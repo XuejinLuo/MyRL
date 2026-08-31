@@ -1,0 +1,21 @@
+# configs/train_offline.yaml
+# 核心魔法：Hydra 会自动去对应文件夹下加载这些 yaml 并挂载到 cfg 树上
+defaults:
+  - model: flow_3d         # 加载 configs/model/flow_3d.yaml 作为 cfg.model
+  - algo: idql             # 加载 configs/algo/idql.yaml 作为 cfg.algo
+  - dataset: offline_data  # 加载 configs/dataset/offline_data.yaml 作为 cfg.dataset
+  - _self_                 # _self_ 保证下方定义的全局变量优先级最高，可覆盖子配置
+
+# 全局工程设置
+run_name: "idql_flow_chunk16"
+project: "my_rl100_infra"
+seed: 42
+device: "cuda"
+epochs: 200
+batch_size: 64
+save_dir: "./checkpoints/offline"
+
+wandb:
+  enable: true
+  project: "RL-100-Infra"
+  entity: null

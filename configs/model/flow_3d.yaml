@@ -1,0 +1,11 @@
+# configs/model/flow_3d.yaml
+# 自动映射为 cfg.model.xxx
+algo_type: "flow"
+action_dim: 7
+state_dim: 18
+chunk_size: 16        
+use_state: true
+encoder_type: "pointnext"
+backbone_type: "transformer" 
+cond_dim: 256
+num_inference_steps: 10

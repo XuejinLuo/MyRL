@@ -1,0 +1,12 @@
+# configs/algo/pg.yaml
+steps_per_epoch: 64   # 每次 PPO 收集环境的 Rollout 步数 (乘以环境并行数)
+update_epochs: 4      # 收集完数据后，PPO 网络微调的 Epoch 数
+actor_lr: 1e-5        # 微调阶段 Actor 学习率必须小，防止破坏预训练权重
+critic_lr: 3e-4
+gamma: 0.99
+gae_lambda: 0.95      # GAE 优势估计平滑系数
+clip_ratio: 0.2       # PPO 截断范围
+entropy_coef: 0.01    # 熵正则化系数 (鼓励探索)
+v_loss_coef: 0.5      # Value Loss 权重系数
+max_grad_norm: 1.0    # 梯度裁剪阈值
+pretrained_ckpt: "./checkpoints/idql_policy_best.pth" # [关键] 在线微调的起点

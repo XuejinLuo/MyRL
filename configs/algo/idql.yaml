@@ -1,0 +1,7 @@
+# configs/algo/idql.yaml
+tau: 0.7              # Expectile regression parameter (拟合上分位数)
+discount: 0.99        # 贝尔曼更新折扣因子
+beta: 3.0             # Reject Sampling 温度 (越大越贪婪，越小越像 BC)
+tau_target: 0.005     # 目标 Q 网络软更新率 (Polyak averaging)
+actor_lr: 1e-4        # Flow/Diffusion Policy 的学习率
+critic_lr: 3e-4       # Q 和 V 网络的学习率

@@ -1,0 +1,15 @@
+# configs/eval.yaml
+defaults:
+  - model: flow_3d
+  - env: dummy_env
+  - _self_
+
+eval:
+  ckpt_path: "./checkpoints/distill/student_distilled_ep50.pth"
+  num_episodes: 20
+  num_inference_steps: 1      # 蒸馏后单步推理填1，普通Flow填10
+  cfg_weight: 1.0             
+  record_video: false         
+  log_dir: "./logs"
+  device: "cuda"
+  seed: 42

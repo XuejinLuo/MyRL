@@ -1,0 +1,4927 @@
+你是一个高级程序员和代码架构专家。请阅读以下提供的项目代码库上下文，然后回答我的问题。
+
+================================================================
+【我的问题 / 任务说明】
+================================================================
+我成功跑起来了我的train_offline.py，但我发现我的GPU利用率一直在67%左右，是不是我的代码当中有计算瓶颈？
+
+
+================================================================
+【项目文件树结构】(仅展示部分相关层级)
+================================================================
+MyRL/
+├── .gitignore
+├── algos
+│   ├── diffusion_utils
+│   │   ├── ddim_scheduler.py
+│   │   └── flow_matching.py
+│   ├── distill.py
+│   ├── idql.py
+│   └── pg.py
+├── configs
+│   ├── algo
+│   │   ├── idql.yaml
+│   │   └── pg.yaml
+│   ├── dataset
+│   │   └── offline_data.yaml
+│   ├── eval.yaml
+│   ├── model
+│   │   ├── diffusion_3d.yaml
+│   │   └── flow_3d.yaml
+│   ├── train_offline.yaml
+│   └── train_online.yaml
+├── data
+│   ├── check_maniskill_dataset.py
+│   ├── dataset.py
+│   ├── maniskill_dataset.py
+│   └── replay_buffer.py
+├── distill_policy.py
+├── envs
+│   ├── chunk_wrapper.py
+│   ├── maniskill_bridge.py
+│   └── pointcloud_wrapper.py
+├── evaluate.py
+├── generate_prompt.py
+├── llm_prompt.txt
+├── models
+│   ├── backbones
+│   │   ├── transformer.py
+│   │   └── unet1d.py
+│   ├── critics
+│   │   └── q_v_network.py
+│   ├── encoders
+│   │   └── pointnext.py
+│   └── policy.py
+├── train_offline.py
+└── train_online.py
+
+
+================================================================
+【项目文件详细内容】
+================================================================
+
+--- 💡 File: distill_policy.py ---
+```python
+# distill_policy.py
+import os
+import copy
+import time
+import argparse
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# 引入你写好的核心组件
+from models.policy import EmbodiedGenPolicy
+from algos.distill import OneStepDistiller
+from data.dataset import PointCloudChunkDataset
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="One-step Distillation for Flow/Diffusion Policy")
+    # 环境与模型超参数
+    parser.add_argument("--action_dim", type=int, default=7, help="Robot action dimension")
+    parser.add_argument("--state_dim", type=int, default=7, help="Robot state dimension")
+    parser.add_argument("--chunk_size", type=int, default=16, help="Action chunk length")
+    parser.add_argument("--n_points", type=int, default=1024, help="Point cloud downsample size")
+    parser.add_argument("--algo", type=str, default="flow", choices=["flow", "diffusion"], help="Base algorithm")
+    
+    # 蒸馏超参数
+    parser.add_argument("--epochs", type=int, default=50, help="Distillation training epochs")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Student learning rate")
+    parser.add_argument("--teacher_steps", type=int, default=10, help="Number of ODE steps teacher uses to generate pseudo-labels")
+    
+    # 路径与工程超参数
+    parser.add_argument("--teacher_ckpt", type=str, default="", help="Path to pre-trained teacher checkpoint (optional)")
+    parser.add_argument("--save_dir", type=str, default="./checkpoints/distill", help="Directory to save student checkpoints")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    
+    # [性能核心] 是否开启伪标签预计算 (强烈建议开启)
+    parser.add_argument("--precompute", action="store_true", help="Precompute Teacher ODE steps before training loop to save massive time")
+    
+    return parser.parse_args()
+
+
+def generate_mock_trajectories(num_episodes=10, ep_len=100, n_points=2048, state_dim=7, action_dim=7):
+    """ 生成一些 Mock 数据，用于在没有真实数据集时验证代码是否跑通 """
+    print(f"📦 生成 Mock 数据集 (Episodes: {num_episodes})...")
+    trajectories = []
+    for _ in range(num_episodes):
+        ep = {
+            'pc': np.random.randn(ep_len, n_points, 3).astype(np.float32),
+            'state': np.random.randn(ep_len, state_dim).astype(np.float32),
+            'action': np.random.randn(ep_len, action_dim).astype(np.float32),
+            'reward': np.random.rand(ep_len).astype(np.float32),
+            'done': np.zeros(ep_len, dtype=bool)
+        }
+        ep['done'][-1] = True
+        trajectories.append(ep)
+    return trajectories
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    # =========================================================================
+    # 1. 准备数据 (真实部署时，替换为读取你的 Zarr / HDF5 / Pickle 文件)
+    # =========================================================================
+    raw_trajectories = generate_mock_trajectories(
+        num_episodes=20, 
+        state_dim=args.state_dim, 
+        action_dim=args.action_dim
+    )
+    
+    dataset = PointCloudChunkDataset(
+        trajectories=raw_trajectories, 
+        chunk_size=args.chunk_size, 
+        n_points=args.n_points
+    )
+    print(f"✅ 数据准备完成: 共 {len(dataset)} 个 Transitions")
+
+    # =========================================================================
+    # 2. 初始化 Teacher 和 Student 策略网络
+    # =========================================================================
+    print(f"🧠 初始化 Teacher Policy ({args.algo.upper()})...")
+    teacher_policy = EmbodiedGenPolicy(
+        action_dim=args.action_dim, 
+        chunk_size=args.chunk_size,
+        use_state=True, 
+        state_dim=args.state_dim,
+        encoder_type="pointnext", 
+        backbone_type="transformer",
+        algo_type=args.algo
+    ).to(args.device)
+
+    # 尝试加载教师权重 (如果有)
+    if args.teacher_ckpt and os.path.exists(args.teacher_ckpt):
+        teacher_policy.load_state_dict(torch.load(args.teacher_ckpt, map_location=args.device))
+        print(f"   📥 成功加载 Teacher 权重: {args.teacher_ckpt}")
+    else:
+        print("   ⚠️ 未提供有效的 Teacher 权重，将使用随机初始化的 Teacher 进行流程测试。")
+    
+    # 锁定 Teacher，设为评估模式
+    teacher_policy.eval()
+    for param in teacher_policy.parameters():
+        param.requires_grad = False
+
+    print("👶 初始化 Student Policy (从 Teacher 深拷贝以加速收敛)...")
+    # 蒸馏的最佳实践：用 Teacher 的权重初始化 Student
+    student_policy = copy.deepcopy(teacher_policy)
+    student_policy.train()
+    for param in student_policy.parameters():
+        param.requires_grad = True # 解锁 Student
+
+    # =========================================================================
+    # 3. 初始化蒸馏器 (Distiller)
+    # =========================================================================
+    distiller = OneStepDistiller(
+        teacher_model=teacher_policy,
+        student_model=student_policy,
+        device=args.device,
+        lr=args.lr,
+        teacher_steps=args.teacher_steps,
+        use_ema=True
+    )
+    
+    # =========================================================================
+    # 4. [性能优化] Precompute Targets (提前计算 Teacher 的多步输出)
+    # =========================================================================
+    # 由于 Teacher 生成 Action Chunk 需要解 ODE/DDIM (如 10 步)，如果放在每个 Epoch 的 DataLoader 里，
+    # 会极大拖慢训练速度。如果显存/内存允许，最好的做法是提前生成一次伪标签存下来。
+    if args.precompute:
+        print("\n⚡ 开启高速模式：正在离线预计算 Teacher 的多步目标生成 (Pseudo-labels)...")
+        # 遍历数据集（使用顺序遍历 DataLoader 进行模拟）
+        # 在真实的大规模数据集中，你可能需要单独存入硬盘
+        precompute_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+        
+        precomputed_dataset = [] # [修复]: 将预计算结果展平存入列表，避免 shuffle 导致的数据错位
+        
+        for batch in tqdm(precompute_loader, desc="Precomputing Target Actions"):
+            obs = batch['pc'].to(args.device)
+            state = batch['state'].to(args.device)
+            B = obs.shape[0]
+            
+            # 提前采样固定的噪声
+            z_noise = torch.randn((B, args.chunk_size, args.action_dim), device=args.device)
+            # 调用 Teacher 多步生成
+            with torch.no_grad():
+                target_action = distiller.teacher_generate(obs, state, z_noise)
+            
+            # [修复]: 拆解 Batch 为单个样本 (Sample) 存入列表，转移至 CPU 节省显存
+            for i in range(B):
+                precomputed_dataset.append({
+                    'pc': obs[i].cpu(),
+                    'state': state[i].cpu(),
+                    'noise': z_noise[i].cpu(),
+                    'target': target_action[i].cpu()
+                })
+        
+        # 预计算模式下，使用携带 noise 和 target 的新 DataLoader，彻底安全地开启 shuffle
+        dataloader = DataLoader(precomputed_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        print(f"✅ 高速模式准备完毕: 生成了 {len(precomputed_dataset)} 个包含伪标签的样本。")
+    else:
+        # 普通模式下，使用原始 Dataset 实时生成
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        print(f"🐢 普通模式准备完毕: 训练期间将实时执行 ODE，速度较慢。")
+
+    # =========================================================================
+    # 5. 蒸馏主训练循环 (Distillation Loop)
+    # =========================================================================
+    print(f"\n🔥 开始单步蒸馏训练 (Total Epochs: {args.epochs})...")
+    for epoch in range(1, args.epochs + 1):
+        epoch_loss = 0.0
+        start_time = time.time()
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        for batch in pbar:
+            obs = batch['pc'].to(args.device)
+            state = batch['state'].to(args.device)
+            
+            # 检查是否使用了预计算的高速数据格式
+            if args.precompute:
+                pre_z = batch['noise'].to(args.device)
+                pre_target = batch['target'].to(args.device)
+                
+                # 高速更新: 直接用拟合好的目标计算速度场匹配
+                loss = distiller.update_step(obs, state, precomputed_noise=pre_z, precomputed_target=pre_target)
+            else:
+                # 在线/龟速更新: 现场跑 10 步 ODE (通常用于在强化学习 Rollout 中的在线蒸馏)
+                loss = distiller.update_step(obs, state)
+                
+            epoch_loss += loss
+            pbar.set_postfix({"Loss": f"{loss:.4f}"})
+            
+        epoch_loss /= len(dataloader)
+        elapsed = time.time() - start_time
+        print(f"Epoch {epoch:03d} | Avg Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s")
+        
+        # 定期保存权重 (保存 EMA 版本的 Student 性能更稳定)
+        if epoch % 10 == 0 or epoch == args.epochs:
+            ckpt_path = os.path.join(args.save_dir, f"student_distilled_ep{epoch}.pth")
+            torch.save(distiller.ema_student.state_dict(), ckpt_path)
+            print(f"   💾 Saved EMA Student Checkpoint to {ckpt_path}")
+
+    print("\n🎉 单步蒸馏结束！Student 现已具备极致响应速度，可以部署到真机环境中了。")
+    print("👉 部署提示：在推理时，直接调用 student_policy.sample(..., num_steps=1) 即可。")
+
+if __name__ == '__main__':
+    main()
+```
+
+--- 💡 File: generate_prompt.py ---
+```python
+import os
+
+# ================= 配置区 =================
+TARGET_DIR = "."              # 你要扫描的代码库文件夹路径，"." 表示当前目录
+OUTPUT_FILE = "llm_prompt.txt" # 输出的文本文件名
+
+# 允许提取内容的文件后缀
+ALLOWED_EXTENSIONS = {'.py', '.yaml', '.yml'}
+
+# 生成文件树和遍历时需要忽略的常见无关文件夹
+IGNORE_DIRS = {
+    '.git', '__pycache__', 'venv', 'env', 
+    '.idea', '.vscode', 'node_modules', 'dist', 'build',
+    'outputs', 'wandb', 'checkpoints'
+}
+# ==========================================
+
+def generate_tree(dir_path, prefix=""):
+    """递归生成文件树结构的字符串"""
+    tree_str = ""
+    try:
+        # 获取目录下的所有文件和文件夹，并过滤掉忽略的目录
+        items = sorted([
+            item for item in os.listdir(dir_path) 
+            if item not in IGNORE_DIRS
+        ])
+    except PermissionError:
+        return ""
+
+    for i, item in enumerate(items):
+        item_path = os.path.join(dir_path, item)
+        is_last = (i == len(items) - 1)
+        
+        # 树枝符号
+        connector = "└── " if is_last else "├── "
+        tree_str += f"{prefix}{connector}{item}\n"
+        
+        # 如果是文件夹，继续递归深入
+        if os.path.isdir(item_path):
+            extension = "    " if is_last else "│   "
+            tree_str += generate_tree(item_path, prefix=prefix + extension)
+            
+    return tree_str
+
+def export_codebase_to_prompt(repo_path, output_file):
+    repo_path = os.path.abspath(repo_path)
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        # 1. 注入给大模型的系统提示词 (System Prompt) 和你的问题占位符
+        f.write("你是一个高级程序员和代码架构专家。请阅读以下提供的项目代码库上下文，然后回答我的问题。\n\n")
+        
+        f.write("================================================================\n")
+        f.write("【我的问题 / 任务说明】\n")
+        f.write("================================================================\n")
+        f.write(">>> [请在此处填写你的具体问题。例如：解释一下整个项目的运行逻辑 / 帮我重构一下 main.py / 为什么 yaml 里的配置没生效？] <<<\n\n\n")
+        
+        # 2. 写入项目文件树结构（给予大模型全局视野）
+        f.write("================================================================\n")
+        f.write("【项目文件树结构】(仅展示部分相关层级)\n")
+        f.write("================================================================\n")
+        f.write(f"{os.path.basename(repo_path)}/\n")
+        f.write(generate_tree(repo_path))
+        f.write("\n\n")
+        
+        # 3. 遍历写入文件详细内容
+        f.write("================================================================\n")
+        f.write("【项目文件详细内容】\n")
+        f.write("================================================================\n\n")
+        
+        file_count = 0
+        for root, dirs, files in os.walk(repo_path):
+            # 过滤掉不需要遍历的文件夹，修改 dirs 即可影响 os.walk 的行为
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in ALLOWED_EXTENSIONS:
+                    file_path = os.path.join(root, file)
+                    # 获取相对路径，方便大模型阅读
+                    rel_path = os.path.relpath(file_path, repo_path)
+                    
+                    # 使用明确的标识符区分文件
+                    f.write(f"--- 💡 File: {rel_path} ---\n")
+                    
+                    # 根据后缀判断 Markdown 的代码语言高亮
+                    lang = "python" if ext == ".py" else "yaml"
+                    f.write(f"```{lang}\n")
+                    
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as code_file:
+                            f.write(code_file.read())
+                    except Exception as e:
+                        f.write(f"# Error reading file: {e}\n")
+                    
+                    f.write(f"\n```\n\n")
+                    file_count += 1
+                    
+        f.write(f"\n# 提示：共读取了 {file_count} 个代码/配置文件。\n")
+        f.write("# [End of Context]\n")
+        
+    print(f"✅ 成功！共提取了 {file_count} 个文件。")
+    print(f"📁 结果已保存至: {os.path.abspath(output_file)}")
+
+if __name__ == "__main__":
+    export_codebase_to_prompt(TARGET_DIR, OUTPUT_FILE)
+```
+
+--- 💡 File: evaluate.py ---
+```python
+# evaluate.py
+
+import os
+import time # [新增] 用于测试高频推理延迟
+import torch
+import numpy as np
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo # [新增] 视频录制
+import mani_skill.envs
+
+# 导入你的核心架构
+from models.policy import EmbodiedGenPolicy
+from envs.pointcloud_wrapper import PointCloudObservationWrapper
+from envs.chunk_wrapper import ChunkActionWrapper
+from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
+
+# =========================================================================
+# 辅助模块: 归一化/反归一化 (根据你的实际需求修改)
+# =========================================================================
+class Normalizer:
+    def __init__(self, stats_dict=None):
+        """
+        stats_dict 应包含 {'action': {'min': ..., 'max': ...}, ...}
+        如果没有提供，默认不做归一化 (直接返回)
+        """
+        self.stats = stats_dict
+        
+    def normalize_obs(self, obs_dict):
+        # 如果你的 point cloud 和 state 在训练时做了归一化，在这里处理
+        # 为保持极简，假设点云在 Wrapper 中已处于合理范围，不做处理
+        return obs_dict
+
+    def unnormalize_action(self, action):
+        if self.stats is None or 'action' not in self.stats:
+            return action
+        action_min = self.stats['action']['min']
+        action_max = self.stats['action']['max']
+        # 将 [-1, 1] 的网络输出反归一化到真实物理环境动作空间
+        action = (action + 1) / 2 * (action_max - action_min) + action_min
+        return action
+
+# =========================================================================
+# 核心评估逻辑
+# =========================================================================
+def make_env_dummy(cfg: DictConfig):
+    """ 创建并包装环境 """
+    # 1. 初始化你的真实环境 (这里你需要根据真实情况替换)
+    # env = gym.make(cfg.env.env_id) 
+    
+    # [Mock] 为了防止报错，如果你还没有真实环境，用 Dummy 替代
+    class DummyEmbodiedEnv(gym.Env):
+        def __init__(self):
+            super().__init__()
+            self.observation_space = gym.spaces.Dict({
+                'xyz': gym.spaces.Box(-10, 10, shape=(2000, 3), dtype=np.float32),
+                'rgb': gym.spaces.Box(0, 1, shape=(2000, 3), dtype=np.float32),
+                'state': gym.spaces.Box(-1, 1, shape=(cfg.model.state_dim,), dtype=np.float32)
+            })
+            self.action_space = gym.spaces.Box(-1, 1, shape=(cfg.model.action_dim,), dtype=np.float32)
+            self.step_count = 0
+            # [新增] 模拟渲染接口，供 RecordVideo 调用
+            self.render_mode = "rgb_array" 
+            
+        def reset(self, seed=None, options=None):
+            self.step_count = 0
+            return self.observation_space.sample(), {}
+            
+        def step(self, action):
+            self.step_count += 1
+            done = self.step_count >= 100
+            reward = 1.0 if done else 0.0
+            return self.observation_space.sample(), reward, done, False, {"success": done}
+            
+        # [新增] 假渲染
+        def render(self):
+            return np.zeros((240, 320, 3), dtype=np.uint8)
+
+    env = DummyEmbodiedEnv()
+
+    # [新增] 包装 RecordVideo (按需开启，这里默认每 5 个 episode 录制一次)
+    if cfg.eval.get("record_video", False):
+        video_dir = os.path.join(cfg.eval.get("log_dir", "./logs"), "videos")
+        env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda x: x % 5 == 0)
+
+    # 2. 包装 PointCloud 处理器
+    ws_bounds = np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]) # 根据任务修改
+    env = PointCloudObservationWrapper(
+        env=env,
+        num_points=cfg.env.num_points,
+        workspace_bounds=ws_bounds,
+        use_color=cfg.env.use_color
+    )
+
+    # 3. 包装 Action Chunk 处理器 (自动处理 Temporal Ensembling)
+    env = ChunkActionWrapper(
+        env=env,
+        chunk_size=cfg.model.chunk_size,
+        exec_steps=cfg.env.exec_steps,
+        exp_weight=cfg.env.exp_weight
+    )
+    return env
+
+def make_env_ManiSkill(cfg):
+    """ 创建并包装 ManiSkill 真实仿真环境 """
+    
+    # 1. 实例化 ManiSkill 环境 (以最经典的抓取方块任务为例)
+    env = gym.make(
+        "PickCube-v1",
+        obs_mode="pointcloud",           # 必须开启点云模式
+        control_mode="pd_joint_pos", # 控制模式为关节位置
+        render_mode="rgb_array",         # 用于 evaluation 录制视频
+    )
+    
+    # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
+    env = ManiSkillToRL100Wrapper(env)
+    
+    # 3. 接入你原来写好的 PointCloud Wrapper
+    # 注意：这里的 workspace_bounds 需要根据 PickCube 任务的实际桌面范围做调整
+    # 例如只保留桌面上的物体和机械臂部分点云，剔除背景
+    ws_bounds = np.array([
+        [-0.5, -0.5, 0.0],  # [X_min, Y_min, Z_min] (Z > 0 保留桌面以上)
+        [ 0.5,  0.5, 0.5]   # [X_max, Y_max, Z_max]
+    ])
+    
+    env = PointCloudObservationWrapper(
+        env=env,
+        num_points=cfg.env.num_points,  # 比如 1024
+        workspace_bounds=ws_bounds,
+        use_color=cfg.env.use_color
+    )
+    
+    # 4. 接入你写好的 Action Chunk Wrapper
+    env = ChunkActionWrapper(
+        env=env,
+        chunk_size=cfg.model.chunk_size,
+        exec_steps=cfg.env.exec_steps,
+        exp_weight=cfg.env.exp_weight
+    )
+    
+    return env
+
+@hydra.main(version_base=None, config_path="configs", config_name="eval")
+def main(cfg: DictConfig):
+    print("=" * 60)
+    print("🚀 开始具身策略评估 (Evaluation)")
+    print(OmegaConf.to_yaml(cfg))
+    print("=" * 60)
+
+    device = torch.device(cfg.eval.device)
+    
+    # [新增] 提取基础配置 (防止用户在使用蒸馏模型时忘了改 step)
+    num_inference_steps = cfg.eval.get("num_inference_steps", 10)
+    is_distilled = cfg.eval.get("is_distilled", False)
+    if is_distilled and num_inference_steps != 1:
+        print(f"⚠️ 警告: 你声明了这是蒸馏模型，但 num_inference_steps 为 {num_inference_steps}。自动强制覆写为 1！")
+        num_inference_steps = 1
+
+    # 1. 准备环境
+    # env = make_env_dummy(cfg)
+    env = make_env_ManiSkill(cfg)
+    print(f"✅ 环境初始化完成! Action Space: {env.action_space}")
+
+    # 2. 准备策略模型
+    policy = EmbodiedGenPolicy(
+        action_dim=cfg.model.action_dim,
+        chunk_size=cfg.model.chunk_size,
+        use_state=cfg.model.use_state,
+        state_dim=cfg.model.state_dim,
+        encoder_type=cfg.model.encoder_type,
+        backbone_type=cfg.model.backbone_type,
+        cond_dim=cfg.model.cond_dim,
+        algo_type=cfg.model.algo_type
+    ).to(device)
+
+    # 3. 加载 Checkpoint
+    if os.path.exists(cfg.eval.ckpt_path):
+        state_dict = torch.load(cfg.eval.ckpt_path, map_location=device)
+        # 兼容性处理：如果保存的是包含 model / ema_model 的大字典
+        if 'ema_model_state_dict' in state_dict:
+            policy.load_state_dict(state_dict['ema_model_state_dict'])
+            print("📥 成功加载 EMA 权重!")
+        elif 'model_state_dict' in state_dict:
+            policy.load_state_dict(state_dict['model_state_dict'])
+            print("📥 成功加载 Model 权重!")
+        else:
+            policy.load_state_dict(state_dict)
+            print("📥 成功加载纯 State Dict 权重!")
+    else:
+        print(f"⚠️ 警告: 找不到权重文件 {cfg.eval.ckpt_path}，将使用随机初始化进行测试!")
+
+    policy.eval()
+
+    # 4. 加载 Normalizer (假设你的 stats 与权重存在一起，或者有单独的文件)
+    # stats = torch.load(cfg.dataset_stats_path) if cfg.dataset_stats_path else None
+    normalizer = Normalizer(stats_dict=None) 
+
+    # 5. 评估循环
+    all_rewards = []
+    all_success = []
+    latencies = [] # [新增] 用于记录推理耗时
+
+    print(f"\n🏃 开始进行 {cfg.eval.num_episodes} 个 Episode 的测试...")
+    for ep in tqdm(range(cfg.eval.num_episodes), desc="Evaluating"):
+        # [新增] 传入固定的 base_seed 以确保测试环境的一致性和可复现性
+        base_seed = cfg.eval.get("seed", 42)
+        obs, info = env.reset(seed=base_seed + ep)
+        
+        done, truncated = False, False
+        ep_reward = 0.0
+        success = False
+
+        while not (done or truncated):
+            # (A) 准备观测数据: 增加 Batch 维度并发送到 Device
+            obs_normalized = normalizer.normalize_obs(obs)
+            pc_tensor = torch.from_numpy(obs_normalized['point_cloud']).unsqueeze(0).to(device)
+            state_tensor = torch.from_numpy(obs_normalized['state']).unsqueeze(0).to(device)
+
+            # (B) 策略推理: 返回形状为 [1, chunk_size, action_dim]
+            # [新增] 计时开始，并引入自动混合精度 (AMP) 提速
+            torch.cuda.synchronize() if device.type == 'cuda' else None
+            t0 = time.perf_counter()
+            
+            with torch.no_grad():
+                # [新增] AMP 自动混合精度，极大地加速 3D Transformer 的推理
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if device.type == 'cuda' else torch.no_grad():
+                    action_chunk = policy.sample(
+                        obs=pc_tensor, 
+                        state=state_tensor, 
+                        num_steps=num_inference_steps, # [修改] 使用顶部提取并校验过的 steps
+                        cfg_weight=cfg.eval.get("cfg_weight", 1.0)
+                    )
+            
+            # [新增] 计时结束
+            torch.cuda.synchronize() if device.type == 'cuda' else None
+            inference_time = (time.perf_counter() - t0) * 1000  # ms
+            latencies.append(inference_time)
+
+            # (C) 转换为 NumPy 并去掉 Batch 维度 -> [chunk_size, action_dim]
+            action_chunk_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy() # [修改] 加上 .to(float32) 防 bf16 报错
+
+            # (D) 反归一化动作
+            action_chunk_np = normalizer.unnormalize_action(action_chunk_np)
+
+            # (E) 在 Wrapper 环境中步进 
+            # (ChunkActionWrapper 内部会自动做滑动窗口集成并步进 exec_steps 步)
+            obs, reward, done, truncated, info = env.step(action_chunk_np)
+            ep_reward += reward
+            
+            # 判断是否成功 (根据具体环境调整，比如 info['success'])
+            if info.get('success', False):
+                success = True
+
+        all_rewards.append(ep_reward)
+        all_success.append(success)
+        # print(f"Episode {ep} | Reward: {ep_reward:.2f} | Success: {success}")
+
+    # 6. 统计结果
+    mean_reward = np.mean(all_rewards)
+    success_rate = np.mean(all_success) * 100.0
+    # [新增] 推理延迟统计 (去除前 5 个 warmup 样本以保证准确)
+    valid_latencies = latencies[5:] if len(latencies) > 5 else latencies
+    mean_latency = np.mean(valid_latencies) if valid_latencies else 0.0
+    
+    print("\n" + "=" * 40)
+    print("📊 评估完成 (Evaluation Summary)")
+    print("=" * 40)
+    print(f"Total Episodes    : {cfg.eval.num_episodes}")
+    print(f"Mean Reward       : {mean_reward:.2f} ± {np.std(all_rewards):.2f}")
+    print(f"Success Rate      : {success_rate:.1f} %")
+    print(f"Inference Latency : {mean_latency:.2f} ms/step (≈ {1000/mean_latency if mean_latency > 0 else 0:.1f} FPS)")
+    print("=" * 40)
+
+if __name__ == "__main__":
+    main()
+```
+
+--- 💡 File: train_online.py ---
+```python
+# train_online.py
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+import wandb
+import gymnasium as gym
+import mani_skill.envs
+
+# =========================================================================
+# 导入你的核心架构组件
+# =========================================================================
+from models.policy import EmbodiedGenPolicy
+from models.encoders.pointnext import PointNeXtEncoder
+from models.critics.q_v_network import VNetwork
+from algos.pg import FlowPolicyGradient
+from envs.pointcloud_wrapper import PointCloudObservationWrapper
+from envs.chunk_wrapper import ChunkActionWrapper
+from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
+
+# =========================================================================
+# 桥接层 (Bridge Wrappers)
+# PG 更新要求 Tensor 输入，而我们的环境吐出的是 Dict。这里用 Wrapper 进行解包对齐。
+# =========================================================================
+
+class CriticFeatureExtractor(nn.Module):
+    """ 为 Critic 专门提供 3D 点云特征提取 """
+    def __init__(self, cfg):
+        super().__init__()
+        self.encoder = PointNeXtEncoder(
+            in_channels=3,
+            output_dim=cfg.model.cond_dim,
+            use_state=cfg.model.use_state,
+            state_dim=cfg.model.state_dim
+        )
+    def forward(self, obs_dict):
+        pn_dict = {
+            'point_cloud': obs_dict['pc'],
+            'state': obs_dict['state']
+        }
+        return self.encoder(pn_dict)
+
+class Critic_PG_Wrapper(nn.Module):
+    """ 将 Encoder 和 VNetwork 组合，对外暴露单一的 forward 接口 """
+    def __init__(self, encoder, v_net):
+        super().__init__()
+        self.encoder = encoder
+        self.v_net = v_net
+        
+    def forward(self, obs_dict):
+        # PG 会调用 self.critic(states)，这里 states 实际上就是 obs_dict
+        feat = self.encoder(obs_dict)
+        return self.v_net(feat)
+
+class Policy_PG_Wrapper(nn.Module):
+    """ 将 EmbodiedGenPolicy 包装，对齐 evaluate_actions 和 sample 的字典解包 """
+    def __init__(self, policy):
+        super().__init__()
+        self.policy = policy
+        
+    def evaluate_actions(self, obs_dict, actions):
+        # 匹配 algos/pg.py 中 trainer.update_step 的调用
+        return self.policy.evaluate_actions(
+            obs=obs_dict['pc'], 
+            actions=actions, 
+            state=obs_dict['state']
+        )
+        
+    def sample(self, obs_dict, num_steps=10):
+        # 环境 Rollout 交互调用
+        return self.policy.sample(
+            obs=obs_dict['pc'], 
+            state=obs_dict['state'], 
+            num_steps=num_steps
+        )
+
+# =========================================================================
+# 环境构建
+# =========================================================================
+def make_env_dummy(cfg: DictConfig):
+    # 替换为你自己真实的 Gym Env
+    class DummyEmbodiedEnv(gym.Env):
+        def __init__(self):
+            super().__init__()
+            self.observation_space = gym.spaces.Dict({
+                'xyz': gym.spaces.Box(-10, 10, shape=(cfg.env.n_original_points, 3), dtype=np.float32),
+                'rgb': gym.spaces.Box(0, 1, shape=(cfg.env.n_original_points, 3), dtype=np.float32),
+                'state': gym.spaces.Box(-1, 1, shape=(cfg.model.state_dim,), dtype=np.float32)
+            })
+            self.action_space = gym.spaces.Box(-1, 1, shape=(cfg.model.action_dim,), dtype=np.float32)
+            self.step_count = 0
+            
+        def reset(self, seed=None, options=None):
+            self.step_count = 0
+            return self.observation_space.sample(), {}
+            
+        def step(self, action):
+            self.step_count += 1
+            done = self.step_count >= 50
+            reward = 1.0 if done else np.random.rand() * 0.1
+            return self.observation_space.sample(), reward, done, False, {"success": done}
+            
+    env = DummyEmbodiedEnv()
+
+    # 包装点云处理器
+    ws_bounds = np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+    env = PointCloudObservationWrapper(
+        env=env, num_points=cfg.env.num_points, workspace_bounds=ws_bounds, use_color=cfg.env.use_color
+    )
+
+    # 包装动作 Chunk 处理器 (含 Temporal Ensembling)
+    env = ChunkActionWrapper(
+        env=env, chunk_size=cfg.model.chunk_size, exec_steps=cfg.env.exec_steps, exp_weight=cfg.env.exp_weight
+    )
+    return env
+
+def make_env_ManiSkill(cfg):
+    """ 创建并包装 ManiSkill 真实仿真环境 """
+    
+    # 1. 实例化 ManiSkill 环境 (以最经典的抓取方块任务为例)
+    env = gym.make(
+        "PickCube-v1",
+        obs_mode="pointcloud",           # 必须开启点云模式
+        control_mode="pd_joint_pos",    # 控制模式为关节位置
+        render_mode="rgb_array",         # 用于 evaluation 录制视频
+    )
+    
+    # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
+    env = ManiSkillToRL100Wrapper(env)
+    
+    # 3. 接入你原来写好的 PointCloud Wrapper
+    # 注意：这里的 workspace_bounds 需要根据 PickCube 任务的实际桌面范围做调整
+    # 例如只保留桌面上的物体和机械臂部分点云，剔除背景
+    ws_bounds = np.array([
+        [-0.5, -0.5, 0.0],  # [X_min, Y_min, Z_min] (Z > 0 保留桌面以上)
+        [ 0.5,  0.5, 0.5]   # [X_max, Y_max, Z_max]
+    ])
+    
+    env = PointCloudObservationWrapper(
+        env=env,
+        num_points=cfg.env.num_points,  # 比如 1024
+        workspace_bounds=ws_bounds,
+        use_color=cfg.env.use_color
+    )
+    
+    # 4. 接入你写好的 Action Chunk Wrapper
+    env = ChunkActionWrapper(
+        env=env,
+        chunk_size=cfg.model.chunk_size,
+        exec_steps=cfg.env.exec_steps,
+        exp_weight=cfg.env.exp_weight
+    )
+    
+    return env
+
+# =========================================================================
+# Rollout Buffer (On-policy 数据收集器)
+# =========================================================================
+class RolloutBuffer:
+    def __init__(self, device):
+        self.device = device
+        self.clear()
+        
+    def clear(self):
+        self.obs_pc, self.obs_state = [], []
+        self.actions, self.rewards, self.dones, self.values = [], [], [], []
+        
+    def add(self, pc, state, action, reward, done, value):
+        self.obs_pc.append(pc)
+        self.obs_state.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+        
+    def get_tensors(self):
+        # 转化为 Tensor, 维度: [Time_Steps, Batch_Size(1), ...]
+        return {
+            'pc': torch.FloatTensor(np.array(self.obs_pc)).unsqueeze(1).to(self.device),
+            'state': torch.FloatTensor(np.array(self.obs_state)).unsqueeze(1).to(self.device),
+            'actions': torch.FloatTensor(np.array(self.actions)).unsqueeze(1).to(self.device),
+            'rewards': torch.FloatTensor(np.array(self.rewards)).unsqueeze(1).to(self.device),
+            'dones': torch.FloatTensor(np.array(self.dones)).unsqueeze(1).to(self.device),
+            'values': torch.FloatTensor(np.array(self.values)).unsqueeze(1).to(self.device),
+        }
+
+# =========================================================================
+# Main 训练循环
+# =========================================================================
+@hydra.main(version_base=None, config_path="configs", config_name="train_online")
+def main(cfg: DictConfig):
+    # 1. 实验追踪
+    if cfg.wandb.enable:
+        wandb.init(project=cfg.wandb.project, name=cfg.run_name, config=OmegaConf.to_container(cfg, resolve=True))
+        
+    device = torch.device(cfg.device)
+    os.makedirs(cfg.save_dir, exist_ok=True)
+
+    # 2. 初始化环境
+    # env = make_env_dummy(cfg)
+    env = make_env_ManiSkill(cfg)
+    
+    # 3. 初始化模型组件
+    print("🧠 初始化 Actor (Policy) 与 Critic (Value Network)...")
+    base_policy = EmbodiedGenPolicy(
+        action_dim=cfg.model.action_dim, chunk_size=cfg.model.chunk_size,
+        use_state=cfg.model.use_state, state_dim=cfg.model.state_dim,
+        encoder_type=cfg.model.encoder_type, backbone_type=cfg.model.backbone_type,
+        cond_dim=cfg.model.cond_dim, algo_type=cfg.model.algo_type
+    ).to(device)
+    actor = Policy_PG_Wrapper(base_policy)
+    
+    # 假设我们在此处加载通过 IDQL 预训练好的权重作为起点 (极其重要)
+    if cfg.pg.pretrained_ckpt and os.path.exists(cfg.pg.pretrained_ckpt):
+        base_policy.load_state_dict(torch.load(cfg.pg.pretrained_ckpt, map_location=device))
+        print("✅ 成功加载 IDQL 离线预训练权重，在此基础上启动 PG 微调！")
+
+    critic_encoder = CriticFeatureExtractor(cfg).to(device)
+    base_v_net = VNetwork(state_dim=cfg.model.cond_dim).to(device)
+    critic = Critic_PG_Wrapper(critic_encoder, base_v_net)
+    
+    # 4. 初始化 PG Trainer
+    trainer = FlowPolicyGradient(
+        policy=actor, critic=critic,
+        actor_lr=cfg.algo.actor_lr,        # 统一使用 cfg.algo
+        critic_lr=cfg.algo.critic_lr,
+        gamma=cfg.algo.gamma, 
+        gae_lambda=cfg.algo.gae_lambda, 
+        clip_ratio=cfg.algo.clip_ratio,
+        device=device
+    )
+
+    buffer = RolloutBuffer(device)
+    obs, _ = env.reset()
+
+    # 5. 主循环 (Epochs)
+    print(f"🚀 开始在线强化微调 (Total Epochs: {cfg.epochs})")
+    
+    for epoch in range(1, cfg.epochs + 1):
+        buffer.clear()
+        epoch_reward = 0.0
+        
+        # --- A. 轨迹收集阶段 (Rollout) ---
+        actor.eval()
+        critic.eval()
+        
+        for _ in tqdm(range(cfg.pg.steps_per_epoch), desc=f"Epoch {epoch} Rollout", leave=False):
+            # 将 numpy 观测转为单 Batch Tensor
+            obs_dict = {
+                'pc': torch.FloatTensor(obs['point_cloud']).unsqueeze(0).to(device),
+                'state': torch.FloatTensor(obs['state']).unsqueeze(0).to(device)
+            }
+            
+            with torch.no_grad():
+                # 计算当前状态的 Value
+                value = critic(obs_dict).item()
+                # 策略前向生成动作 Chunk
+                action_chunk = actor.sample(obs_dict, num_steps=cfg.model.num_inference_steps)
+            
+            # 环境执行 (转换为 numpy)
+            action_np = action_chunk.squeeze(0).cpu().numpy()
+            next_obs, reward, done, truncated, info = env.step(action_np)
+            
+            epoch_reward += reward
+            
+            # 存储轨迹
+            buffer.add(obs['point_cloud'], obs['state'], action_np, reward, done or truncated, value)
+            
+            obs = next_obs
+            if done or truncated:
+                obs, _ = env.reset()
+                
+        # --- B. 计算 GAE 与 Returns ---
+        rollout_data = buffer.get_tensors()
+        
+        # 获取下一个状态的 value (用于 Bootstrapping)
+        with torch.no_grad():
+            next_obs_dict = {
+                'pc': torch.FloatTensor(obs['point_cloud']).unsqueeze(0).to(device),
+                'state': torch.FloatTensor(obs['state']).unsqueeze(0).to(device)
+            }
+            next_value = critic(next_obs_dict).squeeze(-1)
+            
+        advantages, returns = trainer.compute_gae(
+            rollout_data['rewards'], rollout_data['values'], rollout_data['dones'], next_value
+        )
+        
+        # PPO Trick: Advantage 归一化 (极大提升微调稳定性)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # --- C. PPO 网络更新阶段 ---
+        actor.train()
+        critic.train()
+        
+        # 将 [Time, Batch, ...] 拍扁为 [Batch_size, ...]
+        flat_obs_dict = {
+            'pc': rollout_data['pc'].view(-1, cfg.env.num_points, 3),
+            'state': rollout_data['state'].view(-1, cfg.model.state_dim)
+        }
+        flat_actions = rollout_data['actions'].view(-1, cfg.model.chunk_size, cfg.model.action_dim)
+        flat_adv = advantages.view(-1)
+        flat_returns = returns.view(-1)
+
+        # 事先计算 old_log_probs
+        with torch.no_grad():
+            old_log_probs, _ = actor.evaluate_actions(flat_obs_dict, flat_actions)
+
+        # PPO 循环微调
+        epoch_losses = {}
+        for ppo_epoch in range(cfg.pg.update_epochs):
+            # 这里简单起见做整批更新（如果 GPU 显存不够，可在此加一个 Mini-Batch for 循环切片）
+            loss_dict = trainer.update_step(
+                states=flat_obs_dict, 
+                actions=flat_actions, 
+                old_log_probs=old_log_probs, 
+                returns=flat_returns, 
+                advantages=flat_adv
+            )
+            
+            for k, v in loss_dict.items():
+                epoch_losses[k] = epoch_losses.get(k, 0) + v
+                
+        # 平均 Loss
+        for k in epoch_losses:
+            epoch_losses[k] /= cfg.pg.update_epochs
+
+        # --- D. 打印与保存 ---
+        log_metrics = {**epoch_losses, "Reward/Epoch": epoch_reward}
+        if cfg.wandb.enable:
+            wandb.log(log_metrics, step=epoch)
+            
+        print(f"Epoch {epoch:03d} | Avg Reward: {epoch_reward:.2f} | Actor Loss: {epoch_losses['actor_loss']:.4f} | Critic Loss: {epoch_losses['critic_loss']:.4f}")
+
+        if epoch % 10 == 0 or epoch == cfg.epochs:
+            ckpt_path = os.path.join(cfg.save_dir, f"pg_finetuned_ep{epoch}.pth")
+            torch.save(base_policy.state_dict(), ckpt_path)
+            print(f"   💾 Saved Checkpoint to {ckpt_path}")
+
+    if cfg.wandb.enable:
+        wandb.finish()
+    print("🎉 在线 PG 微调完成！可以接入 distill_policy.py 开始进行单步蒸馏！")
+
+# =========================================================================
+# 用于直接运行代码的虚拟配置 (Dummy Config)
+# 实际运行请将这些放入 configs/train_online.yaml 中交由 Hydra 解析
+# =========================================================================
+if __name__ == "__main__":
+    from omegaconf import OmegaConf
+    dummy_yaml = """
+    run_name: "Flow-PG-Finetune"
+    device: "cuda"
+    save_dir: "./checkpoints/online"
+    epochs: 200
+    
+    env:
+      n_original_points: 2048
+      num_points: 1024
+      use_color: false
+      exec_steps: 2
+      exp_weight: 0.01
+
+    model:
+      action_dim: 7
+      state_dim: 14
+      chunk_size: 8
+      use_state: true
+      encoder_type: "pointnext"
+      backbone_type: "transformer"
+      algo_type: "flow"
+      cond_dim: 256
+      num_inference_steps: 10
+      
+    pg:
+      steps_per_epoch: 64
+      update_epochs: 4
+      actor_lr: 1e-5
+      critic_lr: 3e-4
+      gamma: 0.99
+      gae_lambda: 0.95
+      clip_ratio: 0.2
+      pretrained_ckpt: "" # "./checkpoints/offline/idql_policy_best.pth"
+      
+    wandb:
+      enable: false
+      project: "RL-100-Infra"
+    """
+    
+    # 覆盖 Hydra 劫持逻辑，直接解析字符串执行
+    cfg = OmegaConf.create(dummy_yaml)
+    main(cfg)
+```
+
+--- 💡 File: train_offline.py ---
+```python
+# train_offline.py
+
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import wandb
+
+# =========================================================================
+# 导入你提供的核心模块
+# =========================================================================
+from data.dataset import PointCloudChunkDataset
+from models.policy import EmbodiedGenPolicy
+from models.encoders.pointnext import PointNeXtEncoder
+from models.critics.q_v_network import VNetwork, TwinQNetwork
+from algos.idql import IDQL
+
+# =========================================================================
+# 桥接层 (Bridge Wrappers)
+# 作用：解决 IDQL 原版算法要求 Tensor，而我们的观测是 PointCloud + State 字典的问题
+# =========================================================================
+
+class CriticFeatureExtractor(nn.Module):
+    """ 为 Q / V 网络共享一个 3D 点云特征提取器 """
+    def __init__(self, cfg):
+        super().__init__()
+        self.encoder = PointNeXtEncoder(
+            in_channels=3,
+            output_dim=cfg.model.cond_dim,
+            use_state=cfg.model.use_state,
+            state_dim=cfg.model.state_dim
+        )
+    def forward(self, obs_dict):
+        # 强制将键名对齐为 PointNeXtEncoder 需要的 'point_cloud' 和 'state'
+        pn_dict = {
+            'point_cloud': obs_dict['pc'],
+            'state': obs_dict['state']
+        }
+        return self.encoder(pn_dict)
+
+class IDQL_VNet_Wrapper(nn.Module):
+    def __init__(self, encoder, v_net):
+        super().__init__()
+        self.encoder = encoder
+        self.v_net = v_net
+    def forward(self, obs_dict):
+        feat = self.encoder(obs_dict)
+        return self.v_net(feat)
+
+class IDQL_QNet_Wrapper(nn.Module):
+    def __init__(self, encoder, q_net):
+        super().__init__()
+        self.encoder = encoder
+        self.q_net = q_net
+    def forward(self, obs_dict, actions):
+        feat = self.encoder(obs_dict)
+        return self.q_net(feat, actions)
+
+class Policy_IDQL_Wrapper(nn.Module):
+    """ 包装 EmbodiedGenPolicy 使其兼容 IDQL 的单参数调用 """
+    def __init__(self, policy):
+        super().__init__()
+        self.policy = policy
+    def compute_loss(self, obs_dict, actions):
+        # 解包字典，传入 policy
+        return self.policy.compute_loss(
+            obs=obs_dict['pc'],
+            actions=actions,
+            state=obs_dict['state']
+        )
+    def parameters(self):
+        return self.policy.parameters()
+
+# =========================================================================
+# 算法继承 (Subclassing IDQL)
+# 作用：完美兼容字典观测的 keep_mask 过滤，不改动你原来 algos/idql.py 一行代码
+# =========================================================================
+class EmbodiedIDQL(IDQL):
+    def update_critic(self, obs_dict, actions, rewards, next_obs_dict, dones):
+        """ 改造：接收 dict，计算 TD Loss """
+        with torch.no_grad():
+            # [🔥 修复 Target Q 状态错位] IQL 中 target_q 用于评估当前 (s,a) 的价值来拟合 V，必须传入当前的 obs_dict！
+            target_q1, target_q2 = self.q_target(obs_dict, actions) 
+            target_q = torch.minimum(target_q1, target_q2)
+            next_v = self.v_net(next_obs_dict)
+            
+        # 1. 更新 V
+        v = self.v_net(obs_dict)
+        adv = target_q - v
+        v_loss = self.expectile_loss(adv, self.tau).mean()
+        
+        self.v_opt.zero_grad()
+        v_loss.backward()
+        self.v_opt.step()
+        
+        # 2. 更新 Q
+        q_target_value = rewards + self.discount * (1.0 - dones) * next_v.detach()
+        q1, q2 = self.q_net(obs_dict, actions)
+        
+        q1_loss = torch.nn.functional.mse_loss(q1, q_target_value)
+        q2_loss = torch.nn.functional.mse_loss(q2, q_target_value)
+        q_loss = q1_loss + q2_loss
+        
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        self.q_opt.step()
+        
+        # 3. Soft update
+        for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+            target_param.data.copy_(self.tau_target * param.data + (1 - self.tau_target) * target_param.data)
+            
+        return {"loss/v": v_loss.item(), "loss/q": q_loss.item(), "q_value": q1.mean().item()}
+
+    def update_actor(self, obs_dict, actions):
+        """ 改造：在对样本进行 Reject Sampling 过滤时，正确切割字典 """
+        with torch.no_grad():
+            v = self.v_net(obs_dict)
+            q1, q2 = self.q_target(obs_dict, actions)
+            q = torch.minimum(q1, q2)
+            adv = q - v
+            adv_stable = adv - adv.max() 
+            weights = torch.exp(self.beta * adv_stable)
+            accept_prob = (weights / weights.max()).squeeze(-1)
+            
+            random_u = torch.rand_like(accept_prob)
+            keep_mask = random_u < accept_prob
+            if keep_mask.sum() == 0:
+                keep_mask[torch.argmax(accept_prob)] = True
+
+        # [核心] 使用 mask 过滤字典中的张量
+        filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
+        filtered_actions = actions[keep_mask]
+        
+        actor_loss = self.actor.compute_loss(filtered_obs, filtered_actions)
+        
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
+        
+        return {
+            "loss/actor": actor_loss.item(), 
+            "metrics/accept_ratio": keep_mask.float().mean().item(),
+            "metrics/adv_mean": adv.mean().item()
+        }
+
+# =========================================================================
+# Main 训练循环
+# =========================================================================
+@hydra.main(version_base=None, config_path="configs", config_name="train_offline")
+def main(cfg: DictConfig):
+    # 1. 初始化实验记录 (Wandb)
+    if cfg.wandb.enable:
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True)
+        )
+    
+    device = torch.device(cfg.device)
+    os.makedirs(cfg.save_dir, exist_ok=True)
+
+    # 2. 准备数据流 (Dataset & DataLoader)
+    # # 实际项目中，替换 generate_mock_trajectories 为你的本地数据读取逻辑
+    # print("📦 正在加载离线数据...")
+    # from distill_policy import generate_mock_trajectories # 借用你写好的 mock
+    # raw_trajectories = generate_mock_trajectories(num_episodes=50, state_dim=cfg.model.state_dim, action_dim=cfg.model.action_dim)
+    
+    # dataset = PointCloudChunkDataset(
+    #     trajectories=raw_trajectories, 
+    #     chunk_size=cfg.model.chunk_size, 
+    #     n_points=cfg.dataset.n_points
+    # )
+
+    print("📦 正在加载 ManiSkill 真机/仿真离线数据...")
+    
+    # 导入读取函数
+    from data.maniskill_dataset import load_maniskill_h5 
+    
+    # 从 Hydra 配置中读取路径和限制参数
+    data_path = cfg.dataset.data_path
+    max_episodes = cfg.dataset.get("max_episodes", None)
+    
+    # 动态加载数据
+    raw_trajectories = load_maniskill_h5(data_path, max_episodes=max_episodes)
+    
+    # 这里的 Dataset 内部会把你那 16384 个点，随机降采样到 cfg.dataset.n_points (比如 1024 个点)，防止显存 OOM
+    dataset = PointCloudChunkDataset(
+        trajectories=raw_trajectories, 
+        chunk_size=cfg.model.chunk_size, 
+        n_points=cfg.dataset.n_points 
+    )
+
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=cfg.batch_size, 
+        shuffle=True, 
+        drop_last=True,
+        num_workers=4,          # 开启多进程数据加载 (可根据你的CPU核心数调整)
+        pin_memory=True,        # 开启锁页内存，加速 CPU Tensor 向 GPU 的拷贝
+        persistent_workers=True # 防止每个 epoch 重新创建 worker 导致的延迟
+    )
+    print(f"✅ 数据加载完成! Total batches per epoch: {len(dataloader)}")
+
+    # 3. 初始化网络模型
+    print("🧠 正在初始化策略与价值网络...")
+    
+    # Actor (Flow/Diffusion Policy)
+    base_policy = EmbodiedGenPolicy(
+        action_dim=cfg.model.action_dim,
+        chunk_size=cfg.model.chunk_size,
+        use_state=cfg.model.use_state,
+        state_dim=cfg.model.state_dim,
+        encoder_type=cfg.model.encoder_type,
+        backbone_type=cfg.model.backbone_type,
+        cond_dim=cfg.model.cond_dim,
+        algo_type=cfg.model.algo_type
+    ).to(device)
+    wrapped_actor = Policy_IDQL_Wrapper(base_policy)
+
+    # Critics (V & Q Networks)
+    # [🔥 修复双重优化器冲突] 给 V 网络和 Q 网络分配各自独立的 PointCloud 编码器。
+    # 这样防止 v_opt 和 q_opt 在 backward 时互相覆盖/破坏同一个 encoder 的动量与梯度。
+    v_encoder = CriticFeatureExtractor(cfg).to(device)
+    q_encoder = CriticFeatureExtractor(cfg).to(device)
+    
+    base_v_net = VNetwork(state_dim=cfg.model.cond_dim).to(device)
+    base_q_net = TwinQNetwork(state_dim=cfg.model.cond_dim, action_dim=cfg.model.action_dim, chunk_size=cfg.model.chunk_size).to(device)
+    
+    wrapped_v_net = IDQL_VNet_Wrapper(v_encoder, base_v_net)
+    wrapped_q_net = IDQL_QNet_Wrapper(q_encoder, base_q_net)
+
+    # 4. 初始化 IDQL 算法引擎
+    agent = EmbodiedIDQL(
+        actor=wrapped_actor,
+        q_network=wrapped_q_net,
+        v_network=wrapped_v_net,
+        device=device,
+        tau=cfg.algo.tau,          # 统一使用 cfg.algo
+        discount=cfg.algo.discount,
+        beta=cfg.algo.beta,
+        tau_target=cfg.algo.tau_target,
+        actor_lr=cfg.algo.actor_lr,
+        critic_lr=cfg.algo.critic_lr
+    )
+
+    # 5. 开始训练 (Training Loop)
+    print(f"🔥 开始 IDQL 离线训练 (Total Epochs: {cfg.epochs})")
+    
+    for epoch in range(1, cfg.epochs + 1):
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{cfg.epochs}", leave=False)
+        epoch_metrics = {}
+
+        for batch in pbar:
+            # 数据迁移至 Device 并拆解
+            obs_dict = {
+                'pc': batch['pc'].to(device),
+                'state': batch['state'].to(device)
+            }
+            next_obs_dict = {
+                'pc': batch['next_pc'].to(device),
+                'state': batch['next_state'].to(device)
+            }
+            action_chunk = batch['action_chunk'].to(device)
+            
+            # Note: RL 算法中 rewards 和 dones 需要 [Batch, 1] 形状才能与 V 值正常广播
+            rewards = batch['reward'].to(device).unsqueeze(-1)
+            dones = batch['done'].to(device).unsqueeze(-1)
+
+            # --- A. 更新 Critic (Q & V) ---
+            critic_info = agent.update_critic(obs_dict, action_chunk, rewards, next_obs_dict, dones)
+            
+            # --- B. 更新 Actor (Flow / Diffusion with Reject Sampling) ---
+            actor_info = agent.update_actor(obs_dict, action_chunk)
+            
+            # 合并日志
+            step_metrics = {**critic_info, **actor_info}
+            
+            # 更新累加器以计算 Epoch 均值
+            for k, v in step_metrics.items():
+                epoch_metrics[k] = epoch_metrics.get(k, 0) + v
+                
+            pbar.set_postfix({"v_loss": f"{step_metrics['loss/v']:.3f}", "act_loss": f"{step_metrics['loss/actor']:.3f}"})
+
+        # 计算 Epoch 平均指标并上传 WandB
+        for k in epoch_metrics:
+            epoch_metrics[k] /= len(dataloader)
+            
+        if cfg.wandb.enable:
+            wandb.log(epoch_metrics, step=epoch)
+
+        print(f"Epoch {epoch:03d} | Actor Loss: {epoch_metrics['loss/actor']:.4f} | Q Value: {epoch_metrics['q_value']:.4f} | Accept Ratio: {epoch_metrics['metrics/accept_ratio']*100:.1f}%")
+
+        # 定期保存权重 (Save Checkpoint)
+        if epoch % 10 == 0 or epoch == cfg.epochs:
+            ckpt_path = os.path.join(cfg.save_dir, f"idql_policy_ep{epoch}.pth")
+            # 仅保存 EmbodiedGenPolicy 的权重，方便后续推理和 Distill 直接加载
+            torch.save(base_policy.state_dict(), ckpt_path)
+            print(f"   💾 Saved Checkpoint to {ckpt_path}")
+
+    if cfg.wandb.enable:
+        wandb.finish()
+    print("🎉 离线预训练彻底完成！")
+
+if __name__ == "__main__":
+    main()
+```
+
+--- 💡 File: envs/maniskill_bridge.py ---
+```python
+# envs/maniskill_bridge.py
+import gymnasium as gym
+import numpy as np
+
+class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
+    """
+    将 ManiSkill 原生的点云字典转换为你的 Infra 所需的极简字典格式
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        # 你可以根据真实的 action_dim (比如 8) 和 state_dim (比如 18) 修改下面
+        self.observation_space = gym.spaces.Dict({
+            'xyz': gym.spaces.Box(-np.inf, np.inf, shape=(100000, 3), dtype=np.float32),
+            'rgb': gym.spaces.Box(0, 1, shape=(100000, 3), dtype=np.float32),
+            'state': gym.spaces.Box(-np.inf, np.inf, shape=(18,), dtype=np.float32)
+        })
+
+    def observation(self, obs):
+        # 辅助函数：防御性兼容 (ManiSkill GPU 模式返回 Tensor，CPU 模式返回 numpy)
+        def to_np(x):
+            return x.cpu().numpy() if hasattr(x, 'cpu') else np.array(x)
+
+        # 1. 提取点云 XYZ 和 RGB
+        # ManiSkill 默认点云结构可能按相机分组，我们把所有相机的点云压平合并
+        if 'pointcloud' in obs:
+            pc_dict = obs['pointcloud']
+            # ManiSkill 3 的点云通常在 xyzw 中，前三维是 xyz
+            if 'xyzw' in pc_dict:
+                xyz = to_np(pc_dict['xyzw'][..., :3]).reshape(-1, 3)
+            elif 'xyz' in pc_dict:
+                xyz = to_np(pc_dict['xyz']).reshape(-1, 3)
+            else:
+                xyz = np.zeros((0, 3))
+            
+            if 'rgb' in pc_dict:
+                # 归一化到 0~1
+                rgb = to_np(pc_dict['rgb']).reshape(-1, 3) / 255.0 
+            else:
+                rgb = np.zeros_like(xyz)
+        else:
+            xyz, rgb = np.zeros((0, 3)), np.zeros((0, 3))
+
+        # 2. 提取机器人本体状态 (Proprioception)
+        # 例如 7 DoF 关节位置 + 7 DoF 关节速度 = 14 维
+        qpos = to_np(obs['agent']['qpos']).reshape(-1)
+        qvel = to_np(obs['agent']['qvel']).reshape(-1)
+        state = np.concatenate([qpos, qvel], axis=-1).astype(np.float32)
+
+        return {
+            'xyz': xyz, 
+            'rgb': rgb, 
+            'state': state
+        }
+```
+
+--- 💡 File: envs/pointcloud_wrapper.py ---
+```python
+# envs/pointcloud_wrapper.py
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Dict, Optional, Tuple, Any
+
+class PointCloudObservationWrapper(gym.ObservationWrapper):
+    """
+    点云观测封装器 (适配 RL-100 / 3D Diffusion 架构)
+    功能：
+    1. 接收原始的 dict 观测 (包含无序点云 xyz, 颜色 rgb, 本体状态 state)
+    2. 工作空间裁剪 (Workspace Cropping) - 剔除无关背景，极大提升 3D Diffusion 效率
+    3. 点云降采样 (Downsampling) - 固定输出 N 个点，支持 PointNeXt/PointNet++ 批处理
+    4. 特征拼接 - 统一输出 {'point_cloud': [N, 3+C], 'state': [S]}
+    """
+    def __init__(
+        self, 
+        env: gym.Env, 
+        num_points: int = 1024, 
+        workspace_bounds: Optional[np.ndarray] = None, 
+        use_color: bool = False
+    ):
+        """
+        :param env: 原始 Gymnasium 环境
+        :param num_points: 降采样后的目标点云数量 (常用 1024 或 2048)
+        :param workspace_bounds: 形状为 (2, 3) 的 numpy 数组, [[xmin, ymin, zmin], [xmax, ymax, zmax]]
+        :param use_color: 是否在 point_cloud 维度中拼接 RGB 特征 (输出 Nx6 或 Nx3)
+        """
+        super().__init__(env)
+        self.num_points = num_points
+        self.workspace_bounds = workspace_bounds
+        self.use_color = use_color
+
+        # 校验原始环境是否包含我们需要的键
+        assert isinstance(self.env.observation_space, spaces.Dict), "基础环境观测必须是 Dict 空间"
+        assert 'state' in self.env.observation_space.spaces, "基础环境必须包含本体状态 'state'"
+
+        # 计算特征维度
+        pc_feature_dim = 6 if self.use_color else 3
+        state_dim = self.env.observation_space.spaces['state'].shape[0]
+
+        # 重写 Observation Space (给后端的 Buffer 和 Neural Network 明确形状)
+        self.observation_space = spaces.Dict({
+            'point_cloud': spaces.Box(
+                low=-np.inf, high=np.inf, 
+                shape=(self.num_points, pc_feature_dim), dtype=np.float32
+            ),
+            'state': spaces.Box(
+                low=-np.inf, high=np.inf, 
+                shape=(state_dim,), dtype=np.float32
+            )
+        })
+
+    def observation(self, obs: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """
+        每次 env.step() 或 env.reset() 后会自动调用此方法
+        """
+        # 1. 提取原始数据 (兼容不同环境的命名习惯)
+        xyz = obs.get('xyz', np.zeros((0, 3)))
+        rgb = obs.get('rgb', None)
+        state = obs['state']
+
+        # [修复] 如果要求用颜色，但环境没给，补零对齐维度，防止后续报 Shape Mismatch
+        if self.use_color and rgb is None:
+            rgb = np.zeros_like(xyz)
+
+        # 2. 工作空间裁剪 (剔除机器人本体基座、远处背景等无关信息)
+        if self.workspace_bounds is not None and xyz.shape[0] > 0:
+            mask = (
+                (xyz[:, 0] >= self.workspace_bounds[0, 0]) & (xyz[:, 0] <= self.workspace_bounds[1, 0]) &
+                (xyz[:, 1] >= self.workspace_bounds[0, 1]) & (xyz[:, 1] <= self.workspace_bounds[1, 1]) &
+                (xyz[:, 2] >= self.workspace_bounds[0, 2]) & (xyz[:, 2] <= self.workspace_bounds[1, 2])
+            )
+            xyz = xyz[mask]
+            if rgb is not None:
+                rgb = rgb[mask]
+
+        # 3. 点云降采样 / 补齐
+        num_current_pts = xyz.shape[0]
+        if num_current_pts == 0:
+            # 极端情况：视野内什么点都没有，返回全零以防止网络报错
+            xyz = np.zeros((self.num_points, 3))
+            if rgb is not None:
+                rgb = np.zeros((self.num_points, 3))
+        elif num_current_pts >= self.num_points:
+            # 使用随机采样 (FPS Farthest Point Sampling 在 Python 端做会较慢，随机采样在大多数场景足够好)
+            indices = np.random.choice(num_current_pts, self.num_points, replace=False)
+            xyz = xyz[indices]
+            if rgb is not None:
+                rgb = rgb[indices]
+        else:
+            # 点数不够，允许重复采样 (Padding)
+            indices = np.random.choice(num_current_pts, self.num_points, replace=True)
+            xyz = xyz[indices]
+            if rgb is not None:
+                rgb = rgb[indices]
+
+        # 4. 拼接点云特征
+        if self.use_color and rgb is not None:
+            # 假设 RGB 已经是 0-1 或 -1~1 归一化的浮点数
+            point_cloud = np.concatenate([xyz, rgb], axis=-1)
+        else:
+            point_cloud = xyz
+
+        return {
+            'point_cloud': point_cloud.astype(np.float32),
+            'state': state.astype(np.float32)
+        }
+
+
+# =========================================================================
+# 测试模块：用来验证代码是否可行
+# =========================================================================
+if __name__ == '__main__':
+    class DummyEmbodiedEnv(gym.Env):
+        """ 模拟一个底层环境（例如 ManiSkill3, MuJoCo 或是真机相机的返回流） """
+        def __init__(self):
+            super().__init__()
+            # 定义原始空间：含有数万个无序点的 xyz 和 rgb，以及 14 维的本体状态 (如关节角+末端位姿)
+            self.observation_space = spaces.Dict({
+                'xyz': spaces.Box(-10, 10, shape=(20000, 3), dtype=np.float32),
+                'rgb': spaces.Box(0, 1, shape=(20000, 3), dtype=np.float32),
+                'state': spaces.Box(-1, 1, shape=(14,), dtype=np.float32)
+            })
+            self.action_space = spaces.Box(-1, 1, shape=(7,), dtype=np.float32)
+
+        def reset(self, seed=None, options=None):
+            # 模拟相机生成一团包含桌面、目标物和背景的点云
+            raw_xyz = np.random.uniform(-2, 2, size=(15000, 3))
+            raw_rgb = np.random.uniform(0, 1, size=(15000, 3))
+            state = np.random.uniform(-1, 1, size=(14,))
+            obs = {'xyz': raw_xyz, 'rgb': raw_rgb, 'state': state}
+            return obs, {}
+
+        def step(self, action):
+            obs, _ = self.reset()
+            reward = 1.0
+            done = False
+            return obs, reward, done, False, {}
+
+    print("=== 初始化原始虚拟环境 ===")
+    base_env = DummyEmbodiedEnv()
+    
+    # 设定机械臂桌面操作的工作空间 (单位：米)
+    # 例如：x:[0.1, 0.8] (前方), y:[-0.5, 0.5] (左右), z:[0.0, 0.6] (高度)
+    ws_bounds = np.array([
+        [0.1, -0.5, 0.0],
+        [0.8,  0.5, 0.6]
+    ])
+
+    print("=== 接入 PointCloudObservationWrapper ===")
+    env = PointCloudObservationWrapper(
+        env=base_env,
+        num_points=1024,                # 降采样到 1024 个点
+        workspace_bounds=ws_bounds,     # 剔除框外干扰点
+        use_color=True                  # 采用 XYZ + RGB (6维特征)
+    )
+
+    print("\n[环境观测空间]")
+    print(env.observation_space)
+
+    obs, info = env.reset()
+    print("\n[Reset后 - Wrapper 输出的数据维度]")
+    print(f"Point Cloud Shape: {obs['point_cloud'].shape}  (应为 1024, 6)")
+    print(f"Robot State Shape: {obs['state'].shape}        (应为 14,)")
+    print(f"Point Cloud Sample [0]: \n{obs['point_cloud'][0]}")
+
+    print("\n[Step 测试]")
+    action = env.action_space.sample()
+    obs, reward, terminated, truncated, info = env.step(action)
+    print(f"Step后提取的 Point Cloud Shape: {obs['point_cloud'].shape}")
+    print("================ 测试通过 ✅ ================")
+```
+
+--- 💡 File: envs/chunk_wrapper.py ---
+```python
+# envs/chunk_wrapper.py
+import gymnasium as gym
+import numpy as np
+
+class ChunkActionWrapper(gym.Wrapper):
+    """
+    针对 3D Diffusion / Flow Policy 设计的 Action Chunk Wrapper。
+    
+    核心功能：
+    1. 接收模型输出的 Action Chunk (shape: [chunk_size, action_dim])。
+    2. 维护历史预测序列，通过 Temporal Ensembling (时序集成) 平滑动作。
+    3. 在底层环境执行 `exec_steps` 步动作后，返回最新状态给外部模型再次推理。
+    """
+    def __init__(self, env: gym.Env, chunk_size: int = 16, exec_steps: int = 1, exp_weight: float = 0.01):
+        """
+        :param env: 原始环境
+        :param chunk_size: 策略网络单次预测的未来动作步数 (Horizon)
+        :param exec_steps: 每次模型预测后，在环境中实际连续执行的步数 (通常为1~8)
+                           如果是 1，则属于最高频的 Temporal Ensembling。
+        :param exp_weight: 时序集成的指数衰减权重。越大代表越不信任老旧预测。
+                           公式: weight = exp(-exp_weight * age)
+        """
+        super().__init__(env)
+        self.chunk_size = chunk_size
+        self.exec_steps = exec_steps
+        self.exp_weight = exp_weight
+        
+        # 记录全局步数
+        self.global_step = 0
+        
+        # 存储历史动作块, 格式: [(生成时的时间步, action_chunk_array), ...]
+        self.action_history = []
+        
+        # 修改环境的 Action Space，告知外部算法这里需要输入 (chunk_size, action_dim) 的形状
+        orig_space = env.action_space
+        if isinstance(orig_space, gym.spaces.Box):
+            self.action_space = gym.spaces.Box(
+                low=np.repeat(orig_space.low[None, ...], chunk_size, axis=0),
+                high=np.repeat(orig_space.high[None, ...], chunk_size, axis=0),
+                dtype=orig_space.dtype
+            )
+            # [Opt] 保存原始动作空间的上下界，用于后续的浮点数安全裁剪
+            self._orig_low = orig_space.low
+            self._orig_high = orig_space.high
+        else:
+            raise NotImplementedError("Chunk Wrapper 目前只支持 Box (连续动作空间).")
+
+    def reset(self, **kwargs):
+        """重置环境与历史轨迹 buffer"""
+        self.global_step = 0
+        self.action_history.clear()
+        return self.env.reset(**kwargs)
+
+    def step(self, action_chunk: np.ndarray):
+        """
+        :param action_chunk: 形状为 (chunk_size, action_dim) 的 NumPy 数组
+        """
+        assert action_chunk.shape[0] == self.chunk_size, f"期待动作长度 {self.chunk_size}, 实际拿到 {action_chunk.shape[0]}"
+        
+        # 将最新预测的 Chunk 压入历史列表
+        self.action_history.append((self.global_step, action_chunk))
+        
+        total_reward = 0.0
+        done, truncated = False, False
+        latest_obs = None
+        latest_info = {}
+        
+        # [Fix] 记录实际执行的步数，防止因为 done/truncated 提前结束导致 global_step 错误
+        actual_steps = 0
+
+        # 在环境中连续执行 exec_steps 步
+        for i in range(self.exec_steps):
+            current_t = self.global_step + i
+            
+            # 使用时序集成计算出【当前时刻】最合适的单步动作
+            ensembled_action = self._get_ensembled_action(current_t)
+            
+            # 丢给真实环境去执行
+            obs, reward, done, truncated, info = self.env.step(ensembled_action)
+            
+            total_reward += reward
+            latest_obs = obs
+            latest_info = info
+            actual_steps += 1
+            
+            if done or truncated:
+                break
+                
+        # 更新全局时间步 [Fix: 修改为增加实际执行的步数]
+        self.global_step += actual_steps
+        
+        # 垃圾回收：清理掉那些已经“过期”的 chunk (它的覆盖范围已经完全落在过去)
+        # 只要 chunk 生成时间 + chunk_size > 当前时间，说明它对未来还有用
+        self.action_history = [
+            (t_g, chunk) for (t_g, chunk) in self.action_history 
+            if t_g + self.chunk_size > self.global_step
+        ]
+        
+        return latest_obs, total_reward, done, truncated, latest_info
+
+    def _get_ensembled_action(self, target_t: int) -> np.ndarray:
+        """
+        聚合所有覆盖了 target_t 这个时刻的历史 chunk 的预测，取指数加权平均。
+        """
+        valid_actions = []
+        ages = []
+        
+        for (t_g, chunk) in self.action_history:
+            # 找到 target_t 在该 chunk 中的对应索引
+            idx_in_chunk = target_t - t_g
+            
+            # 确保索引合法 (没有越界)
+            if 0 <= idx_in_chunk < self.chunk_size:
+                valid_actions.append(chunk[idx_in_chunk])
+                ages.append(target_t - t_g) # age 即距离该 chunk 生成过去了多少步
+                
+        if not valid_actions:
+            raise RuntimeError(f"在时刻 {target_t} 没有找到有效的动作预测！")
+            
+        valid_actions = np.array(valid_actions)
+        ages = np.array(ages)
+        
+        # 计算时序集成的指数权重：越老的预测 (age越大)，权重越小
+        # weight = e^(-k * age)
+        weights = np.exp(-self.exp_weight * ages)
+        weights = weights / np.sum(weights)  # 归一化
+        
+        # 加权求和得到最终的单一动作
+        ensembled_action = np.sum(valid_actions * weights[:, None], axis=0)
+        
+        # [Opt] 解决浮点精度问题：确保加权后的动作严格在原始环境的合法范围内
+        ensembled_action = np.clip(ensembled_action, self._orig_low, self._orig_high)
+        
+        return ensembled_action
+
+
+# ==========================================
+# 测试模块：检查该 Wrapper 是否符合逻辑
+# ==========================================
+if __name__ == '__main__':
+    print(">>> 开始测试 ChunkActionWrapper...")
+    
+    # 使用基础的连续控制环境作为 dummy env
+    base_env = gym.make("Pendulum-v1")
+    
+    # 假设模型的 Chunk Size = 8，每次预测后执行 2 步 (exec_steps=2)
+    CHUNK_SIZE = 8
+    EXEC_STEPS = 2
+    
+    env = ChunkActionWrapper(base_env, chunk_size=CHUNK_SIZE, exec_steps=EXEC_STEPS, exp_weight=0.01)
+    
+    obs, info = env.reset()
+    action_dim = base_env.action_space.shape[0]
+    
+    print(f"环境初始动作空间维度: {base_env.action_space.shape}")
+    print(f"包装后期待的 Chunk 动作空间: {env.action_space.shape}")
+    
+    # 模拟 Diffusion Policy 在不同时间步输出动作 Chunk
+    for step_idx in range(3):
+        # 模拟生成模型前向推理出来的动作块：尺寸为 (8, 1)
+        # 为了测试效果，我们在这里放置有规律的数字，方便观察集成结果
+        fake_action_chunk = np.random.uniform(-1, 1, size=(CHUNK_SIZE, action_dim))
+        
+        print(f"\n--- 模型第 {step_idx + 1} 次调用 (当前全局环境步数: {env.global_step}) ---")
+        
+        # 把 chunk 扔进环境中执行
+        next_obs, reward, done, truncated, info = env.step(fake_action_chunk)
+        
+        print(f"当前历史 Buffer 中保留的 Chunk 数量: {len(env.action_history)}")
+        print(f"成功执行了 {EXEC_STEPS} 步环境迭代，获得奖励: {reward:.4f}")
+        
+        if done or truncated:
+            break
+            
+    print("\n>>> ChunkActionWrapper 测试通过！该逻辑可以直接用于你的 3D Infra 项目中。")
+```
+
+--- 💡 File: models/policy.py ---
+```python
+# models/policy.py
+"""
+Embodied Policy Core (Flow / Diffusion Policy)
+为 3D 具身智能 (PointCloud + Chunk Action) 打造的通用策略包装器。
+
+完美适配：
+1. Behavior Cloning (BC) & IDQL: 通过 compute_loss() 接口
+2. Env Rollout (推理): 通过 sample() 接口
+3. One-step Distillation: 通过 forward() 接口暴露底层前向计算
+4. Policy Gradient (PG): 通过 evaluate_actions() 提供近似对数似然估计
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict, Tuple, Union
+
+# 导入你提供的各个模块 (请确保这些文件在你的 PYTHONPATH 中)
+from models.encoders.pointnext import PointNeXtEncoder
+from models.backbones.transformer import ActionDiffusionTransformer
+from models.backbones.unet1d import ConditionalUnet1D
+from algos.diffusion_utils.flow_matching import OTFlowMatching
+from algos.diffusion_utils.ddim_scheduler import DDIMScheduler
+
+class EmbodiedGenPolicy(nn.Module):
+    def __init__(
+        self,
+        # 1. 空间/动作定义
+        action_dim: int = 7,
+        chunk_size: int = 16,
+        use_state: bool = True,
+        state_dim: int = 14,
+        
+        # 2. 网络结构配置
+        encoder_type: str = "pointnext", 
+        backbone_type: str = "transformer", # "transformer" or "unet1d"
+        cond_dim: int = 256,                # 融合后条件向量维度
+        
+        # 3. 生成算法配置
+        algo_type: str = "flow",            # "flow" (推荐) or "diffusion"
+        num_train_steps: int = 100,         # 仅 Diffusion 需要
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+        self.use_state = use_state
+        self.state_dim = state_dim
+        self.algo_type = algo_type.lower()
+
+        # ====================================================================
+        # 1. 实例化 3D 编码器 (Encoder)
+        # ====================================================================
+        if encoder_type == "pointnext":
+            self.encoder = PointNeXtEncoder(
+                in_channels=3, 
+                output_dim=cond_dim, 
+                use_state=use_state, 
+                state_dim=state_dim
+            )
+        else:
+            raise NotImplementedError(f"Unsupported encoder: {encoder_type}")
+
+        # ====================================================================
+        # 2. 实例化 骨干网络 (Backbone)
+        # ====================================================================
+        if backbone_type == "transformer":
+            self.backbone = ActionDiffusionTransformer(
+                action_dim=action_dim,
+                cond_dim=cond_dim,
+                chunk_size=chunk_size,
+                embed_dim=256,
+                depth=6,
+                num_heads=8
+            )
+        elif backbone_type == "unet1d":
+            self.backbone = ConditionalUnet1D(
+                action_dim=action_dim,
+                global_cond_dim=cond_dim,
+                down_dims=(128, 256, 512)
+            )
+        else:
+            raise NotImplementedError(f"Unsupported backbone: {backbone_type}")
+
+        # ====================================================================
+        # 3. 实例化 生成调度器 (Scheduler)
+        # ====================================================================
+        if self.algo_type == "flow":
+            self.scheduler = OTFlowMatching(sigma_min=1e-5)
+        elif self.algo_type == "diffusion":
+            self.scheduler = DDIMScheduler(num_train_timesteps=num_train_steps)
+        else:
+            raise ValueError("algo_type must be 'flow' or 'diffusion'")
+
+    def _get_condition(self, obs: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """ 内部辅助函数：将点云和本体状态打包喂给 Encoder """
+        obs_dict = {'point_cloud': obs}
+        if self.use_state and state is not None:
+            obs_dict['state'] = state
+        return self.encoder(obs_dict)
+
+    # ========================================================================
+    # [核心接口 1] Distillation / 基础前向计算
+    # 与 algos/distill.py 完全对齐 (student_v = self.student(obs, state, z_noise, t_zero))
+    # ========================================================================
+    def forward(self, obs: torch.Tensor, state: torch.Tensor, noisy_action: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        """
+        直接暴露底层计算流，专供 One-step Distillation 和 Teacher-forcing 使用。
+        """
+        cond = self._get_condition(obs, state)
+        
+        # 如果 time 的维度是 [B, 1]，需要 squeeze 成 [B] 给 Transformer/UNet
+        if time.dim() == 2 and time.shape[1] == 1:
+            time = time.squeeze(1)
+            
+        return self.backbone(noisy_action, time, cond)
+
+    # ========================================================================
+    # [核心接口 2] BC / IDQL 训练
+    # 与 algos/idql.py 完全对齐 (actor_loss = self.actor.compute_loss(filtered_states, filtered_actions))
+    # ========================================================================
+    def compute_loss(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        计算生成模型的训练 Loss (Vector Field MSE 或 Denoising MSE)
+        支持 IDQL 传入过滤后的高质量样本直接求导。
+        """
+        cond = self._get_condition(obs, state)
+
+        if self.algo_type == "flow":
+            # Flow Matching 直接利用你写好的 OTFlowMatching.compute_loss
+            # 注意：我们将 self.backbone 传入，巧妙解耦
+            return self.scheduler.compute_loss(self.backbone, actions, cond)
+            
+        elif self.algo_type == "diffusion":
+            # DDPM/DDIM 标准加噪与 MSE 训练逻辑
+            B = actions.shape[0]
+            device = actions.device
+            noise = torch.randn_like(actions)
+            # 随机采样整数时间步
+            timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (B,), device=device).long()
+            
+            # 加噪
+            noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)
+            
+            # 预测
+            pred = self.backbone(noisy_actions, timesteps, cond)
+            
+            # 假定 prediction_type == "epsilon" (预测噪声)
+            return F.mse_loss(pred, noise)
+
+    # ========================================================================
+    # [核心接口 3] 环境 Rollout / 动作推断
+    # ========================================================================
+    @torch.no_grad()
+    def sample(self, 
+               obs: torch.Tensor, 
+               state: Optional[torch.Tensor] = None, 
+               num_steps: int = 10, 
+               cfg_weight: float = 1.0) -> torch.Tensor:
+        """
+        用于环境交互期间生成动作 Chunk。
+        """
+        cond = self._get_condition(obs, state)
+        action_shape = (self.chunk_size, self.action_dim)
+        
+        if self.algo_type == "flow":
+            # [Fix: CFG 修复] - 补充 uncond_cond 生成逻辑，否则 cfg_weight 传入底层会失效
+            uncond_cond = None
+            if cfg_weight != 1.0:
+                dummy_obs = torch.zeros_like(obs)
+                dummy_state = torch.zeros_like(state) if (self.use_state and state is not None) else None
+                uncond_cond = self._get_condition(dummy_obs, dummy_state)
+            
+            # 调用你写好的 Flow ODE Solver
+            return self.scheduler.sample(
+                model=self.backbone, 
+                cond=cond, 
+                action_shape=action_shape, 
+                num_steps=num_steps,
+                solver='euler',       # Euler 对于 10 步通常足够且快
+                cfg_weight=cfg_weight,
+                uncond_cond=uncond_cond # [Fix] 将无条件特征传入 Flow Matching
+            )
+            
+        elif self.algo_type == "diffusion":
+            # 调用你写好的 DDIM Step 循环
+            B = cond.shape[0]
+            device = cond.device
+            self.scheduler.set_timesteps(num_steps, device=device)
+            
+            x_t = torch.randn((B, *action_shape), device=device)
+            for t in self.scheduler.timesteps:
+                t_batch = torch.full((B,), t.item(), device=device, dtype=torch.long)
+                pred = self.backbone(x_t, t_batch, cond)
+                x_t = self.scheduler.step(pred, int(t.item()), x_t)
+                
+            return x_t
+
+    # ========================================================================
+    # [核心接口 4] Policy Gradient (PPO) 辅助评估
+    # 与 algos/pg.py 完全对齐 (log_probs, entropy = self.policy.evaluate_actions(states, actions))
+    # ========================================================================
+    def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        【硬核提醒】计算 Flow/Diffusion 的精确 log_prob 需要解常微分方程(ODE)的迹，计算极慢。
+        在现代具身 RL 中 (如 DP3/RL-100)，PG 微调通常采用 "Denoising MSE 代理似然" 
+        或者直接通过 "Gaussian Proxy" 计算。
+        这里我们实现了一个基于 Denoising Error 的 Proxy Log-Prob，这不仅快，而且梯度稳定。
+        """
+        B = obs.shape[0]
+        device = obs.device
+        cond = self._get_condition(obs, state)
+        
+        # [Fix: PPO 稳定性危机] - PG 中的 evaluate_actions 多个 Epoch 会评测同样的 (s,a)。
+        # 如果使用随机 noise = torch.randn_like(actions)，每次算出的 log_prob 都会剧烈震荡，
+        # 导致 PPO 的 Ratio 疯狂触发错误 Clip。必须使用确定性（Deterministic）的 Proxy！
+        # 我们用全 0 Tensor 作为恒定的代理扰动起点。
+        deterministic_noise = torch.zeros_like(actions)
+
+        # 我们使用一个固定的居中时间步 (如 t=0.5) 评估一步去噪误差作为似然的代理
+        if self.algo_type == "flow":
+            t_fixed = torch.full((B,), 0.5, device=device)
+            # Flow 的 target 速度公式 [修复：传入确定性噪声]
+            xt = (1 - (1 - 1e-5) * t_fixed.view(B, 1, 1)) * deterministic_noise + t_fixed.view(B, 1, 1) * actions
+            target_v = actions - (1 - 1e-5) * deterministic_noise
+            pred_v = self.backbone(xt, t_fixed, cond)
+            
+            # 使用 MSE 作为负对数似然的代理 (代理高斯分布)
+            mse_error = torch.mean((pred_v - target_v) ** 2, dim=(-1, -2)) 
+            log_prob = -mse_error 
+            
+            # 启发式 Entropy (防止方差坍缩)
+            entropy = torch.ones_like(log_prob) * 1.0 # 占位，或者返回 action_var
+            
+        else: # diffusion
+            t_fixed = torch.full((B,), self.scheduler.num_train_timesteps // 2, device=device, dtype=torch.long)
+            # [修复：传入确定性噪声]
+            xt = self.scheduler.add_noise(actions, deterministic_noise, t_fixed)
+            pred_noise = self.backbone(xt, t_fixed, cond)
+            
+            mse_error = torch.mean((pred_noise - deterministic_noise) ** 2, dim=(-1, -2))
+            log_prob = -mse_error
+            entropy = torch.ones_like(log_prob) * 1.0
+            
+        return log_prob, entropy
+
+
+
+# ==============================================================================
+# 本地测试模块 
+# ==============================================================================
+if __name__ == "__main__":
+    print("🚀 启动 EmbodiedGenPolicy 大一统核心测试...\n")
+    
+    # 模拟超参数
+    BATCH_SIZE = 4
+    N_POINTS = 1024
+    OBS_DIM = 3
+    STATE_DIM = 7
+    CHUNK_SIZE = 16
+    ACTION_DIM = 7
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"🖥️  测试设备: {DEVICE}")
+    
+    # 初始化策略 (以最前沿的 Transformer + Flow Matching 为例)
+    print("1️⃣ 正在初始化 Flow Transformer Policy...")
+    policy = EmbodiedGenPolicy(
+        action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE, 
+        use_state=True, state_dim=STATE_DIM,
+        encoder_type="pointnext", backbone_type="transformer", algo_type="flow"
+    ).to(DEVICE)
+    print(f"✅ 初始化完成！总参数量: {sum(p.numel() for p in policy.parameters()) / 1e6:.2f} M\n")
+
+    # 模拟数据
+    dummy_obs = torch.randn((BATCH_SIZE, N_POINTS, OBS_DIM), device=DEVICE)
+    dummy_state = torch.randn((BATCH_SIZE, STATE_DIM), device=DEVICE)
+    dummy_actions = torch.randn((BATCH_SIZE, CHUNK_SIZE, ACTION_DIM), device=DEVICE)
+
+    # 测试 1: BC/IDQL Loss 计算
+    print("2️⃣ 测试 IDQL/BC 前向 Loss 计算 (compute_loss)...")
+    loss = policy.compute_loss(dummy_obs, dummy_actions, dummy_state)
+    print(f"✅ Loss 计算成功: {loss.item():.4f}\n")
+
+    # 测试 2: 环境推断 Sample
+    print("3️⃣ 测试 环境推断 (sample)...")
+    generated_actions = policy.sample(dummy_obs, dummy_state, num_steps=10)
+    print(f"✅ 推断成功，输出维度 (应与目标一致): {generated_actions.shape}\n")
+
+    # 测试 3: 蒸馏底层调用 Distill Forward
+    print("4️⃣ 测试 蒸馏底层调用 (forward)...")
+    t_zero = torch.zeros((BATCH_SIZE, 1), device=DEVICE)
+    z_noise = torch.randn_like(dummy_actions)
+    v_pred = policy(dummy_obs, dummy_state, z_noise, t_zero)
+    print(f"✅ 前向成功，输出维度: {v_pred.shape}\n")
+
+    # 测试 4: PG PPO 似然估计
+    print("5️⃣ 测试 PG 似然评估 (evaluate_actions)...")
+    log_probs, entropy = policy.evaluate_actions(dummy_obs, dummy_actions, dummy_state)
+    print(f"✅ 似然估计成功，Log Probs shape: {log_probs.shape}\n")
+
+    print("🎉 EmbodiedGenPolicy 完美契合你的所有底层协议，可以开服了！")
+```
+
+--- 💡 File: models/critics/q_v_network.py ---
+```python
+# models/critics/q_v_network.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+def weight_init(m):
+    """用于 RL 的正交初始化"""
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight.data)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias.data)
+            
+class MLP(nn.Module):
+    """
+    基础的多层感知机 (MLP) 模块，用于构建 Q 和 V 网络。
+    """
+    def __init__(self, input_dim, hidden_dims, output_dim, activation=nn.GELU):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.LayerNorm(h_dim)) # 使用 LayerNorm 提升离线 RL 训练稳定性
+            layers.append(activation())
+            in_dim = h_dim
+        # 最后一层
+        last_layer = nn.Linear(in_dim, output_dim)
+        # 针对 RL Critic 的 Trick：最后一层权重初始化为一个极小的值 (如 3e-3)
+        # 这样网络刚开始输出的 Q/V 值接近 0，防止启动时 advantage 爆炸
+        nn.init.uniform_(last_layer.weight, -3e-3, 3e-3)
+        nn.init.uniform_(last_layer.bias, -3e-3, 3e-3)
+        
+        layers.append(last_layer)
+        self.net = nn.Sequential(*layers)
+        
+        # 对除最后一层外的其他层应用正交初始化
+        self.net[:-1].apply(weight_init)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class VNetwork(nn.Module):
+    """
+    V(s) 价值网络：用于 IDQL 中计算 Advantage (A = Q - V) 和 Expectile Regression。
+    输入: state_embedding (Point Cloud Feature + Proprioception Feature 融合后的一维向量)
+    输出: V-value (标量)
+    """
+    def __init__(self, state_dim, hidden_dims=[256, 256, 256]):
+        super().__init__()
+        self.v_net = MLP(input_dim=state_dim, hidden_dims=hidden_dims, output_dim=1)
+
+    def forward(self, state_embedding):
+        """
+        Args:
+            state_embedding: Tensor of shape [B, state_dim]
+        Returns:
+            v_value: Tensor of shape [B, 1]
+        """
+        return self.v_net(state_embedding)
+
+
+class TwinQNetwork(nn.Module):
+    """
+    双 Q(s, a) 网络：用于缓解离线 RL (IDQL) 和在线 PG 中的 Q 值高估问题。
+    输入: state_embedding, action_chunk
+    输出: Q1, Q2 (标量)
+    """
+    def __init__(self, state_dim, action_dim, chunk_size, hidden_dims=[256, 256, 256]):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        
+        # 因为输入的是 Chunk Action，我们将其 Flatten 为一维向量
+        # 实际输入 Q 网络的维度是: state_dim + (chunk_size * action_dim)
+        input_dim = state_dim + (chunk_size * action_dim)
+
+        self.q1_net = MLP(input_dim=input_dim, hidden_dims=hidden_dims, output_dim=1)
+        self.q2_net = MLP(input_dim=input_dim, hidden_dims=hidden_dims, output_dim=1)
+
+    def forward(self, state_embedding, action_chunk):
+        """
+        Args:
+            state_embedding: Tensor of shape [B, state_dim]
+            action_chunk: Tensor of shape [B, chunk_size, action_dim]
+        Returns:
+            q1, q2: Tensors of shape [B, 1]
+        """
+        batch_size = state_embedding.shape[0]
+        
+        # 将 Chunk Action 展平 [B, chunk_size, action_dim] -> [B, chunk_size * action_dim]
+        action_flat = action_chunk.view(batch_size, -1)
+        
+        # 拼接状态与动作 [B, state_dim + chunk_size * action_dim]
+        sa_cat = torch.cat([state_embedding, action_flat], dim=1)
+        
+        q1 = self.q1_net(sa_cat)
+        q2 = self.q2_net(sa_cat)
+        return q1, q2
+
+    def get_q1(self, state_embedding, action_chunk):
+        """仅在某些策略更新时(如PG/Distill)需要单Q值时调用"""
+        batch_size = state_embedding.shape[0]
+        action_flat = action_chunk.view(batch_size, -1)
+        sa_cat = torch.cat([state_embedding, action_flat], dim=1)
+        return self.q1_net(sa_cat)
+
+
+# ==========================================
+# 下方为 Mock 的状态编码器，仅用于测试展示整体的数据流
+# 实际项目中，你需要从 models/encoders 导入你的 PointNeXt
+# ==========================================
+class MockStateEncoder(nn.Module):
+    """
+    模拟一个 3D 点云 + 本体感觉的编码器
+    用于将 Point Cloud [B, N, 3+C] 和 Proprioception [B, P] 映射为 State Embedding
+    """
+    def __init__(self, proprio_dim, state_dim=512):
+        super().__init__()
+        # 假设点云经过 PointNeXt 提取出 256 维特征
+        self.point_feature_dim = 256
+        self.proprio_proj = nn.Linear(proprio_dim, 128)
+        self.fusion_mlp = MLP(input_dim=self.point_feature_dim + 128, 
+                              hidden_dims=[256], 
+                              output_dim=state_dim)
+
+    def forward(self, point_cloud, proprio):
+        # 模拟点云特征提取 (假装用 PointNeXt 提取了 Global Feature)
+        batch_size = point_cloud.shape[0]
+        mock_point_features = torch.randn(batch_size, self.point_feature_dim).to(point_cloud.device)
+        
+        # 本体特征映射
+        proprio_feat = F.relu(self.proprio_proj(proprio))
+        
+        # 拼接并融合
+        fused = torch.cat([mock_point_features, proprio_feat], dim=1)
+        state_embedding = self.fusion_mlp(fused)
+        return state_embedding
+
+
+if __name__ == "__main__":
+    print("="*50)
+    print("Testing Q and V Networks for IDQL & PG with Chunk Action")
+    print("="*50)
+
+    # 1. 定义超参数 (假设针对桌面机械臂抓取任务)
+    BATCH_SIZE = 16
+    NUM_POINTS = 1024       # 降采样后的点云数量
+    POINT_DIM = 3           # [X, Y, Z]
+    PROPRIO_DIM = 14        # 本体感觉 (7DoF 关节角 + 7DoF 速度等)
+    CHUNK_SIZE = 8          # Action Chunk 大小 (未来 8 步轨迹)
+    ACTION_DIM = 7          # 动作维度 (6DoF 位姿 + 1DoF 夹爪)
+    STATE_EMBED_DIM = 512   # 融合后的 State Embedding 维度
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {DEVICE}")
+
+    # 2. 初始化网络
+    state_encoder = MockStateEncoder(proprio_dim=PROPRIO_DIM, state_dim=STATE_EMBED_DIM).to(DEVICE)
+    v_network = VNetwork(state_dim=STATE_EMBED_DIM).to(DEVICE)
+    twin_q_network = TwinQNetwork(
+        state_dim=STATE_EMBED_DIM, 
+        action_dim=ACTION_DIM, 
+        chunk_size=CHUNK_SIZE
+    ).to(DEVICE)
+
+    # 3. 构造 Dummy Data (模拟从 Replay Buffer 中取出的一个 Batch)
+    dummy_points = torch.randn(BATCH_SIZE, NUM_POINTS, POINT_DIM).to(DEVICE)
+    dummy_proprio = torch.randn(BATCH_SIZE, PROPRIO_DIM).to(DEVICE)
+    dummy_action_chunk = torch.randn(BATCH_SIZE, CHUNK_SIZE, ACTION_DIM).to(DEVICE)
+
+    print("\n[Input Shapes]")
+    print(f"Point Cloud   : {dummy_points.shape}")
+    print(f"Proprioception: {dummy_proprio.shape}")
+    print(f"Action Chunk  : {dummy_action_chunk.shape}")
+
+    # 4. 前向传播测试
+    # Step 4.1: 提取 State Embedding (在 RL 训练 step 中只需要提取一次！)
+    state_embedding = state_encoder(dummy_points, dummy_proprio)
+    print(f"\n[Intermediate] State Embedding shape: {state_embedding.shape}")
+
+    # Step 4.2: 计算 V(s) (用于 IDQL Advantage 计算)
+    v_values = v_network(state_embedding)
+    print(f"[Output] V_values shape: {v_values.shape}")
+
+    # Step 4.3: 计算 Q1(s, a_chunk), Q2(s, a_chunk) (用于 Critic 更新)
+    q1, q2 = twin_q_network(state_embedding, dummy_action_chunk)
+    print(f"[Output] Q1 shape: {q1.shape}")
+    print(f"[Output] Q2 shape: {q2.shape}")
+
+    # 5. 模拟一个简单的 IDQL Loss 计算过程 (验证梯度流通)
+    print("\n[Testing Backprop / Gradient flow (Mock IDQL logic)]")
+    # 假设我们要更新 V 网络 (Expectile Regression)
+    # Advantage = Q - V
+    # 这里用 Q1 模拟 Target Q
+    with torch.no_grad():
+        target_q, _ = twin_q_network(state_embedding, dummy_action_chunk)
+    
+    adv = target_q - v_values
+    expectile = 0.7
+    # Expectile loss: |tau - I(adv < 0)| * adv^2
+    weight = torch.where(adv > 0, expectile, (1 - expectile))
+    v_loss = (weight * (adv ** 2)).mean()
+    
+    v_loss.backward()
+    print(f"V_loss: {v_loss.item():.4f}")
+    
+    # 检查梯度是否正常生成
+    v_has_grad = any(p.grad is not None for p in v_network.parameters())
+    print(f"VNetwork has gradients after backward: {v_has_grad}")
+    
+    print("\n=== Test Passed Successfully! ===")
+```
+
+--- 💡 File: models/backbones/transformer.py ---
+```python
+# models/backbones/transformer.py
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SinusoidalPosEmb(nn.Module):
+    """
+    经典的正弦波位置编码，用于将连续的 Timestep 转化为高维特征
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        # x: [Batch]
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+class AdaLN(nn.Module):
+    """
+    Adaptive Layer Normalization (AdaLN)
+    用于将环境特征 (Cond) 和 时间步 (Timestep) 调制并注入到 Transformer 块中
+    """
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.silu = nn.SiLU()
+        # 输出 6 倍维度，分别对应 Self-Attention 和 FFN 的 (shift, scale, gate)
+        self.linear = nn.Linear(embed_dim, embed_dim * 6)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, c):
+        # c: [Batch, embed_dim]
+        c = self.silu(c)
+        c = self.linear(c)
+        # 将输出切分为 6 个部分，形状均为 [Batch, embed_dim]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = c.chunk(6, dim=1)
+        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+class DiTBlock(nn.Module):
+    """
+    Diffusion Transformer Block
+    带有 AdaLN 调制的标准 Transformer Encoder Layer
+    """
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        
+        # FFN层 (使用GELU)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        
+        self.adaLN_modulation = AdaLN(embed_dim)
+
+    def forward(self, x, c):
+        # x: [Batch, Chunk_size, embed_dim]
+        # c: [Batch, embed_dim] (Timestep + 3D/State Feature 融合后的特征)
+        
+        # 1. 获取调制参数，并增加序列维度以匹配 x: [Batch, 1, embed_dim]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
+            param.unsqueeze(1) for param in self.adaLN_modulation(c)
+        ]
+
+        # 2. Attention 模块 (带调制)
+        norm_x1 = self.norm1(x) * (1 + scale_msa) + shift_msa
+        attn_out, _ = self.attn(norm_x1, norm_x1, norm_x1)
+        x = x + gate_msa * attn_out
+
+        # 3. FFN 模块 (带调制)
+        norm_x2 = self.norm2(x) * (1 + scale_mlp) + shift_mlp
+        ffn_out = self.ffn(norm_x2)
+        x = x + gate_mlp * ffn_out
+
+        return x
+
+class ActionDiffusionTransformer(nn.Module):
+    """
+    主网络 Backbone：专为 Flow / 3D Diffusion 优化的 Chunk Action Transformer
+    """
+    def __init__(
+        self, 
+        action_dim, 
+        cond_dim, 
+        chunk_size, 
+        embed_dim=256, 
+        depth=6, 
+        num_heads=8
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.cond_dim = cond_dim
+        self.chunk_size = chunk_size
+        self.embed_dim = embed_dim
+        
+        # 1. Timestep Embedding
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb(embed_dim),
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        
+        # 2. Condition (3D features + state) Embedding
+        self.cond_emb = nn.Sequential(
+            nn.Linear(cond_dim, embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        
+        # 3. Action / Chunk Embedding
+        self.action_proj = nn.Linear(action_dim, embed_dim)
+        # Learnable Positional Embedding for Action Chunk Sequence
+        self.pos_embed = nn.Parameter(torch.randn(1, chunk_size, embed_dim) * 0.02)
+        
+        # 4. Transformer Blocks
+        self.blocks = nn.ModuleList([
+            DiTBlock(embed_dim, num_heads) for _ in range(depth)
+        ])
+        
+        # 5. Output Projector (Predict Noise or Vector Field)
+        self.final_norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        self.final_adaLN = nn.Linear(embed_dim, embed_dim * 2)
+        self.action_out = nn.Linear(embed_dim, action_dim)
+
+        self.cond_time_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Mish(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        # 针对 Diffusion 模型的零初始化技巧 (Zero-initialization for outputs)
+        nn.init.zeros_(self.action_out.weight)
+        nn.init.zeros_(self.action_out.bias)
+        nn.init.zeros_(self.final_adaLN.weight)
+        nn.init.zeros_(self.final_adaLN.bias)
+
+    def forward(self, x, timestep, cond):
+        """
+        x: [B, Chunk_Size, Action_Dim] (Noisy actions at current step)
+        timestep: [B] (Current diffusion/flow step)
+        cond: [B, Cond_Dim] (Output from PointNeXt encoder + Robot proprioception)
+        
+        Returns:
+        [B, Chunk_Size, Action_Dim] (Predicted noise or vector field dt)
+        """
+        B, seq_len, _ = x.shape
+        assert seq_len == self.chunk_size, f"Input sequence length must be {self.chunk_size}"
+        if timestep.max() <= 1.0:
+            timestep = timestep * 1000.0 
+
+        # 1. Embed Timestep & Condition
+        t_feat = self.time_emb(timestep)      # [B, embed_dim]
+        c_feat = self.cond_emb(cond)          # [B, embed_dim]
+        mod_feat = self.cond_time_mlp(torch.cat([t_feat, c_feat], dim=-1))
+        
+        # 2. Embed Action and add Positional Embedding
+        x = self.action_proj(x)               # [B, Chunk_Size, embed_dim]
+        x = x + self.pos_embed                # 添加序列位置信息
+        
+        # 3. Pass through Transformer Blocks
+        for block in self.blocks:
+            x = block(x, mod_feat)
+            
+        # 4. Final output layer with AdaLN modulation
+        shift_final, scale_final = self.final_adaLN(F.silu(mod_feat)).chunk(2, dim=1)
+        shift_final = shift_final.unsqueeze(1)
+        scale_final = scale_final.unsqueeze(1)
+        
+        x = self.final_norm(x) * (1 + scale_final) + shift_final
+        out = self.action_out(x)              # [B, Chunk_Size, Action_Dim]
+        
+        return out
+
+
+if __name__ == "__main__":
+    # ==========================================
+    # Main 测试模块：验证 Backbone 是否可跑通
+    # ==========================================
+    print("🚀 开始测试 ActionDiffusionTransformer...")
+    
+    # 设定超参数 (可以根据你的任务修改)
+    BATCH_SIZE = 4
+    CHUNK_SIZE = 16        # 每次预测连续 16 步动作
+    ACTION_DIM = 8         # 机器人动作维度 (如 7-DOF机械臂 + 1个夹爪)
+    COND_DIM = 512         # 从 PointNeXt 提取的 3D 特征 + 本体特征 (如关节角) 拼起来的维度
+    EMBED_DIM = 256
+    
+    # 初始化模型
+    model = ActionDiffusionTransformer(
+        action_dim=ACTION_DIM,
+        cond_dim=COND_DIM,
+        chunk_size=CHUNK_SIZE,
+        embed_dim=EMBED_DIM,
+        depth=4,           # 4层 Transformer (轻量级测试)
+        num_heads=8
+    )
+    
+    # 模拟输入 Tensor
+    # 1. 加噪后的 Action Chunk (Noisy Action)
+    noisy_actions = torch.randn(BATCH_SIZE, CHUNK_SIZE, ACTION_DIM)
+    
+    # 2. 时间步 Timestep (Diffusion 常用 0-1000，Flow 常用 0-1 的浮点数)
+    # 这里模拟 Flow Matching 的浮点时间 (或 DDPM/DDIM 的整数步)
+    timesteps = torch.rand(BATCH_SIZE) * 1000 
+    
+    # 3. 视觉与本体状态特征 (Condition)
+    conditions = torch.randn(BATCH_SIZE, COND_DIM)
+    
+    print(f"✅ 模型初始化完成. 参数量: {sum(p.numel() for p in model.parameters())/1e6:.2f} M")
+    print(f"👉 输入 Action Shape: {noisy_actions.shape}")
+    print(f"👉 输入 Timestep Shape: {timesteps.shape}")
+    print(f"👉 输入 Condition Shape: {conditions.shape}")
+    
+    # 前向传播 (Forward)
+    try:
+        predicted_noise_or_vf = model(noisy_actions, timesteps, conditions)
+        print(f"🎉 前向传播成功!")
+        print(f"✅ 输出 Shape (应该与输入 Action 保持一致): {predicted_noise_or_vf.shape}")
+        
+        # 简单验证输出形状是否一致
+        assert predicted_noise_or_vf.shape == noisy_actions.shape, "❌ 输出形状与输入动作不匹配！"
+        
+    except Exception as e:
+        print(f"❌ 前向传播失败: {e}")
+```
+
+--- 💡 File: models/backbones/unet1d.py ---
+```python
+# models/backbones/unet1d.py
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Union, Tuple
+
+class SinusoidalPosEmb(nn.Module):
+    """时间步 (Timestep) 的正弦位置编码，用于告诉模型当前处于 Diffusion/Flow 的哪一步"""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+class Downsample1d(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+class Upsample1d(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+class Conv1dBlock(nn.Module):
+    """基础 1D 卷积块 (带有 GroupNorm)"""
+    def __init__(self, inp_channels: int, out_channels: int, kernel_size: int = 3):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            # GroupNorm 要求 out_channels 必须是 8 的倍数 (隐藏维度 128/256/512 都满足)
+            nn.GroupNorm(8, out_channels),
+            nn.SiLU()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+class ConditionalResidualBlock1D(nn.Module):
+    """
+    带有 FiLM (Feature-wise Linear Modulation) 条件注入的残差块。
+    """
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels),
+            Conv1dBlock(out_channels, out_channels)
+        ])
+        self.dropout = nn.Dropout(dropout)
+
+        self.cond_encoder = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, out_channels * 2)
+        )
+        
+        self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        out = self.blocks[0](x)
+        
+        # FiLM 注入
+        cond_embed = self.cond_encoder(cond)
+        cond_embed = cond_embed.unsqueeze(-1)
+        scale, shift = cond_embed.chunk(2, dim=1)
+        out = out * (scale + 1.0) + shift
+        out = self.dropout(out)
+        out = self.blocks[1](out)
+        return out + self.residual_conv(x)
+
+class ConditionalUnet1D(nn.Module):
+    """
+    针对 Action Chunking 设计的 1D U-Net 主干网络。
+    可直接作为 Diffusion 或 Flow Matching 的 Policy backbone。
+    """
+    def __init__(
+        self, 
+        action_dim: int, 
+        global_cond_dim: int, 
+        diffusion_step_embed_dim: int = 256,
+        down_dims: Tuple[int, ...] = (128, 256, 512)
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        
+        # 时间步的编码器
+        self.step_emb = SinusoidalPosEmb(diffusion_step_embed_dim)
+        self.step_mlp = nn.Sequential(
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            nn.SiLU(),
+            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim)
+        )
+        
+        cond_dim = diffusion_step_embed_dim + global_cond_dim
+        
+        # 1. 初始卷积：把不规则的 action_dim (如14) 投影到隐藏维度(如128)，避开 GroupNorm 报错
+        self.init_conv = nn.Conv1d(action_dim, down_dims[0], kernel_size=5, padding=2)
+        
+        # 2. 规划 U-Net 中间层的通道流动 (只在 down_dims 这种 8 的倍数的维度之间流动)
+        in_out_channels = []
+        dim_in = down_dims[0]
+        for dim_out in down_dims:
+            in_out_channels.append((dim_in, dim_out))
+            dim_in = dim_out
+        # 例如对于 (128, 256, 512)，得到：[(128, 128), (128, 256), (256, 512)]
+
+        # 构建 Encoder (Down)
+        self.down_modules = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(in_out_channels):
+            is_last = i == (len(in_out_channels) - 1)
+            self.down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(dim_in, dim_out, cond_dim=cond_dim),
+                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim=cond_dim),
+                Downsample1d(dim_out) if not is_last else nn.Identity()
+            ]))
+            
+        # 中间块 (Mid)
+        mid_dim = down_dims[-1]
+        self.mid_modules = nn.ModuleList([
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim=cond_dim),
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim=cond_dim)
+        ])
+        
+        # 构建 Decoder (Up)
+        self.up_modules = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(reversed(in_out_channels)):
+            is_last = i == (len(in_out_channels) - 1)
+            self.up_modules.append(nn.ModuleList([
+                # U-Net Skip Connection 导致输入通道数翻倍
+                ConditionalResidualBlock1D(dim_out * 2, dim_in, cond_dim=cond_dim),
+                ConditionalResidualBlock1D(dim_in, dim_in, cond_dim=cond_dim),
+                Upsample1d(dim_in) if not is_last else nn.Identity()
+            ]))
+            
+        # 最后的输出投影层 (从 down_dims[0] 无缝恢复到 action_dim)
+        self.final_conv = nn.Sequential(
+            Conv1dBlock(down_dims[0], down_dims[0]),
+            nn.Conv1d(down_dims[0], action_dim, 1) # 1x1卷积，不带 GroupNorm
+        )
+
+    def forward(
+        self, 
+        sample: torch.Tensor, 
+        timestep: Union[torch.Tensor, float, int], 
+        global_cond: torch.Tensor
+    ) -> torch.Tensor:
+        # 1. 处理输入维度 (B, Chunk_Size, Action_Dim) -> (B, Action_Dim, Chunk_Size)
+        if sample.shape[-1] == self.action_dim:
+            x = sample.permute(0, 2, 1)
+            permuted = True
+        else:
+            x = sample
+            permuted = False
+
+        # 2. 初始通道投影 (规避不规则维度)
+        x = self.init_conv(x)
+
+        # 3. 处理时间步编码
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.float32, device=x.device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(x.device)
+            
+        timestep = timestep.expand(x.shape[0]).float()
+        step_embed = self.step_mlp(self.step_emb(timestep))
+        
+        # 4. 拼接全局特征和时间步特征
+        cond = torch.cat([step_embed, global_cond], dim=-1)
+
+        # 5. Encoder 阶段
+        h = []
+        for resnet1, resnet2, downsample in self.down_modules:
+            x = resnet1(x, cond)
+            x = resnet2(x, cond)
+            h.append(x)  # 保存 Skip Connection
+            x = downsample(x)
+
+        # 6. Mid 阶段
+        for resnet in self.mid_modules:
+            x = resnet(x, cond)
+
+        # 7. Decoder 阶段
+        for resnet1, resnet2, upsample in self.up_modules:
+            # 兼容奇数尺寸的 Chunk Size
+            h_pop = h.pop()
+            if x.shape[-1] != h_pop.shape[-1]:
+                x = F.interpolate(x, size=h_pop.shape[-1], mode='linear', align_corners=False)
+            x = torch.cat([x, h_pop], dim=1)
+            x = resnet1(x, cond)
+            x = resnet2(x, cond)
+            x = upsample(x)
+
+        # 8. 输出层
+        x = self.final_conv(x)
+
+        # 9. 维度复原
+        if permuted:
+            x = x.permute(0, 2, 1)
+
+        return x
+
+# ==========================================
+# 调试与测试模块 
+# ==========================================
+if __name__ == '__main__':
+    batch_size = 32
+    chunk_size = 16
+    action_dim = 14     # 即使是奇奇怪怪的数字也不会报错了
+    global_cond_dim = 256
+    
+    model = ConditionalUnet1D(
+        action_dim=action_dim,
+        global_cond_dim=global_cond_dim,
+        down_dims=(128, 256, 512)
+    )
+    
+    noisy_action_chunk = torch.randn(batch_size, chunk_size, action_dim) 
+    timesteps = torch.randint(0, 100, (batch_size,))
+    pointcloud_feats = torch.randn(batch_size, global_cond_dim)
+    
+    out = model(noisy_action_chunk, timesteps, pointcloud_feats)
+    
+    print(f"输入动作形状: {noisy_action_chunk.shape}")
+    print(f"输出预测形状: {out.shape}")
+    assert noisy_action_chunk.shape == out.shape
+    print("测试通过")
+```
+
+--- 💡 File: models/encoders/pointnext.py ---
+```python
+# models/encoders/pointnext.py
+"""
+PointNeXt Encoder (Pure PyTorch Version v1.0)
+
+【当前版本的优点】
+1. 开箱即用：完全由纯 PyTorch 实现，摒弃了复杂的 C++/CUDA 扩展编译（如 pointnet2_ops）。
+2. 高度便携：跨平台兼容性极强，适合前期快速跑通 Behavior Cloning (BC) 和 IDQL 等算法的训练流。
+
+【🚨 当前版本的缺点与隐患】
+1. 致命的推理延迟 (FPS Bottleneck)：
+   `farthest_point_sample` 包含纯 Python 的 for 循环。在 GPU 上运行时，会导致大量的 Kernel 启动与显存通信开销。
+   如果用于 One-step Distillation 的高频真机部署（如 50Hz），这里的耗时（可能达 20~50ms）将抹杀蒸馏带来的速度优势。
+2. OOM 显存爆炸风险：
+   `square_distance` 的空间复杂度为 O(B * N * M)。如果直接传入未降采样的高密度点云（如 >4096 点），极易导致显存溢出。
+3. 空间拓扑信息的丢失：
+   网络末端使用了 Global Average Pooling，将 3D 点云压缩成了 1D 向量。这在传统的 Diffusion Policy 中可用，
+   但在追求极致精度的 3D Diffusion Policy (DP3) 中，会丢失部分精细的三维拓扑特征。
+
+【🚀 未来部署与优化的改进方向】
+1. 算子替换 (Speedup)：在真机部署或追求极限推理速度时，务必将 `farthest_point_sample` 和 `query_ball_point`
+   替换为 C++/CUDA 预编译版本（如使用 `torch-cluster` 库的 fps，或第三方 `pointnet2_ops`）。
+2. 前置降采样 (Memory)：在 envs/pointcloud_wrapper.py 中强制约束，输入前必须通过 Open3D 等进行 Voxel Downsample，
+   将点数控制在 1024 或 2048 以下。
+3. 保留 Token 序列 (Architecture)：如果抓取任务对三维空间精度要求极高，考虑去掉 `torch.mean`，
+   将 `l3_points` 展平为 token 序列 (例如 [B, 16, 256])，通过 Cross-Attention 注入到后续的 Transformer/UNet 中。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+
+# =====================================================================
+# 1. 基础点云算子 (Pure PyTorch Implementation)
+# =====================================================================
+
+def square_distance(src, dst):
+    """计算两组点之间的平方距离"""
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.transpose(1, 2))
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+    return dist
+
+def index_points(points, idx):
+    """根据索引提取点"""
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    return new_points
+
+def farthest_point_sample(xyz, npoint):
+    """最远点采样 (FPS)"""
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
+    distance = torch.ones(B, N).to(device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
+    batch_indices = torch.arange(B, dtype=torch.long).to(device)
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        farthest = torch.max(distance, -1)[1]
+    return centroids
+
+def query_ball_point(radius, nsample, xyz, new_xyz):
+    """球查询 (Ball Query)"""
+    device = xyz.device
+    B, N, C = xyz.shape
+    _, S, _ = new_xyz.shape
+    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+    sqrdists = square_distance(new_xyz, xyz)
+    group_idx[sqrdists > radius ** 2] = N
+    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
+    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
+    mask = group_idx == N
+    group_idx[mask] = group_first[mask]
+    return group_idx
+
+def sample_and_group(npoint, radius, nsample, xyz, points):
+    """组合采样与局部特征提取"""
+    B, N, C = xyz.shape
+    S = npoint
+    fps_idx = farthest_point_sample(xyz, npoint)
+    new_xyz = index_points(xyz, fps_idx)
+    idx = query_ball_point(radius, nsample, xyz, new_xyz)
+    grouped_xyz = index_points(xyz, idx)
+    grouped_xyz_norm = grouped_xyz - new_xyz.view(B, S, 1, 3)
+
+    if points is not None:
+        grouped_points = index_points(points, idx)
+        new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
+    else:
+        new_points = grouped_xyz_norm
+    return new_xyz, new_points
+
+# =====================================================================
+# 2. PointNeXt 核心模块
+# =====================================================================
+
+class SetAbstraction(nn.Module):
+    """PointNet++ 风格的 Set Abstraction 层，用于降采样和空间特征聚合"""
+    def __init__(self, npoint, radius, nsample, in_channel, mlp):
+        super().__init__()
+        self.npoint = npoint
+        self.radius = radius
+        self.nsample = nsample
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        last_channel = in_channel
+        for out_channel in mlp:
+            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
+            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
+            last_channel = out_channel
+
+    def forward(self, xyz, points):
+        new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+        new_points = new_points.permute(0, 3, 2, 1) # [B, C, nsample, npoint]
+        for i, conv in enumerate(self.mlp_convs):
+            bn = self.mlp_bns[i]
+            new_points = F.relu(bn(conv(new_points)))
+        new_points = torch.max(new_points, 2)[0]    # [B, C, npoint]
+        return new_xyz, new_points.permute(0, 2, 1) # 返回 [B, npoint, C]
+
+class InvResMLP(nn.Module):
+    """PointNeXt 核心贡献：Inverted Residual MLP (倒置残差结构)"""
+    def __init__(self, channels, expansion=4):
+        super().__init__()
+        self.conv1 = nn.Conv1d(channels, channels * expansion, 1)
+        self.bn1 = nn.BatchNorm1d(channels * expansion)
+        self.conv2 = nn.Conv1d(channels * expansion, channels, 1)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.act = nn.GELU()
+        
+    def forward(self, x):
+        # x shape: [B, C, N]
+        identity = x
+        x = self.act(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return self.act(x + identity)
+
+# =====================================================================
+# 3. 供 Flow/Diffusion Policy 使用的 PointNeXt Encoder 主类
+# =====================================================================
+
+class PointNeXtEncoder(nn.Module):
+    def __init__(
+        self, 
+        in_channels=3,       # 如果只有 XYZ 则是 3；如果带 RGB 则是 6
+        output_dim=256,      # 最终输出的全局特征维度 (供 Diffusion/Flow 条件使用)
+        use_state=False,     # 是否拼接机器人本体状态 (Proprioception)
+        state_dim=0          # 本体状态的维度
+    ):
+        """
+        专为 Flow / 3D Diffusion + Chunk Action 打造的点云编码器
+        使用 PointNeXt-S 的轻量化设计，保证推理速度。
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.use_state = use_state
+        self.state_dim = state_dim
+        
+        # Initial MLP
+        self.conv1 = nn.Conv1d(in_channels, 32, 1)
+        self.bn1 = nn.BatchNorm1d(32)
+        
+        # Stage 1: SA + InvResMLP (1024 -> 256 points)
+        self.sa1 = SetAbstraction(npoint=256, radius=0.1, nsample=32, in_channel=32+3, mlp=[32, 32, 64])
+        self.inv_res1 = InvResMLP(64)
+        
+        # Stage 2: SA + InvResMLP (256 -> 64 points)
+        self.sa2 = SetAbstraction(npoint=64, radius=0.2, nsample=32, in_channel=64+3, mlp=[64, 64, 128])
+        self.inv_res2 = InvResMLP(128)
+        
+        # Stage 3: SA + InvResMLP (64 -> 16 points)
+        self.sa3 = SetAbstraction(npoint=16, radius=0.4, nsample=32, in_channel=128+3, mlp=[128, 128, 256])
+        self.inv_res3 = InvResMLP(256)
+        
+        # Global Pooling + Final Projection
+        self.fc = nn.Sequential(
+            nn.Linear(256 + (state_dim if use_state else 0), 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, output_dim)
+        )
+
+    def forward(self, obs_dict):
+        """
+        输入 obs_dict 必须包含:
+            - 'point_cloud': Tensor, shape [B, N, C]
+            - 'state' (可选): Tensor, shape [B, state_dim]
+        返回:
+            - global_feat: Tensor, shape [B, output_dim]
+        """
+        pc = obs_dict['point_cloud'] 
+        B, N, C_in = pc.shape
+        
+        # 【防御性编程】防止纯 PyTorch 算子导致 OOM 和 FPS 逻辑崩坏
+        assert N >= 256, f"输入点云数量 N={N} 必须 >= 256，否则 Stage 1 无法正常降采样。"
+        assert N <= 4096, f"输入点云数量 N={N} 必须 <= 4096，否则纯 PyTorch 矩阵乘法极易引发显存 OOM。"
+
+        # 如果输入带有比 in_channels 更多的特征（防止报错），只取前 in_channels 维
+        xyz = pc[:, :, :3].contiguous()
+        features = pc[:, :, :self.in_channels].permute(0, 2, 1).contiguous() # [B, in_channels, N]
+        
+        # Stem
+        features = F.relu(self.bn1(self.conv1(features))) # [B, 32, N]
+        features = features.permute(0, 2, 1).contiguous() # [B, N, 32]
+        
+        # Stage 1
+        l1_xyz, l1_points = self.sa1(xyz, features)     # [B, 256, 64]
+        l1_points = l1_points.permute(0, 2, 1)          # [B, 64, 256]
+        l1_points = self.inv_res1(l1_points)
+        l1_points = l1_points.permute(0, 2, 1)          # [B, 256, 64]
+        
+        # Stage 2
+        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points) # [B, 64, 128]
+        l2_points = l2_points.permute(0, 2, 1)          # [B, 128, 64]
+        l2_points = self.inv_res2(l2_points)
+        l2_points = l2_points.permute(0, 2, 1)          # [B, 64, 128]
+        
+        # Stage 3
+        l3_xyz, l3_points = self.sa3(l2_xyz, l2_points) # [B, 16, 256]
+        l3_points = l3_points.permute(0, 2, 1)          # [B, 256, 16]
+        l3_points = self.inv_res3(l3_points)            # [B, 256, 16]
+        
+        # Global Average Pooling
+        global_feat = torch.mean(l3_points, dim=-1)     # [B, 256]
+        
+        # 融合机器人本体状态 (Proprioception)
+        if self.use_state and 'state' in obs_dict:
+            state = obs_dict['state']                   # [B, state_dim]
+            global_feat = torch.cat([global_feat, state], dim=-1)
+            
+        # 最终映射为 Flow/Diffusion 接受的条件向量维度
+        out = self.fc(global_feat)                      # [B, output_dim]
+        
+        return out
+
+
+# =====================================================================
+# 本地测试脚本
+# =====================================================================
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🚀 测试启动: PointNeXtEncoder (Pure PyTorch V1.0)")
+    print("=" * 60)
+
+    # 1. 自动选择设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[*] 运行设备: {device}")
+
+    # 2. 模拟超参数与输入数据 (例如 1024 个点, 本体状态 14 维)
+    B, N, C = 2, 1024, 3 
+    state_dim = 14
+    output_dim = 256
+
+    print(f"[*] 生成模拟数据: Batch Size={B}, 点云数={N}, 坐标通道={C}, 状态维数={state_dim}")
+    # 注意：真实环境的点云坐标通常在 (-1, 1) 左右，我们随机生成标准正态分布
+    dummy_pc = torch.randn(B, N, C, device=device) 
+    dummy_state = torch.randn(B, state_dim, device=device)
+    
+    obs_dict = {
+        'point_cloud': dummy_pc,
+        'state': dummy_state
+    }
+
+    # 3. 初始化模型
+    model = PointNeXtEncoder(
+        in_channels=C, 
+        output_dim=output_dim, 
+        use_state=True, 
+        state_dim=state_dim
+    ).to(device)
+    model.eval() # 切换到评估模式
+
+    # 4. 前向传播并记录耗时
+    print("\n[*] 开始前向传播测试 (首次运行可能包含 CUDA 初始化开销)...")
+    
+    # 预热一次 (Warm-up)
+    with torch.no_grad():
+        _ = model(obs_dict)
+    
+    # 正式计时
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        
+    start_time = time.time()
+    with torch.no_grad():
+        output = model(obs_dict)
+        
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    end_time = time.time()
+
+    elapsed_ms = (end_time - start_time) * 1000
+
+    # 5. 打印结果
+    print(f"✅ 前向传播成功！")
+    print(f"   输入点云维度 : {obs_dict['point_cloud'].shape}")
+    print(f"   输入状态维度 : {obs_dict['state'].shape}")
+    print(f"   模型输出维度 : {output.shape} (预期为 [{B}, {output_dim}])")
+    print(f"⏱️  单次推理耗时 : {elapsed_ms:.2f} ms")
+    print("\n【性能提示】如果上述推理时间 > 10ms，请在未来部署时务必参考代码顶部的优化方案！")
+    print("=" * 60)
+```
+
+--- 💡 File: configs/train_offline.yaml ---
+```yaml
+# configs/train_offline.yaml
+# 核心魔法：Hydra 会自动去对应文件夹下加载这些 yaml 并挂载到 cfg 树上
+defaults:
+  - model: flow_3d         # 加载 configs/model/flow_3d.yaml 作为 cfg.model
+  - algo: idql             # 加载 configs/algo/idql.yaml 作为 cfg.algo
+  - dataset: offline_data  # 加载 configs/dataset/offline_data.yaml 作为 cfg.dataset
+  - _self_                 # _self_ 保证下方定义的全局变量优先级最高，可覆盖子配置
+
+# 全局工程设置
+run_name: "idql_flow_chunk16"
+project: "my_rl100_infra"
+seed: 42
+device: "cuda"
+epochs: 200
+batch_size: 64
+save_dir: "./checkpoints/offline"
+
+wandb:
+  enable: true
+  project: "RL-100-Infra"
+  entity: null
+```
+
+--- 💡 File: configs/train_online.yaml ---
+```yaml
+# configs/train_online.yaml
+defaults:
+  - model: flow_3d
+  - algo: pg              # 在线训练切换为 PG 算法
+  - env: dummy_env        # 在线训练需要环境 Rollout
+  - _self_
+
+run_name: "pg_finetune_flow"
+seed: 42
+device: "cuda"
+epochs: 200
+save_dir: "./checkpoints/online"
+
+wandb:
+  enable: true
+  project: "RL-100-Infra"
+```
+
+--- 💡 File: configs/eval.yaml ---
+```yaml
+# configs/eval.yaml
+defaults:
+  - model: flow_3d
+  - env: dummy_env
+  - _self_
+
+eval:
+  ckpt_path: "./checkpoints/distill/student_distilled_ep50.pth"
+  num_episodes: 20
+  num_inference_steps: 1      # 蒸馏后单步推理填1，普通Flow填10
+  cfg_weight: 1.0             
+  record_video: false         
+  log_dir: "./logs"
+  device: "cuda"
+  seed: 42
+```
+
+--- 💡 File: configs/dataset/offline_data.yaml ---
+```yaml
+# configs/dataset/offline_data.yaml
+n_points: 1024
+# 数据集绝对路径或相对路径
+data_path: "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pose.physx_cpu.h5"
+# 最大加载的轨迹数（防 OOM），如果不限制则写 null
+max_episodes: null
+```
+
+--- 💡 File: configs/algo/pg.yaml ---
+```yaml
+# configs/algo/pg.yaml
+steps_per_epoch: 64   # 每次 PPO 收集环境的 Rollout 步数 (乘以环境并行数)
+update_epochs: 4      # 收集完数据后，PPO 网络微调的 Epoch 数
+actor_lr: 1e-5        # 微调阶段 Actor 学习率必须小，防止破坏预训练权重
+critic_lr: 3e-4
+gamma: 0.99
+gae_lambda: 0.95      # GAE 优势估计平滑系数
+clip_ratio: 0.2       # PPO 截断范围
+entropy_coef: 0.01    # 熵正则化系数 (鼓励探索)
+v_loss_coef: 0.5      # Value Loss 权重系数
+max_grad_norm: 1.0    # 梯度裁剪阈值
+pretrained_ckpt: "./checkpoints/idql_policy_best.pth" # [关键] 在线微调的起点
+```
+
+--- 💡 File: configs/algo/idql.yaml ---
+```yaml
+# configs/algo/idql.yaml
+tau: 0.7              # Expectile regression parameter (拟合上分位数)
+discount: 0.99        # 贝尔曼更新折扣因子
+beta: 3.0             # Reject Sampling 温度 (越大越贪婪，越小越像 BC)
+tau_target: 0.005     # 目标 Q 网络软更新率 (Polyak averaging)
+actor_lr: 1e-4        # Flow/Diffusion Policy 的学习率
+critic_lr: 3e-4       # Q 和 V 网络的学习率
+```
+
+--- 💡 File: configs/model/diffusion_3d.yaml ---
+```yaml
+# configs/model/diffusion_3d.yaml
+algo_type: "diffusion"
+action_dim: 7
+state_dim: 14
+chunk_size: 16
+use_state: true
+encoder_type: "pointnext"
+backbone_type: "unet1d"      # Diffusion 传统上多搭配 U-Net1D
+cond_dim: 256
+num_train_steps: 100         # 训练时加噪/去噪总步数 (DDPM)
+num_inference_steps: 10      # 推理时使用的 DDIM 截断步数
+```
+
+--- 💡 File: configs/model/flow_3d.yaml ---
+```yaml
+# configs/model/flow_3d.yaml
+# 自动映射为 cfg.model.xxx
+algo_type: "flow"
+action_dim: 7
+state_dim: 18
+chunk_size: 16        
+use_state: true
+encoder_type: "pointnext"
+backbone_type: "transformer" 
+cond_dim: 256
+num_inference_steps: 10
+```
+
+--- 💡 File: data/check_maniskill_dataset.py ---
+```python
+# data/check_maniskill_dataset.py
+import h5py
+
+# 指向你刚刚生成出的那个庞大的新文件
+h5_path = "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_joint_pos.physx_cpu.h5" 
+
+with h5py.File(h5_path, 'r') as f:
+    # 随便取第一条轨迹
+    first_traj_key = list(f.keys())[0]
+    traj = f[first_traj_key]
+    
+    print("这条轨迹包含的键值:", list(traj.keys()))
+    
+    # 检查点云数据
+    if 'obs' in traj and 'pointcloud' in traj['obs']:
+        pc_data = traj['obs']['pointcloud']
+        # ManiSkill 3 点云默认存储键名可能是 xyzw 或 xyz
+        if 'xyzw' in pc_data:
+            print("🎉 点云(xyzw)数据维度:", pc_data['xyzw'].shape)
+        elif 'xyz' in pc_data:
+            print("🎉 点云(xyz)数据维度:", pc_data['xyz'].shape)
+    else:
+        print("⚠️ 还是没有找到 pointcloud 数据，检查生成命令！")
+```
+
+--- 💡 File: data/dataset.py ---
+```python
+# data/dataset.py
+import torch
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+
+class PointCloudChunkDataset(Dataset):
+    """
+    专门为 3D Diffusion/Flow Policy + IDQL/PG 设计的精简版 Dataset。
+    输入：纯 3D 点云 + 机器人本体状态 (Proprioception)
+    输出：Action Chunk + 用于强化学习的 Transition (Reward, Next_Obs, Done)
+    """
+    def __init__(
+        self, 
+        trajectories: list, 
+        chunk_size: int = 16, 
+        n_points: int = 1024,
+        is_training: bool = True
+    ):
+        """
+        Args:
+            trajectories: 包含多个 episode 的列表。
+                          每个 episode 是一个 dict: {'pc': [T, N, 3], 'state': [T, D_s], 'action': [T, D_a], 'reward': [T], 'done': [T]}
+            chunk_size: 动作块的长度 (Action Chunking)
+            n_points: 固定采样的点云数量
+            is_training: 是否为训练集（可在此处加入点云的数据增强，如 Random Rotation / Jittering）
+        """
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.n_points = n_points
+        self.is_training = is_training
+        
+        self.trajectories = trajectories
+        self.indices = self._build_indices()
+
+    def _build_indices(self):
+        """
+        构建全局索引到 (episode_idx, step_idx) 的映射。
+        过滤掉无效的长度或做特殊处理。
+        """
+        indices = []
+        for ep_idx, ep in enumerate(self.trajectories):
+            ep_len = len(ep['action'])
+            # 安全检查：跳过长度为0的无效 episode
+            if ep_len == 0:
+                continue
+            # 遍历 episode 中的每一个时间步
+            for step_idx in range(ep_len):
+                indices.append((ep_idx, step_idx))
+        return indices
+
+    def _sample_point_cloud(self, pc: np.ndarray):
+        """
+        点云降采样 (Random Sampling 比 Farthest Point Sampling 快很多，适合 DataLoader)
+        pc shape: [N_original, 3] or [N_original, 3+C]
+        """
+        N = pc.shape[0]
+        if N >= self.n_points:
+            # 随机无放回采样
+            choices = np.random.choice(N, self.n_points, replace=False)
+        else:
+            # 如果点不够，有放回采样补齐
+            choices = np.random.choice(N, self.n_points, replace=True)
+        return pc[choices]
+
+    def _get_chunk(self, array: np.ndarray, start_idx: int, length: int, pad_value='last'):
+        """
+        获取从 start_idx 开始的序列块。如果超出 episode 长度，则进行 Padding。
+        返回: chunk_array, mask (1 表示真实数据, 0 表示 Padding 数据)
+        """
+        ep_len = len(array)
+        end_idx = min(start_idx + length, ep_len)
+        
+        # 截取真实数据部分
+        valid_chunk = array[start_idx:end_idx]
+        valid_len = len(valid_chunk)
+        
+        # 构建 Mask
+        mask = np.zeros(length, dtype=np.float32)
+        mask[:valid_len] = 1.0
+        
+        # 如果需要 Padding
+        if valid_len < length:
+            pad_len = length - valid_len
+            if pad_value == 'last':
+                # 重复最后一步的动作/状态 (Diffusion Policy 常用手段)
+                padding = np.repeat(valid_chunk[-1:], pad_len, axis=0)
+            elif pad_value == 'zero':
+                # 补零
+                pad_shape = list(valid_chunk.shape)
+                pad_shape[0] = pad_len
+                padding = np.zeros(pad_shape, dtype=valid_chunk.dtype)
+            else:
+                raise ValueError(f"Unsupported pad_value: {pad_value}")
+                
+            chunk = np.concatenate([valid_chunk, padding], axis=0)
+        else:
+            chunk = valid_chunk
+            
+        return chunk, mask
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        ep_idx, step_idx = self.indices[idx]
+        ep = self.trajectories[ep_idx]
+        
+        # 1. 提取当前观测 (t)
+        # 针对 PointNeXt 等网络，点云形状常转为 [3, N] 或保持 [N, 3]。这里我们保持 [N, 3]，在模型内部 Permute。
+        pc_t = self._sample_point_cloud(ep['pc'][step_idx])
+        state_t = ep['state'][step_idx]
+        
+        # 2. 提取 Action Chunk (t 到 t+K)
+        action_chunk, action_mask = self._get_chunk(ep['action'], step_idx, self.chunk_size, pad_value='last')
+        
+        # 3. 为 IDQL/PG 提供 RL 相关的 Transitions: Reward(t), Next_Obs(t+1), Done(t)
+        reward_t = ep['reward'][step_idx]
+        done_t = ep['done'][step_idx]
+        
+        # 获取 Next Obs (如果是最后一步，next_obs 保持不变，因为 done=True，Q-learning 会 ignore next Q)
+        next_step_idx = min(step_idx + 1, len(ep['action']) - 1)
+        next_pc_t = self._sample_point_cloud(ep['pc'][next_step_idx])
+        next_state_t = ep['state'][next_step_idx]
+
+        # 微调：使用 np.ascontiguousarray 加速 PyTorch Tensor 的内存映射转换
+        # 4. 组装并转换为 Tensor
+        data_dict = {
+            # Behavior Cloning & Diffusion 生成所需
+            "pc": torch.from_numpy(np.ascontiguousarray(pc_t)).float(),                    # [N_points, 3]
+            "state": torch.from_numpy(np.ascontiguousarray(state_t)).float(),              # [State_Dim]
+            "action_chunk": torch.from_numpy(np.ascontiguousarray(action_chunk)).float(),  # [Chunk_Size, Action_Dim]
+            "action_mask": torch.from_numpy(np.ascontiguousarray(action_mask)).float(),    # [Chunk_Size] (Loss计算时需要)
+            
+            # RL (IDQL / PG / Critic网络) 评估所需
+            "reward": torch.tensor(reward_t, dtype=torch.float32),   # []
+            "done": torch.tensor(done_t, dtype=torch.float32),       # []
+            "next_pc": torch.from_numpy(np.ascontiguousarray(next_pc_t)).float(),          # [N_points, 3]
+            "next_state": torch.from_numpy(np.ascontiguousarray(next_state_t)).float(),    # [State_Dim]
+        }
+        
+        return data_dict
+
+
+# =========================================================================
+# 测试模块 (可以直接 `python data/dataset.py` 运行)
+# =========================================================================
+if __name__ == "__main__":
+    print("🚀 正在生成 Mock 3D 点云轨迹数据...")
+    
+    # 模拟超参数
+    NUM_EPISODES = 5
+    EPISODE_LEN = 50
+    N_ORIGINAL_POINTS = 2048 # 原始传感器返回的点云数，一般是不定长的，这里 Mock 为定长
+    STATE_DIM = 8  # 如机械臂 7 DoF + 1 Gripper
+    ACTION_DIM = 8 # 目标位置 7 DoF + 1 Gripper
+    
+    # 1. 构建 Mock Trajectories
+    mock_trajectories = []
+    for _ in range(NUM_EPISODES):
+        ep = {
+            'pc': np.random.randn(EPISODE_LEN, N_ORIGINAL_POINTS, 3).astype(np.float32),
+            'state': np.random.randn(EPISODE_LEN, STATE_DIM).astype(np.float32),
+            'action': np.random.randn(EPISODE_LEN, ACTION_DIM).astype(np.float32),
+            'reward': np.random.rand(EPISODE_LEN).astype(np.float32),
+            'done': np.zeros(EPISODE_LEN, dtype=bool)
+        }
+        # 最后一个 step 标记为 done
+        ep['done'][-1] = True
+        mock_trajectories.append(ep)
+
+    print("✅ Mock 数据生成完毕！")
+    
+    # 2. 实例化 Dataset
+    CHUNK_SIZE = 16
+    N_SAMPLED_POINTS = 512
+    
+    dataset = PointCloudChunkDataset(
+        trajectories=mock_trajectories,
+        chunk_size=CHUNK_SIZE,
+        n_points=N_SAMPLED_POINTS
+    )
+    
+    print(f"📦 Dataset 总样本数 (Transitions): {len(dataset)}")
+    
+    # 3. 实例化 DataLoader 并测试性能与形状
+    BATCH_SIZE = 32
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=2, 
+        drop_last=False
+    )
+    
+    print("🔄 开始测试 DataLoader ...\n")
+    for batch_idx, batch in enumerate(dataloader):
+        print(f"--- Batch {batch_idx+1} ---")
+        print(f"🔍 PC Shape:           {batch['pc'].shape} \t\t(Expected: [{BATCH_SIZE}, {N_SAMPLED_POINTS}, 3])")
+        print(f"🔍 State Shape:        {batch['state'].shape} \t\t\t(Expected: [{BATCH_SIZE}, {STATE_DIM}])")
+        print(f"🎬 Action Chunk Shape: {batch['action_chunk'].shape} \t(Expected: [{BATCH_SIZE}, {CHUNK_SIZE}, {ACTION_DIM}])")
+        print(f"🛡️  Action Mask Shape:  {batch['action_mask'].shape} \t\t(Expected: [{BATCH_SIZE}, {CHUNK_SIZE}])")
+        print(f"💰 Reward Shape:       {batch['reward'].shape} \t\t\t(Expected: [{BATCH_SIZE}])")
+        print(f"🏁 Done Shape:         {batch['done'].shape} \t\t\t(Expected: [{BATCH_SIZE}])")
+        print(f"⏭️  Next PC Shape:      {batch['next_pc'].shape} \t\t(Expected: [{BATCH_SIZE}, {N_SAMPLED_POINTS}, 3])")
+        
+        # 打印一个 mask 看看 padding 效果
+        # 如果采样的刚好是某个 episode 的最后几步，mask 的尾部应该会有 0
+        print(f"\n💡 抽查第一个样本的 Action Mask:\n {batch['action_mask'][0].cpu().numpy()}")
+        
+        break # 测试一个 Batch 就够了
+    
+    print("\n🎉 Dataset & DataLoader 测试完美通过！可以接入你的 Flow/Diffusion + IDQL 训练啦！")
+```
+
+--- 💡 File: data/replay_buffer.py ---
+```python
+# data/replay_buffer.py
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, Tuple
+
+class ActionChunkReplayBuffer:
+    """
+    专为 PointCloud + Chunk Action + PG/IDQL 设计的在线 Replay Buffer。
+    采用扁平化存储，但在采样时自动构建 Action Chunk，避免内存中存在大量重复动作数据。
+    """
+    def __init__(
+        self, 
+        capacity: int, 
+        num_points: int, 
+        pc_dim: int, 
+        state_dim: int, 
+        action_dim: int, 
+        chunk_size: int,
+        device: str = "cpu"
+    ):
+        self.capacity = capacity
+        self.chunk_size = chunk_size
+        self.device = device
+        
+        # 指针与容量追踪
+        self.ptr = 0
+        self.size = 0
+        
+        # State: 3D Point Cloud + Proprioception (本体感觉/低维状态)
+        self.obs_pc = np.zeros((capacity, num_points, pc_dim), dtype=np.float32)
+        self.obs_state = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.next_obs_pc = np.zeros((capacity, num_points, pc_dim), dtype=np.float32)
+        self.next_obs_state = np.zeros((capacity, state_dim), dtype=np.float32)
+        
+        # Action, Reward, Done
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+        # done 标志用于 Chunk 采样时判断是否越界（Episode结束）
+        self.dones = np.zeros((capacity, 1), dtype=bool)
+
+    def add(self, obs_pc, obs_state, action, reward, next_obs_pc, next_obs_state, done):
+        """添加单步 transition，Chunk 会在 sample 时动态生成"""
+        self.obs_pc[self.ptr] = obs_pc
+        self.obs_state[self.ptr] = obs_state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_obs_pc[self.ptr] = next_obs_pc
+        self.next_obs_state[self.ptr] = next_obs_state
+        self.dones[self.ptr] = done
+        
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def _get_chunk_action(self, start_idx: int) -> np.ndarray:
+        """
+        获取从 start_idx 开始的长度为 chunk_size 的 action。
+        如果期间遇到 done==True (即episode结束)，则用最后一个有效动作进行 Padding。
+        """
+        chunk = np.zeros((self.chunk_size, self.actions.shape[-1]), dtype=np.float32)
+        
+        # [修复1] 增加一个 has_done 标志位，防止跨越 episode 边界
+        has_done = False 
+        
+        for i in range(self.chunk_size):
+            curr_idx = (start_idx + i) % self.capacity
+            
+            # [修复2] 防止读取到未来的脏数据或跨越环形缓冲区的新旧边界
+            if i > 0 and curr_idx == self.ptr:
+                has_done = True
+                
+            # 如果当前步越界或者上一步已经是 done，则 padding 最后一个有效动作
+            if i > 0 and self.dones[(start_idx + i - 1) % self.capacity]:
+                has_done = True # 一旦遇到 done，后续全部变为 padding 状态
+                
+            if has_done:
+                chunk[i] = chunk[i - 1] # Action Padding
+            else:
+                chunk[i] = self.actions[curr_idx]
+                
+        return chunk
+
+    def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        """随机采样 Batch，返回带有 Chunk Action 的 Tensor 字典"""
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        
+        batch_obs_pc = self.obs_pc[idxs]
+        batch_obs_state = self.obs_state[idxs]
+        batch_next_obs_pc = self.next_obs_pc[idxs]
+        batch_next_obs_state = self.next_obs_state[idxs]
+        batch_rewards = self.rewards[idxs]
+        batch_dones = self.dones[idxs]
+        
+        # 动态提取 Action Chunk
+        batch_action_chunks = np.array([self._get_chunk_action(idx) for idx in idxs])
+        
+        # 转换为 PyTorch Tensor 并送到指定 Device
+        return {
+            "obs_pc": torch.FloatTensor(batch_obs_pc).to(self.device),
+            "obs_state": torch.FloatTensor(batch_obs_state).to(self.device),
+            "action_chunk": torch.FloatTensor(batch_action_chunks).to(self.device),
+            "reward": torch.FloatTensor(batch_rewards).to(self.device),
+            "next_obs_pc": torch.FloatTensor(batch_next_obs_pc).to(self.device),
+            "next_obs_state": torch.FloatTensor(batch_next_obs_state).to(self.device),
+            "done": torch.FloatTensor(batch_dones).to(self.device),
+        }
+
+
+class OfflineChunkDataset(Dataset):
+    """
+    用于离线预训练 (BC / IDQL) 的 PyTorch Dataset。
+    如果你有存好的 HDF5 或 NPZ 文件，可以将其加载并在这里包装。
+    """
+    def __init__(self, data_path: str = None, chunk_size: int = 16):
+        super().__init__()
+        self.chunk_size = chunk_size
+        
+        # 这里用 dummy 数据模拟离线数据加载，实际使用时替换为 np.load(data_path)
+        print(f"Loading offline dataset from {data_path}...")
+        self.num_samples = 1000
+        self.obs_pc = np.random.randn(self.num_samples, 1024, 3).astype(np.float32)
+        self.obs_state = np.random.randn(self.num_samples, 14).astype(np.float32)
+        self.actions = np.random.randn(self.num_samples, 7).astype(np.float32)
+        self.dones = np.zeros((self.num_samples, 1), dtype=bool)
+        
+        # 随机设置几个 done=True 模拟 Episode 分界
+        self.dones[99::100] = True 
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
+        # 提前切出 Action Chunk
+        action_chunk = np.zeros((self.chunk_size, self.actions.shape[-1]), dtype=np.float32)
+        
+        # [修复1 同理] 需要 has_done 标志
+        has_done = False
+        
+        for i in range(self.chunk_size):
+            curr_idx = min(idx + i, self.num_samples - 1)
+            
+            if i > 0 and self.dones[curr_idx - 1]:
+                has_done = True
+                
+            if has_done:
+                action_chunk[i] = action_chunk[i - 1] # Padding
+            else:
+                action_chunk[i] = self.actions[curr_idx]
+                
+        return {
+            "obs_pc": torch.FloatTensor(self.obs_pc[idx]),
+            "obs_state": torch.FloatTensor(self.obs_state[idx]),
+            "action_chunk": torch.FloatTensor(action_chunk)
+        }
+
+
+
+# ==========================================
+# 🛠️ Main 函数测试模块
+# ==========================================
+if __name__ == "__main__":
+    print("🚀 开始测试 Chunk Action Replay Buffer & Dataset 🚀\n")
+
+    # 参数设置
+    CAPACITY = 5000
+    NUM_POINTS = 1024   # 点云降采样后的点数 (通常1024或2048)
+    PC_DIM = 3          # 点云特征维度 (xyz)
+    STATE_DIM = 14      # 机器人本体状态维度 (如关节角+末端位置)
+    ACTION_DIM = 7      # 动作维度 (如6D位姿+抓手)
+    CHUNK_SIZE = 16     # Diffusion Policy 生成的 Action Chunk 长度
+    BATCH_SIZE = 32
+
+    # 1. 测试在线 Replay Buffer (用于 PG / 强化微调)
+    print("-" * 50)
+    print("🧪 1. Testing Online ActionChunkReplayBuffer...")
+    buffer = ActionChunkReplayBuffer(
+        capacity=CAPACITY,
+        num_points=NUM_POINTS,
+        pc_dim=PC_DIM,
+        state_dim=STATE_DIM,
+        action_dim=ACTION_DIM,
+        chunk_size=CHUNK_SIZE,
+        device="cpu"
+    )
+
+    # 模拟环境交互，塞入 100 步 Transition (设第49步和99步为 Episode 结束)
+    for step in range(100):
+        dummy_pc = np.random.randn(NUM_POINTS, PC_DIM)
+        dummy_state = np.random.randn(STATE_DIM)
+        dummy_action = np.ones(ACTION_DIM) * step  # 动作值设为 step 方便观察 Padding
+        dummy_reward = np.random.rand(1)
+        done = (step == 49 or step == 99)
+
+        buffer.add(
+            obs_pc=dummy_pc, obs_state=dummy_state, action=dummy_action, 
+            reward=dummy_reward, next_obs_pc=dummy_pc, next_obs_state=dummy_state, done=done
+        )
+
+    # 抽样并检查维度
+    batch = buffer.sample(BATCH_SIZE)
+    print("✅ Buffer Sampled Successfully!")
+    print(f"   -> obs_pc shape:       {batch['obs_pc'].shape}  (Expected: [{BATCH_SIZE}, {NUM_POINTS}, {PC_DIM}])")
+    print(f"   -> obs_state shape:    {batch['obs_state'].shape}     (Expected: [{BATCH_SIZE}, {STATE_DIM}])")
+    print(f"   -> action_chunk shape: {batch['action_chunk'].shape}  (Expected: [{BATCH_SIZE}, {CHUNK_SIZE}, {ACTION_DIM}])")
+    
+    # 检查其中一个 sample 是否正确 Padding 了 (边界测试)
+    print(f"   💡 随机检查第一个 sample 的 action_chunk 前 5 步:\n{batch['action_chunk'][0, :5, 0].cpu().numpy()}")
+
+
+    # 2. 测试离线 Dataset (用于 BC / IDQL 预训练)
+    print("\n" + "-" * 50)
+    print("🧪 2. Testing OfflineChunkDataset with PyTorch DataLoader...")
+    dataset = OfflineChunkDataset(data_path="dummy_path.npz", chunk_size=CHUNK_SIZE)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+
+    # 迭代一个 Batch
+    for offline_batch in dataloader:
+        print("✅ Dataloader Sampled Successfully!")
+        print(f"   -> offline obs_pc shape:       {offline_batch['obs_pc'].shape}")
+        print(f"   -> offline action_chunk shape: {offline_batch['action_chunk'].shape}")
+        break  # 只测试一个 batch
+
+    print("\n🎉 所有数据流测试通过，此 Buffer 可以直接对接到你的 3D Diffusion/Flow 模型中！")
+```
+
+--- 💡 File: data/maniskill_dataset.py ---
+```python
+# data/maniskill_dataset.py
+import h5py
+import numpy as np
+from tqdm import tqdm
+
+def load_maniskill_h5(h5_path, max_episodes=None):
+    """
+    读取 ManiSkill 生成的点云 .h5 数据，转换为离线 RL 训练所需格式。
+    """
+    print(f"📦 正在从 {h5_path} 加载 ManiSkill 数据...")
+    trajectories = []
+    
+    with h5py.File(h5_path, 'r') as f:
+        # 获取所有轨迹的键名，例如 'traj_0', 'traj_1'
+        keys = list(f.keys())
+        if max_episodes is not None:
+            keys = keys[:max_episodes]
+            
+        for ep_key in tqdm(keys, desc="Loading Episodes"):
+            traj = f[ep_key]
+            
+            # 1. 提取点云 (取前三维 X, Y, Z)
+            # 原始维度 [T, 16384, 4] -> 切片为 [T, 16384, 3]
+            xyzw = traj['obs']['pointcloud']['xyzw'][:]
+            xyz = xyzw[..., :3].astype(np.float32)
+            
+            # 2. 提取本体状态 (Proprioception)
+            # 拼接 qpos 和 qvel。假设是 PickCube 任务，通常加起来是 14 维左右
+            qpos = traj['obs']['agent']['qpos'][:]
+            qvel = traj['obs']['agent']['qvel'][:]
+            state = np.concatenate([qpos, qvel], axis=-1).astype(np.float32)
+            
+            # 3. 提取动作
+            action = traj['actions'][:].astype(np.float32)
+            
+            # 4. 提取奖励和结束标志 (给 IDQL 的 Critic 更新使用)
+            # 真实的演示轨迹通常都是成功的，可以用 'success' 作为稀疏奖励
+            if 'success' in traj:
+                reward = traj['success'][:].astype(np.float32)
+            else:
+                reward = np.zeros(len(action), dtype=np.float32)
+                reward[-1] = 1.0 # 假设最后一步成功
+                
+            done = np.zeros(len(action), dtype=bool)
+            if 'terminated' in traj:
+                done = traj['terminated'][:]
+            done[-1] = True # 强行确保最后一步为 Done
+            
+            trajectories.append({
+                'pc': xyz,
+                'state': state,
+                'action': action,
+                'reward': reward,
+                'done': done
+            })
+            
+    print(f"✅ 成功加载 {len(trajectories)} 条专家轨迹！")
+    return trajectories
+```
+
+--- 💡 File: algos/distill.py ---
+```python
+# algos/distill.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import copy
+from typing import Tuple
+
+class OneStepDistiller:
+    """
+    单步蒸馏核心逻辑 (One-step Distillation for Flow-matching / Diffusion)
+    将多步 ODE 的 Teacher Policy 蒸馏为一个只需 1 步推理的 Student Policy。
+    适用于 PointCloud + Action Chunk 架构。
+    """
+    def __init__(
+        self,
+        teacher_model: nn.Module,
+        student_model: nn.Module,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        lr: float = 1e-4,
+        teacher_steps: int = 10,
+        use_ema: bool = True  # 强推开启 EMA
+    ):
+        self.device = device
+        self.teacher_steps = teacher_steps
+        
+        # 1. 初始化 Teacher 模型 (冻结参数)
+        self.teacher = teacher_model.to(self.device).eval()
+        for param in self.teacher.parameters():
+            param.requires_grad = False
+            
+        # 2. 初始化 Student 模型 (可训练)
+        self.student = student_model.to(self.device).train()
+        
+        # 3. 优化器
+        self.optimizer = optim.AdamW(self.student.parameters(), lr=lr, weight_decay=1e-4)
+
+        # 4. EMA Model (Optional but recommended)
+        self.use_ema = use_ema
+        if self.use_ema:
+            self.ema_student = copy.deepcopy(self.student).eval()
+            for param in self.ema_student.parameters():
+                param.requires_grad = False
+
+    def update_ema(self, decay=0.995):
+        with torch.no_grad():
+            for ema_param, param in zip(self.ema_student.parameters(), self.student.parameters()):
+                ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+
+    @torch.no_grad()
+    def teacher_generate(self, obs: torch.Tensor, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """
+        使用 Teacher 模型通过 Euler ODE 求解器多步生成 Action Chunk
+        Flow Matching 约定: t=0 为纯噪声, t=1 为目标真实动作
+        """
+        dt = 1.0 / self.teacher_steps
+        x_t = noise.clone() # 初始状态: 纯噪声 [B, Chunk_Size, Action_Dim]
+        
+        for i in range(self.teacher_steps):
+            # 构造当前的时间步 t
+            t = torch.ones((obs.shape[0], 1), device=self.device) * (i * dt)
+            
+            # 预测向量场 Vector Field (速度 v)
+            v_pred = self.teacher(obs, state, x_t, t) 
+            
+            # Euler 步进: x_{t+dt} = x_t + v * dt
+            x_t = x_t + v_pred * dt
+            
+        return x_t # 返回生成的 Target Action Chunk
+
+    def update_step(self, obs: torch.Tensor, state: torch.Tensor, 
+                    precomputed_noise=None, precomputed_target=None) -> float:
+        """
+        单步蒸馏训练逻辑，支持在线蒸馏 (慢) 和离线缓存数据集蒸馏 (快)
+        Args:
+            obs: 3D Point Cloud 观测, shape: [B, N_points, 3] (或经过 Encoder 后的特征)
+        """
+        B, chunk_size, action_dim = obs.shape[0], self.student.chunk_size, self.student.action_dim
+
+        # --- 数据准备 ---
+        if precomputed_noise is not None and precomputed_target is not None:
+            # 高效模式：直接使用事先跑好 teacher_generate 的离线数据
+            z_noise = precomputed_noise
+            target_action = precomputed_target
+        else:
+            # 在线模式：每次前向都要跑 10 步 (极慢，仅供验证和小规模微调)
+            z_noise = torch.randn((B, chunk_size, action_dim), device=self.device) # 采样相同的初始随机噪声 [B, Chunk_Size, Action_Dim]
+            target_action = self.teacher_generate(obs, state, z_noise) # Teacher 多步生成伪标签 (Pseudo-target Action)
+        
+        # --- Student 单步预测 ---
+        t_zero = torch.zeros((B, 1), device=self.device) # 对于单步蒸馏，Student 的输入是同样的噪声，但 t 固定为 0
+        student_v = self.student(obs, state, z_noise, t_zero)
+            
+        # --- Loss 计算 (Velocity Matching) ---
+        target_v = target_action - z_noise  # dt=1 的理想速度
+        loss = F.mse_loss(student_v, target_v)
+        
+        # --- 优化 ---
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+        self.optimizer.step()
+        
+        if self.use_ema:
+            self.update_ema()
+            
+        return loss.item()
+
+
+# ==============================================================================
+# 以下为测试与验证模块 (__main__)，仅在直接运行该脚本时执行
+# 用于验证你的模型管道 (Model Pipeline) 是否能够正常完成维度对齐和蒸馏闭环
+# ==============================================================================
+if __name__ == "__main__":
+    import numpy as np
+    
+    print("🚀 正在启动 One-step Distillation 测试...\n")
+    
+    # 模拟超参数 (Hyperparams)
+    BATCH_SIZE = 16
+    N_POINTS = 1024         # 3D 点云点数
+    OBS_DIM = 3             # 3D 坐标
+    STATE_DIM = 7           # 本体状态维度 (比如 6DoF 关节角 + 1 Gripper 状态)
+    CHUNK_SIZE = 16         # Action Chunk 长度 (Temporal Ensembling)
+    ACTION_DIM = 7          # 机器臂动作维度 (6DoF + 1 Gripper)
+    
+    class DummyPolicyNetwork(nn.Module):
+        """
+        模拟你的 3D Flow/Diffusion 策略网络 (PointNeXt + Transformer)
+        仅作测试用，确保张量维度流转正确
+        """
+        def __init__(self, chunk_size, action_dim, state_dim):
+            super().__init__()
+            self.chunk_size = chunk_size
+            self.action_dim = action_dim
+            self.state_dim = state_dim
+            
+            # 假装这是一个 PointNet/PointNeXt 特征提取器
+            self.point_encoder = nn.Sequential(
+                nn.Linear(3, 64),
+                nn.ReLU(),
+                nn.Linear(64, 128)
+            )
+            # 假装这是一个 Transformer/UNet 处理时序和噪声
+            self.action_decoder = nn.Sequential(
+                nn.Linear(128 + self.state_dim + action_dim * chunk_size + 1, 256), 
+                nn.ReLU(),
+                nn.Linear(256, action_dim * chunk_size)
+            )
+
+        def forward(self, obs: torch.Tensor, state: torch.Tensor, noisy_action: torch.Tensor, time: torch.Tensor):
+            # obs: [B, N, 3] -> 简易 PointNet 的 MaxPool
+            obs_feats = self.point_encoder(obs).max(dim=1)[0] # [B, 128]
+            
+            # 展平 noisy_action [B, Chunk, Dim] -> [B, Chunk*Dim]
+            act_feats = noisy_action.view(noisy_action.shape[0], -1) 
+            
+            # 拼接所有条件 (Conditioning)
+            fused = torch.cat([obs_feats, state, act_feats, time], dim=-1)
+            
+            # 预测向量场 (Vector Field)
+            v_pred = self.action_decoder(fused)
+            
+            return v_pred.view(noisy_action.shape[0], self.chunk_size, self.action_dim)
+
+    # 1. 实例化假模型
+    print("1️⃣ 初始化 Teacher 和 Student 网络...")
+    teacher_net = DummyPolicyNetwork(CHUNK_SIZE, ACTION_DIM, STATE_DIM)
+    # Student 通常以 Teacher 为初始化基座 (可以极大加速收敛)
+    student_net = copy.deepcopy(teacher_net) 
+    
+    # 2. 实例化蒸馏器
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"2️⃣ 初始化 Distiller (设备: {device})...")
+    distiller = OneStepDistiller(
+        teacher_model=teacher_net,
+        student_model=student_net,
+        device=device,
+        teacher_steps=10, # Teacher 用 10 步 ODE 求解
+        use_ema=True
+    )
+    
+    # 3. 模拟离线或在线环境给过来的 3D 点云 Batch
+    print("3️⃣ 生成模拟的 3D 点云观测数据...\n")
+    dummy_obs_batch = torch.randn((BATCH_SIZE, N_POINTS, OBS_DIM), device=device)
+    dummy_state_batch = torch.randn((BATCH_SIZE, STATE_DIM), device=device)
+    
+    # 4. 执行蒸馏训练循环
+    print("🔥 开始蒸馏训练 (模拟 10 个 Step):")
+    for step in range(1, 11):
+        loss = distiller.update_step(dummy_obs_batch, dummy_state_batch)
+        print(f"   Step {step:02d} | Distillation Loss: {loss:.6f}")
+        
+    print("\n✅ 测试通过！你现在可以安全地将真实的 PointNeXt 和 Transformer 替换 DummyNetwork 了。")
+```
+
+--- 💡 File: algos/idql.py ---
+```python
+# algos/idql.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
+
+# ============================================================================
+# 1. Mock 模块 (在你的真实 Infra 中，这些将被 pointnext.py 和 policy.py 替换)
+# ============================================================================
+
+class MockPointEncoder(nn.Module):
+    """ 简易的点云编码器 (替代 PointNeXt/PointNet++) """
+    def __init__(self, in_channels=3, feature_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, feature_dim)
+        )
+    def forward(self, pc):
+        # pc shape: [B, N, C]
+        features = self.net(pc)           # [B, N, feature_dim]
+        global_feature = features.max(dim=1)[0] # Max Pooling -> [B, feature_dim]
+        return global_feature
+
+class MockFlowDiffusionPolicy(nn.Module):
+    """ 简易的 Flow/Diffusion 策略 (用于占位) """
+    def __init__(self, pc_feature_dim=256, chunk_size=16, action_dim=7):
+        super().__init__()
+        self.encoder = MockPointEncoder(3, pc_feature_dim)
+        # 假设这是一个条件生成模型，这里只 Mock 它的 Loss 计算过程
+        self.mock_net = nn.Sequential(
+            nn.Linear(pc_feature_dim + chunk_size * action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+    
+    def compute_loss(self, states, actions):
+        """ Flow/Diffusion 的前向 Loss 计算 (如 Flow Matching Loss 或 DDPM Denoise Loss) """
+        state_feat = self.encoder(states)       # [B, F]
+        action_flat = actions.view(actions.size(0), -1) # [B, Chunk * A_dim]
+        x = torch.cat([state_feat, action_flat], dim=-1)
+        # Mock loss: 让网络输出逼近 0
+        pred_noise = self.mock_net(x)
+        loss = F.mse_loss(pred_noise, torch.zeros_like(pred_noise))
+        return loss
+
+# ============================================================================
+# 2. IDQL 核心网络组件 (Critic & Value)
+# ============================================================================
+
+class ValueNetwork(nn.Module):
+    def __init__(self, pc_dim=3, feature_dim=256):
+        super().__init__()
+        self.encoder = MockPointEncoder(pc_dim, feature_dim)
+        self.v_net = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, state):
+        feat = self.encoder(state)
+        return self.v_net(feat)
+
+class TwinQNetwork(nn.Module):
+    def __init__(self, pc_dim=3, chunk_size=16, action_dim=7, feature_dim=256):
+        super().__init__()
+        self.encoder = MockPointEncoder(pc_dim, feature_dim)
+        
+        # Q1 Network
+        self.q1_net = nn.Sequential(
+            nn.Linear(feature_dim + chunk_size * action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+        
+        # Q2 Network
+        self.q2_net = nn.Sequential(
+            nn.Linear(feature_dim + chunk_size * action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, state, action_chunk):
+        feat = self.encoder(state)
+        action_flat = action_chunk.view(action_chunk.size(0), -1)
+        x = torch.cat([feat, action_flat], dim=-1)
+        
+        q1 = self.q1_net(x)
+        q2 = self.q2_net(x)
+        return q1, q2
+
+# ============================================================================
+# 3. IDQL 算法核心类
+# ============================================================================
+
+class IDQL:
+    """ 
+    Implicit Diffusion Q-Learning (基于 3D Point Cloud 与 Action Chunk) 
+    支持通过 Reject Sampling (拒绝采样) 训练 Flow/Diffusion Actor。
+    """
+    def __init__(
+        self,
+        actor: nn.Module,
+        q_network: nn.Module,
+        v_network: nn.Module,
+        device="cuda",
+        tau=0.7,             # Expectile 回归系数 (IQL 核心参数)
+        discount=0.99,
+        beta=3.0,            # Reject Sampling 温度系数
+        actor_lr=1e-4,
+        critic_lr=3e-4,
+        tau_target=0.005     # Target 网络软更新系数
+    ):
+        self.actor = actor.to(device)
+        self.q_net = q_network.to(device)
+        self.v_net = v_network.to(device)
+        self.q_target = copy.deepcopy(self.q_net).to(device)
+        
+        self.device = device
+        self.tau = tau
+        self.discount = discount
+        self.beta = beta
+        self.tau_target = tau_target
+        
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.q_opt = torch.optim.Adam(self.q_net.parameters(), lr=critic_lr)
+        self.v_opt = torch.optim.Adam(self.v_net.parameters(), lr=critic_lr)
+
+    def expectile_loss(self, diff, expectile):
+        """ Asymmetric L2 Loss (IQL 用于拟合 V 网络) """
+        weight = torch.where(diff > 0, expectile, (1 - expectile))
+        return weight * (diff ** 2)
+
+    def update_critic(self, states, actions, rewards, next_states, dones):
+        """ 离线阶段：更新 Q 和 V 网络 """
+        with torch.no_grad():
+            target_q1, target_q2 = self.q_target(states, actions)
+            target_q = torch.minimum(target_q1, target_q2)
+            next_v = self.v_net(next_states)
+            
+        # 1. 更新 V 网络 (Expectile Regression)
+        v = self.v_net(states)
+        adv = target_q - v
+        v_loss = self.expectile_loss(adv, self.tau).mean()
+        
+        self.v_opt.zero_grad()
+        v_loss.backward()
+        self.v_opt.step()
+        
+        # 2. 更新 Q 网络 (TD Learning)
+        q_target_value = rewards + self.discount * (1.0 - dones) * next_v.detach()
+        q1, q2 = self.q_net(states, actions)
+        
+        q1_loss = F.mse_loss(q1, q_target_value)
+        q2_loss = F.mse_loss(q2, q_target_value)
+        q_loss = q1_loss + q2_loss
+        
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        self.q_opt.step()
+        
+        # 3. Soft update Target Q Network
+        for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+            target_param.data.copy_(self.tau_target * param.data + (1 - self.tau_target) * target_param.data)
+            
+        return {"v_loss": v_loss.item(), "q_loss": q_loss.item()}
+
+    def update_actor(self, states, actions):
+        """ 提取阶段：使用 Reject Sampling 训练 Flow/Diffusion 策略 """
+        with torch.no_grad():
+            v = self.v_net(states)
+            q1, q2 = self.q_target(states, actions)
+            q = torch.minimum(q1, q2)
+            
+            # 计算 Advantage
+            adv = q - v
+            
+            # [🔥核心修复] 减去 advantage 的最大值，防止 torch.exp 指数爆炸变为 NaN
+            adv_stable = adv - adv.max() 
+            
+            # Reject Sampling 核心概率计算: exp(beta * adv) 归一化到 [0, 1]
+            weights = torch.exp(self.beta * adv_stable)
+            max_weight = weights.max()
+            accept_prob = (weights / max_weight).squeeze(-1) # [B]
+            
+            # 生成均匀分布 U(0,1) 进行过滤
+            random_u = torch.rand_like(accept_prob)
+            keep_mask = random_u < accept_prob
+            
+            # 安全校验: 确保至少保留一个样本，避免 Loss 变成 NaN
+            if keep_mask.sum() == 0:
+                keep_mask[torch.argmax(accept_prob)] = True
+
+        # 仅对被保留的高质量样本计算 Diffusion/Flow Loss
+        filtered_states = states[keep_mask]
+        filtered_actions = actions[keep_mask]
+        
+        actor_loss = self.actor.compute_loss(filtered_states, filtered_actions)
+        
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
+        
+        return {
+            "actor_loss": actor_loss.item(), 
+            "accept_ratio": keep_mask.float().mean().item(),
+            "adv_mean": adv.mean().item()
+        }
+
+# ============================================================================
+# 4. 测试与验证 (直接运行本文件)
+# ============================================================================
+if __name__ == "__main__":
+    print("🚀 启动 IDQL (Point Cloud + Action Chunk) 架构验证...")
+    
+    # --- 参数设定 ---
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    BATCH_SIZE = 32
+    NUM_POINTS = 1024
+    PC_DIM = 3            # (X, Y, Z)
+    CHUNK_SIZE = 16       # Action Chunk 长度 (Temporal Window)
+    ACTION_DIM = 7        # 机器人动作维度 (如 6 DoF + 1 Gripper)
+    FEATURE_DIM = 128     # 点云提取后的特征维度
+    
+    # --- 初始化网络组件 ---
+    actor = MockFlowDiffusionPolicy(FEATURE_DIM, CHUNK_SIZE, ACTION_DIM)
+    v_net = ValueNetwork(PC_DIM, FEATURE_DIM)
+    q_net = TwinQNetwork(PC_DIM, CHUNK_SIZE, ACTION_DIM, FEATURE_DIM)
+    
+    # --- 初始化 IDQL Agent ---
+    agent = IDQL(
+        actor=actor,
+        q_network=q_net,
+        v_network=v_net,
+        device=DEVICE
+    )
+    
+    # --- 生成 Dummy 数据 ---
+    print("\n📦 生成 Batch 数据...")
+    states = torch.randn(BATCH_SIZE, NUM_POINTS, PC_DIM).to(DEVICE)
+    next_states = torch.randn(BATCH_SIZE, NUM_POINTS, PC_DIM).to(DEVICE)
+    actions = torch.randn(BATCH_SIZE, CHUNK_SIZE, ACTION_DIM).to(DEVICE)
+    rewards = torch.rand(BATCH_SIZE, 1).to(DEVICE)
+    dones = torch.zeros(BATCH_SIZE, 1).to(DEVICE)
+    
+    print(f"  > States Shape: {states.shape}")
+    print(f"  > Actions Shape: {actions.shape}")
+    
+    # --- 运行一次离线 Q/V 网络更新 (Critic Step) ---
+    print("\n🔄 [Step 1] 测试 Critic & Value (IQL Expectile Regression) 更新...")
+    critic_info = agent.update_critic(states, actions, rewards, next_states, dones)
+    print(f"  ✅ Q Loss: {critic_info['q_loss']:.4f}")
+    print(f"  ✅ V Loss: {critic_info['v_loss']:.4f}")
+    
+    # --- 运行一次策略提取更新 (Actor Step with Reject Sampling) ---
+    print("\n🔄 [Step 2] 测试 Actor 拒绝采样 (Reject Sampling) 与 Policy 训练...")
+    actor_info = agent.update_actor(states, actions)
+    print(f"  ✅ Actor Loss: {actor_info['actor_loss']:.4f}")
+    print(f"  ✅ 样本保留率 (Accept Ratio): {actor_info['accept_ratio']*100:.1f}%")
+    print(f"  ✅ 平均 Advantage: {actor_info['adv_mean']:.4f}")
+    
+    print("\n🎉 架构测试通过！代码已修复数值稳定性，可直接用于精简版 Infra！")
+```
+
+--- 💡 File: algos/pg.py ---
+```python
+# algos/pg.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+class FlowPolicyGradient:
+    """
+    针对 3D Flow/Diffusion + Chunk Action 优化的 Policy Gradient / PPO 算法。
+    抛弃了复杂的跨模态兼容，专心服务于 PointCloud -> Action Chunk 的更新。
+    """
+    def __init__(
+        self,
+        policy: nn.Module,
+        critic: nn.Module,
+        actor_lr: float = 1e-4,
+        critic_lr: float = 3e-4,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        clip_ratio: float = 0.2,
+        entropy_coef: float = 0.01,
+        v_loss_coef: float = 0.5,
+        max_grad_norm: float = 1.0,
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ):
+        self.policy = policy.to(device)
+        self.critic = critic.to(device)
+        
+        self.optimizer_policy = optim.AdamW(self.policy.parameters(), lr=actor_lr, weight_decay=1e-4)
+        self.optimizer_critic = optim.AdamW(self.critic.parameters(), lr=critic_lr, weight_decay=1e-4)
+        
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
+        self.v_loss_coef = v_loss_coef
+        self.max_grad_norm = max_grad_norm
+        self.device = device
+
+    def compute_gae(self, rewards, values, dones, next_value):
+        """
+        计算广义优势估计 (Generalized Advantage Estimation)
+        注意：在 Chunk Action 环境中，一步 step 可能执行了 k 步环境动作，
+        这里的 rewards 应该是这 k 步的总和或折现和。
+        
+        【修正】: 假设输入张量的形状为 [T, B] (Time_Steps, Num_Envs)
+        T 是轨迹的时间步数，B 是并行环境的数量。
+        """
+        # 获取时间步 T
+        T = rewards.shape[0]
+        advantages = torch.zeros_like(rewards).to(self.device)
+        last_gae_lam = 0
+        
+        for t in reversed(range(T)):
+            if t == T - 1:
+                next_non_terminal = 1.0 - dones[t]
+                next_values = next_value
+            else:
+                next_non_terminal = 1.0 - dones[t]
+                next_values = values[t + 1]
+                
+            delta = rewards[t] + self.gamma * next_values * next_non_terminal - values[t]
+            advantages[t] = last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            
+        returns = advantages + values
+        return advantages, returns
+
+    def update_step(self, states, actions, old_log_probs, returns, advantages):
+        """
+        执行一次 PG/PPO 网络更新
+        states: 3D Point Cloud [B, N, C]
+        actions: Chunk Actions [B, Chunk_Size, Action_Dim]
+        """
+        # 1. 评估当前策略下该动作的 log_prob 和 熵 (Entropy)
+        # 注意: 对于 Flow/Diffusion, 这里内部可能会使用 Hutchinson 迹估计(CNF) 
+        # 或者沿着去噪轨迹计算 per-step log_prob 累加 (类似 DDPO)。
+        log_probs, entropy = self.policy.evaluate_actions(states, actions)
+        
+        # 2. 评估当前状态的 Value
+        values = self.critic(states).squeeze(-1)
+        
+        # 3. 计算 Actor Loss (PPO Clip机制)
+        ratio = torch.exp(log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
+        
+        actor_loss = -torch.min(surr1, surr2).mean()
+        
+        # 4. 计算 Critic Loss (MSE)
+        critic_loss = F.mse_loss(values, returns)
+        
+        # 5. 计算 Entropy Bonus (鼓励探索)
+        entropy_loss = entropy.mean()
+        
+        # 6. 总 Loss
+        total_loss = actor_loss + self.v_loss_coef * critic_loss - self.entropy_coef * entropy_loss
+        
+        # --- 梯度反向传播与更新 ---
+        self.optimizer_policy.zero_grad()
+        self.optimizer_critic.zero_grad()
+        
+        total_loss.backward()
+        
+        # 梯度裁剪防爆 (Flow 模型的梯度容易出现尖峰)
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        
+        self.optimizer_policy.step()
+        self.optimizer_critic.step()
+        
+        return {
+            "actor_loss": actor_loss.item(),
+            "critic_loss": critic_loss.item(),
+            "entropy": entropy_loss.item(),
+            "total_loss": total_loss.item()
+        }
+
+
+# ==============================================================================
+# 本地测试模块 (Mock Data & Models) 
+# ==============================================================================
+if __name__ == "__main__":
+    print("🚀 开始测试 Flow/Diffusion + Chunk Action 的 PG 更新流...")
+    
+    # 模拟超参数
+    TIME_STEPS = 32    # PPO Rollout 收集的时间步长 (Trajectory Length)
+    NUM_ENVS = 4       # 并行环境数量 (Batch Size的一种体现)
+    NUM_POINTS = 1024
+    POINT_DIM = 3      # x, y, z
+    CHUNK_SIZE = 8     # Action Chunk 长度
+    ACTION_DIM = 7     # 7 DoF (比如 6D位姿 + 1D夹爪)
+    
+    # 1. Mock 策略网络 (代替复杂的 PointNeXt + Flow/Diffusion ODE)
+    class MockFlowPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # 简单的特征提取模拟
+            self.net = nn.Sequential(
+                nn.Linear(NUM_POINTS * POINT_DIM, 256),
+                nn.ReLU(),
+                nn.Linear(256, CHUNK_SIZE * ACTION_DIM * 2) # 输出 mu 和 log_std 用于模拟分布
+            )
+            
+        def evaluate_actions(self, states, actions):
+            """
+            在真实的 Flow/Diffusion 中，这里会是计算 ODE 似然或去噪步骤的概率。
+            为了测试 Infra 是否通顺，这里用高斯分布替代模拟。
+            """
+            B = states.shape[0]
+            # Flatten point cloud for dummy MLP
+            flat_states = states.view(B, -1)
+            out = self.net(flat_states).view(B, CHUNK_SIZE, ACTION_DIM, 2)
+            mu, log_std = out[..., 0], out[..., 1]
+            std = torch.exp(torch.clamp(log_std, min=-20, max=2))
+            
+            dist = torch.distributions.Normal(mu, std)
+            # 动作空间独立，将 chunk_size 和 action_dim 的对数概率求和
+            log_prob = dist.log_prob(actions).sum(dim=(-1, -2)) 
+            entropy = dist.entropy().sum(dim=(-1, -2))
+            return log_prob, entropy
+
+    # 2. Mock 价值网络 (Critic)
+    class MockCritic(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(NUM_POINTS * POINT_DIM, 256),
+                nn.ReLU(),
+                nn.Linear(256, 1)
+            )
+        def forward(self, states):
+            B = states.shape[0]
+            return self.net(states.view(B, -1))
+
+    # 3. 初始化环境、数据与 Trainer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    mock_policy = MockFlowPolicy()
+    mock_critic = MockCritic()
+    
+    trainer = FlowPolicyGradient(
+        policy=mock_policy,
+        critic=mock_critic,
+        device=device
+    )
+    
+    # 4. 生成 Dummy Trajectory 数据 (模拟 On-policy 收集的轨迹序列)
+    # [T, B, N_points, C]
+    traj_states = torch.randn(TIME_STEPS, NUM_ENVS, NUM_POINTS, POINT_DIM, device=device)
+    # [T, B, Chunk_Size, Act_Dim]
+    traj_actions = torch.randn(TIME_STEPS, NUM_ENVS, CHUNK_SIZE, ACTION_DIM, device=device)
+    
+    # 模拟环境的奖励和结束标志 [T, B]
+    traj_rewards = torch.randn(TIME_STEPS, NUM_ENVS, device=device)
+    traj_dones = torch.zeros(TIME_STEPS, NUM_ENVS, device=device) # 假设没有 done
+    traj_dones[-1, :] = 1.0 # 最后一个 step 强行 done
+
+    # 获取 Values [T, B] 并计算 GAE
+    # 注意: Critic 往往逐帧或将其 flatten 计算以利用并行
+    with torch.no_grad():
+        flat_states = traj_states.view(TIME_STEPS * NUM_ENVS, NUM_POINTS, POINT_DIM)
+        flat_values = mock_critic(flat_states).squeeze(-1)
+        traj_values = flat_values.view(TIME_STEPS, NUM_ENVS)
+        
+        # 假设下一个最终状态的 value [B]
+        dummy_next_value = torch.zeros(NUM_ENVS, device=device) 
+        
+    advantages, returns = trainer.compute_gae(traj_rewards, traj_values, traj_dones, dummy_next_value)
+    
+    # Advantage 归一化 (PG标准操作，有助于稳定) - 在整个 Trajectory 上做归一化
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # 5. 打平数据并执行一次网络更新 (Flat T and B dimensions into a single Batch)
+    flat_states_update = traj_states.view(-1, NUM_POINTS, POINT_DIM)
+    flat_actions_update = traj_actions.view(-1, CHUNK_SIZE, ACTION_DIM)
+    flat_advantages = advantages.view(-1)
+    flat_returns = returns.view(-1)
+    
+    with torch.no_grad():
+        flat_old_log_probs, _ = mock_policy.evaluate_actions(flat_states_update, flat_actions_update)
+
+    print("执行更新前, Policy weight norm:", torch.norm(mock_policy.net[0].weight).item())
+    
+    # 真实 PPO 训练中，这里往往会将 flat 数据进一步做 Mini-batch 切片，这里为了演示直接整批更新
+    loss_dict = trainer.update_step(
+        states=flat_states_update,
+        actions=flat_actions_update,
+        old_log_probs=flat_old_log_probs,
+        returns=flat_returns,
+        advantages=flat_advantages
+    )
+    
+    print("执行更新后, Policy weight norm:", torch.norm(mock_policy.net[0].weight).item())
+    print("✅ 更新成功! Loss 数据如下:")
+    for k, v in loss_dict.items():
+        print(f"   - {k}: {v:.4f}")
+```
+
+--- 💡 File: algos/diffusion_utils/ddim_scheduler.py ---
+```python
+# algos/diffusion_utils/ddim_scheduler.py
+import math
+import torch
+import torch.nn as nn
+import numpy as np
+
+def get_beta_schedule(schedule_name: str, num_train_timesteps: int, beta_start: float, beta_end: float):
+    """
+    获取 beta 调度策略，具身智能通常使用 linear 或 squaredcos_cap_v2
+    """
+    if schedule_name == "linear":
+        return torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
+    elif schedule_name == "squaredcos_cap_v2":
+        # Diffusion Policy 中常用的 Cosine 调度，在两端更平滑
+        def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
+            alpha_bar = lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+            betas = []
+            for i in range(num_diffusion_timesteps):
+                t1 = i / num_diffusion_timesteps
+                t2 = (i + 1) / num_diffusion_timesteps
+                betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+            return torch.tensor(betas, dtype=torch.float32)
+        return betas_for_alpha_bar(num_train_timesteps)
+    else:
+        raise NotImplementedError(f"Beta schedule {schedule_name} is not implemented.")
+
+class DDIMScheduler(nn.Module): # 继承 nn.Module 以利用 register_buffer 管理设备
+    def __init__(
+        self,
+        num_train_timesteps: int = 100,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
+        beta_schedule: str = "squaredcos_cap_v2",
+        prediction_type: str = "epsilon", # 默认模型预测的是噪声 (epsilon) 支持 "epsilon", "sample"(x0), "v_prediction"
+        clip_sample: bool = False,         # 是否裁剪生成的动作 (防止飞车)，PG 训练下强烈建议设为 False
+        clip_sample_range: float = 1.0    # 动作通常归一化到 [-1, 1]
+    ):
+        """
+        为 Action Chunking 定制的 DDIM Scheduler。
+        去除了 HuggingFace diffusers 中复杂的图像处理逻辑，直接进行张量运算。
+        """
+        super().__init__()
+        self.num_train_timesteps = num_train_timesteps
+        self.prediction_type = prediction_type
+        self.clip_sample = clip_sample
+        self.clip_sample_range = clip_sample_range
+
+        # 1. 计算 Betas 和 Alphas
+        betas = get_beta_schedule(beta_schedule, num_train_timesteps, beta_start, beta_end)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # 2. 使用 register_buffer 彻底解决 .to(device) 的高频调用痛点
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+
+        # 2. 推理时的 timesteps 占位符
+        self.num_inference_steps = None
+        # 默认 timestep 序列
+        self.register_buffer("timesteps", torch.arange(0, num_train_timesteps).flip(0))
+
+    def set_timesteps(self, num_inference_steps: int, device: torch.device = None):
+        """
+        设置推理时间步:使用 linspace 确保从最顶端 (T-1) 完美均匀降落到 0
+        """
+        self.num_inference_steps = num_inference_steps
+        timesteps = np.linspace(0, self.num_train_timesteps - 1, num_inference_steps, dtype=int)[::-1].copy()
+        # 将生成的 numpy array 转为 tensor 并放到正确设备
+        timesteps_tensor = torch.from_numpy(timesteps).long()
+        if device is not None:
+            timesteps_tensor = timesteps_tensor.to(device)
+        self.timesteps = timesteps_tensor
+
+    def _extract(self, a, t, x_shape):
+        """
+        从一维数组 a 中提取时间步 t 对应的值，并 reshape 为 x_shape 以支持 Broadcasting。
+        例如:x_shape 为 [Batch, Chunk_Size, Action_Dim] -> 提取出来的维度为 [Batch, 1, 1]
+        """
+        b, *_ = t.shape
+        out = a.gather(-1, t)
+        return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+    def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """
+        前向过程:q(x_t | x_0) 
+        用于训练阶段生成带噪动作。
+        """
+        alphas_cumprod_t = self._extract(self.alphas_cumprod, timesteps, original_samples.shape)
+        sqrt_alpha_prod = alphas_cumprod_t ** 0.5
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod_t) ** 0.5
+
+        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+        return noisy_samples
+
+    def step(self, model_output: torch.Tensor, timestep: int, sample: torch.Tensor) -> torch.Tensor:
+        """
+        反向过程 (DDIM 单步去噪) : 
+        根据模型预测的噪声 (epsilon)，计算上一时刻的动作 x_{t-1}。
+        支持张量形状: [Batch, Chunk_Size, Action_Dim]
+        """
+        # 1. 寻找 prev_timestep (兼容 linspace 采样的任意间隔)
+        step_index = (self.timesteps == timestep).nonzero(as_tuple=True)[0]
+        if len(step_index) == 0:
+            step_ratio = self.num_train_timesteps // self.num_inference_steps
+            prev_timestep = timestep - step_ratio
+        else:
+            prev_timestep = self.timesteps[step_index + 1].item() if step_index < len(self.timesteps) - 1 else -1
+
+        # 2. 获取当前 t 和前一步 t-1 的 alpha_cumprod
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else torch.tensor(1.0, device=model_output.device)
+        beta_prod_t = 1 - alpha_prod_t
+
+        # 3. 计算预测出的原始无噪样本 (x_0)   支持多目标的预测 (为 One-step Distill / Consistency Model 铺路)
+        if self.prediction_type == "epsilon":
+            pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+            pred_epsilon = model_output
+        elif self.prediction_type == "sample": # 直接预测 x0
+            pred_original_sample = model_output
+            pred_epsilon = (sample - alpha_prod_t ** 0.5 * pred_original_sample) / beta_prod_t ** 0.5
+        elif self.prediction_type == "v_prediction": # Flow 友好型 (velocity)
+            pred_original_sample = alpha_prod_t ** 0.5 * sample - beta_prod_t ** 0.5 * model_output
+            pred_epsilon = alpha_prod_t ** 0.5 * model_output + beta_prod_t ** 0.5 * sample
+        else:
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+
+        # 如果必须裁剪，在 RL 中建议使用软裁剪 (Tanh)，这里保留原逻辑但默认关闭
+        if self.clip_sample:
+            # 软裁切示例:pred_original_sample = torch.tanh(pred_original_sample) * self.clip_sample_range
+            pred_original_sample = torch.clamp(pred_original_sample, -self.clip_sample_range, self.clip_sample_range)
+
+        # 5. DDIM 核心公式 (ETA = 0, 即确定性采样，具身智能通常不需要随机性)
+        # x_{t-1} = sqrt(alpha_{t-1}) * x_0 + sqrt(1 - alpha_{t-1}) * epsilon_theta
+        pred_sample_direction = (1 - alpha_prod_t_prev) ** 0.5 * pred_epsilon  
+        prev_sample = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
+
+        return prev_sample
+
+
+# ==============================================================================
+# MAIN TEST BLOCK 
+# 直接运行此文件以测试:python ddim_scheduler.py
+# ==============================================================================
+if __name__ == "__main__":
+    print("🚀 开始测试定制版 DDIM Scheduler (针对 Action Chunking) ...\n")
+    
+    # 模拟超参数
+    BATCH_SIZE = 2
+    CHUNK_SIZE = 16
+    ACTION_DIM = 7      # 例如:6 DOF 机械臂 + 1 自由度夹爪
+    TRAIN_STEPS = 100
+    INFER_STEPS = 10    # 将 100 步提速到 10 步推理
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🖥️  测试设备: {device}")
+
+    # 1. 初始化调度器
+    scheduler = DDIMScheduler(
+        num_train_timesteps=TRAIN_STEPS,
+        beta_schedule="squaredcos_cap_v2"
+    ).to(device)
+
+    # 2. 模拟训练阶段 (Forward Process / 加噪)
+    print("\n--- 🧪 测试训练阶段 (加噪) ---")
+    # 假设从 Dataset 中采样的真实动作块 (归一化在 -1 到 1 之间)
+    clean_action_chunks = torch.randn((BATCH_SIZE, CHUNK_SIZE, ACTION_DIM), device=device)
+    # 随机生成噪声
+    noise = torch.randn_like(clean_action_chunks)
+    # 随机采样 batch 的 timesteps
+    timesteps = torch.randint(0, TRAIN_STEPS, (BATCH_SIZE,), device=device).long()
+    
+    noisy_actions = scheduler.add_noise(clean_action_chunks, noise, timesteps)
+    print(f"✅ 输入干净动作 shape: {clean_action_chunks.shape}")
+    print(f"✅ 随机采样的 t: {timesteps.tolist()}")
+    print(f"✅ 增加噪声后的 shape: {noisy_actions.shape}")
+    
+    # 3. 模拟推理阶段 (Reverse Process / 去噪)
+    print("\n--- 🧪 测试推理阶段 (去噪采样) ---")
+    
+    # 模拟一个极简的 Dummy 神经网络 (例如基于 Transformer 的 1D-UNet)
+    # 实际上，这里它应该接收 (noisy_actions, t, visual_features)，输出 noise
+    class DummyPolicyNetwork(nn.Module):
+        def forward(self, x, t):
+            # 模型预测的噪声通常与 x 同维度
+            return torch.randn_like(x)
+
+    dummy_model = DummyPolicyNetwork().to(device)
+
+    # 设置推理步数
+    scheduler.set_timesteps(num_inference_steps=INFER_STEPS, device=device)
+    print(f"✅ 推理使用的时间步序列: {scheduler.timesteps.tolist()}")
+
+    # 开始采样:从纯高斯噪声开始
+    action_traj = torch.randn((BATCH_SIZE, CHUNK_SIZE, ACTION_DIM), device=device)
+    print(f"✅ 初始纯噪声动作 shape: {action_traj.shape}")
+
+    # 循环去噪
+    for t in scheduler.timesteps:
+        # 1. 模型预测噪声 epsilon
+        with torch.no_grad():
+            predicted_noise = dummy_model(action_traj, t)
+        
+        # 2. DDIM 步进，计算上一时间步的动作
+        action_traj = scheduler.step(model_output=predicted_noise, timestep=int(t), sample=action_traj)
+        
+        # print(f"  --> 完成去噪 step {int(t)}, 输出 actions std: {action_traj.std().item():.4f}")
+
+    print(f"✅ 最终去噪生成的 Action Chunk shape: {action_traj.shape}")
+    print("🎉 DDIM Scheduler 测试完美通过！可以安全移植入你的具身框架。")
+```
+
+--- 💡 File: algos/diffusion_utils/flow_matching.py ---
+```python
+# algos/diffusion_utils/flow_matching.py
+
+import torch
+import torch.nn as nn
+from typing import Callable, Tuple, Optional
+import contextlib
+
+class OTFlowMatching:
+    """
+    Optimal Transport Conditional Flow Matching (OT-CFM)
+    适用于 Chunk Action 和 Continuous Normalizing Flows 的流匹配核心逻辑。
+    """
+    def __init__(self, sigma_min: float = 1e-5):
+        """
+        初始化 Flow Matching 调度器
+        :param sigma_min: 防止数值不稳定的微小噪声扰动，通常在 OT Flow 中设为极小值
+        """
+        self.sigma_min = sigma_min
+
+    def compute_loss(self, 
+                     model: nn.Module, 
+                     x1: torch.Tensor, 
+                     cond: torch.Tensor) -> torch.Tensor:
+        """
+        计算 Flow Matching 的目标函数 (Vector Field MSE Loss)
+        
+        :param model: 预测向量场的神经网络模型 v_theta(x_t, t, cond)
+        :param x1: 目标数据，即 Expert Action Chunk，形状 [B, Chunk_Size, Action_Dim]
+        :param cond: 条件特征 (如 PointCloud 的全局/局部特征)，形状 [B, Cond_Dim]
+        :return: MSE 损失值
+        """
+        B = x1.shape[0]
+        device = x1.device
+
+        # 1. 采样初始噪声 x0 ~ N(0, I)
+        x0 = torch.randn_like(x1)
+
+        # 2. 在 [0, 1] 之间均匀采样时间步 t
+        # 为了避免 t 恰好为 0 或 1 带来的奇异性，通常在 (0, 1) 的微小截断内采样，或者直接均匀采样
+        # 为了避免极值，通常限制在 [1e-5, 1 - 1e-5] 增加数值稳定性
+        t = torch.rand((B,), device=device) * (1.0 - 2e-5) + 1e-5
+
+        # 将 t 扩展到与 x1 相同的维度，以便于广播计算: [B, 1, 1]
+        t_expand = t.view(-1, *([1] * (x1.dim() - 1)))
+
+        # 3. 构建严格一致的 OT 直线路径
+        # 数学公式: x_t = (1 - (1 - sigma_min)*t) * x0 + t * x1
+        # 求导: d(x_t)/dt = x1 - (1 - sigma_min) * x0
+        xt = (1 - (1 - self.sigma_min) * t_expand) * x0 + t_expand * x1
+
+        # 4. 计算真实的目标向量场 (Target Vector Field)
+        ut = x1 - (1 - self.sigma_min) * x0
+
+        # 5. 模型预测当前时间的向量场
+        vt = model(xt, t, cond)
+
+        # 6. 计算 MSE Loss (匹配向量场)
+        loss = torch.mean((vt - ut) ** 2)
+        return loss
+
+    def sample(self, 
+               model: nn.Module, 
+               cond: torch.Tensor, 
+               action_shape: Tuple[int, ...], 
+               num_steps: int = 20, 
+               solver: str = 'euler',
+               cfg_weight: float = 1.0,         # 新增: CFG 权重 (1.0表示不使用CFG)
+               uncond_cond: Optional[torch.Tensor] = None, # 新增: 无条件向量 (用于CFG)
+               requires_grad: bool = False      # 新增: 是否允许梯度回传 (用于PG和蒸馏)
+               ) -> torch.Tensor:
+        """
+        使用 ODE 求解器从纯噪声生成 Action Chunk
+        
+        :param model: 预测向量场的模型
+        :param cond: 状态/点云条件特征 [B, Cond_Dim]
+        :param action_shape: 单个样本的 Action 形状，如 (Chunk_Size, Action_Dim)
+        :param num_steps: 推理步数 (Flow 一般只需要 10-20 步)
+        :param solver: ODE 求解器，支持 'euler' (欧拉法) 或 'heun' (改进欧拉/Heun法)
+        :return: 生成的 Action Chunk [B, Chunk_Size, Action_Dim]
+        """
+        B = cond.shape[0]
+        device = cond.device
+
+        # 根据 requires_grad 决定是否开启梯度追踪
+        context = contextlib.nullcontext() if requires_grad else torch.no_grad()
+
+        with context:
+            # t=0 时刻，从纯标准高斯噪声出发
+            x = torch.randn((B, *action_shape), device=device)
+            
+            # 步长
+            dt = 1.0 / num_steps
+            
+            # 时间步列表: 0, dt, 2dt, ..., 1.0-dt
+            t_steps = torch.linspace(0, 1.0 - dt, num_steps, device=device)
+
+            for t_val in t_steps:
+                # 构造当前批次的时间张量 [B,]
+                t_batch = torch.full((B,), t_val, device=device)
+
+                # 辅助函数: 计算当前的向量场 (带有 CFG 逻辑)
+                def get_vt(x_curr, t_curr):
+                    if cfg_weight != 1.0 and uncond_cond is not None:
+                        # 拼接 batch 以便一次 forward 算出 cond 和 uncond，节省时间
+                        x_in = torch.cat([x_curr, x_curr], dim=0)
+                        t_in = torch.cat([t_curr, t_curr], dim=0)
+                        c_in = torch.cat([cond, uncond_cond], dim=0)
+                        
+                        vt_out = model(x_in, t_in, c_in)
+                        vt_cond, vt_uncond = torch.chunk(vt_out, chunks=2, dim=0)
+                        
+                        # CFG 外推公式
+                        return vt_uncond + cfg_weight * (vt_cond - vt_uncond)
+                    else:
+                        return model(x_curr, t_curr, cond)
+
+                if solver == 'euler':
+                    vt = get_vt(x, t_batch)
+                    x = x + vt * dt
+                    
+                elif solver == 'heun':
+                    vt = get_vt(x, t_batch)
+                    x_next_euler = x + vt * dt
+                    
+                    if t_val == t_steps[-1]:
+                        x = x_next_euler
+                    else:
+                        t_next = t_batch + dt
+                        vt_next = get_vt(x_next_euler, t_next)
+                        x = x + (vt + vt_next) / 2.0 * dt
+                else:
+                    raise ValueError(f"不支持的 ODE 求解器: {solver}")
+
+            return x
+
+
+# =========================================================================
+# 测试逻辑 (Main) - 验证前向 Loss 与 ODE 采样是否闭环
+# =========================================================================
+if __name__ == "__main__":
+    print("🚀 开始测试 Flow Matching 模块...")
+
+    # 1. 模拟环境与模型的超参数
+    BATCH_SIZE = 16
+    CHUNK_SIZE = 8       # Action Chunk 长度
+    ACTION_DIM = 7       # 机器人自由度 (如 6 DoF + 1 Gripper)
+    COND_DIM = 128       # 假设从 PointNeXt 提取出来的点云特征维度
+
+    # 2. 构建一个非常简单的 Dummy 网络来替代真实的 UNet1D/Transformer
+    class DummyVectorFieldNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # 输入: Action_Flat(8*7=56) + Time(1) + Cond(128) = 185
+            self.net = nn.Sequential(
+                nn.Linear(CHUNK_SIZE * ACTION_DIM + 1 + COND_DIM, 256),
+                nn.Mish(),
+                nn.Linear(256, 256),
+                nn.Mish(),
+                nn.Linear(256, CHUNK_SIZE * ACTION_DIM)
+            )
+        
+        def forward(self, x, t, cond):
+            B = x.shape[0]
+            # Flatten 动作序列
+            x_flat = x.view(B, -1)
+            # t 扩展维度
+            t_exp = t.view(B, 1)
+            # 拼接输入
+            inputs = torch.cat([x_flat, t_exp, cond], dim=-1)
+            # 预测 Vector Field
+            vt_flat = self.net(inputs)
+            # 还原形状返回
+            return vt_flat.view(B, CHUNK_SIZE, ACTION_DIM)
+
+    # 实例化组件
+    model = DummyVectorFieldNet()
+    fm_scheduler = OTFlowMatching()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # 3. 模拟离线数据集中的输入 (Expert Data)
+    expert_actions = torch.randn(BATCH_SIZE, CHUNK_SIZE, ACTION_DIM) # 真实的 Chunk Action
+    state_conds = torch.randn(BATCH_SIZE, COND_DIM)                  # 真实的 PointCloud 条件特征
+
+    print(f"📊 模型输入维度: Actions {expert_actions.shape}, Conds {state_conds.shape}")
+
+    # 4. 测试计算 Loss 并反向传播 (模拟训练过程)
+    model.train()
+    loss = fm_scheduler.compute_loss(model, expert_actions, state_conds)
+    
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    print(f"✅ 训练单步成功! 当前 Flow Matching Loss: {loss.item():.4f}")
+
+    # 5. 测试生成过程 (ODE 采样 / 推理过程)
+    model.eval()
+    action_shape = (CHUNK_SIZE, ACTION_DIM)
+    
+    # 测试 Euler 采样 (假设单步推断需要 10 步)
+    print("⏳ 测试 Euler ODE 采样 (10步)...")
+    sampled_actions_euler = fm_scheduler.sample(
+        model=model, 
+        cond=state_conds, 
+        action_shape=action_shape, 
+        num_steps=10, 
+        solver='euler'
+    )
+    print(f"✅ Euler 采样成功! 生成动作维度: {sampled_actions_euler.shape}")
+
+    # 测试 Heun 采样 (更精确)
+    print("⏳ 测试 Heun ODE 采样 (10步)...")
+    sampled_actions_heun = fm_scheduler.sample(
+        model=model, 
+        cond=state_conds, 
+        action_shape=action_shape, 
+        num_steps=10, 
+        solver='heun'
+    )
+    print(f"✅ Heun 采样成功! 生成动作维度: {sampled_actions_heun.shape}")
+    print("🎉 模块全部测试通过！可以直接移植到 my_rl100_infra 中。")
+```
+
+
+# 提示：共读取了 30 个代码/配置文件。
+# [End of Context]

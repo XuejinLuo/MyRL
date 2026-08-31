@@ -1,0 +1,300 @@
+# models/policy.py
+"""
+Embodied Policy Core (Flow / Diffusion Policy)
+为 3D 具身智能 (PointCloud + Chunk Action) 打造的通用策略包装器。
+
+完美适配：
+1. Behavior Cloning (BC) & IDQL: 通过 compute_loss() 接口
+2. Env Rollout (推理): 通过 sample() 接口
+3. One-step Distillation: 通过 forward() 接口暴露底层前向计算
+4. Policy Gradient (PG): 通过 evaluate_actions() 提供近似对数似然估计
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict, Tuple, Union
+
+# 导入你提供的各个模块 (请确保这些文件在你的 PYTHONPATH 中)
+from models.encoders.pointnext import PointNeXtEncoder
+from models.backbones.transformer import ActionDiffusionTransformer
+from models.backbones.unet1d import ConditionalUnet1D
+from algos.diffusion_utils.flow_matching import OTFlowMatching
+from algos.diffusion_utils.ddim_scheduler import DDIMScheduler
+
+class EmbodiedGenPolicy(nn.Module):
+    def __init__(
+        self,
+        # 1. 空间/动作定义
+        action_dim: int = 7,
+        chunk_size: int = 16,
+        use_state: bool = True,
+        state_dim: int = 14,
+        
+        # 2. 网络结构配置
+        encoder_type: str = "pointnext", 
+        backbone_type: str = "transformer", # "transformer" or "unet1d"
+        cond_dim: int = 256,                # 融合后条件向量维度
+        
+        # 3. 生成算法配置
+        algo_type: str = "flow",            # "flow" (推荐) or "diffusion"
+        num_train_steps: int = 100,         # 仅 Diffusion 需要
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+        self.use_state = use_state
+        self.state_dim = state_dim
+        self.algo_type = algo_type.lower()
+
+        # ====================================================================
+        # 1. 实例化 3D 编码器 (Encoder)
+        # ====================================================================
+        if encoder_type == "pointnext":
+            self.encoder = PointNeXtEncoder(
+                in_channels=3, 
+                output_dim=cond_dim, 
+                use_state=use_state, 
+                state_dim=state_dim
+            )
+        else:
+            raise NotImplementedError(f"Unsupported encoder: {encoder_type}")
+
+        # ====================================================================
+        # 2. 实例化 骨干网络 (Backbone)
+        # ====================================================================
+        if backbone_type == "transformer":
+            self.backbone = ActionDiffusionTransformer(
+                action_dim=action_dim,
+                cond_dim=cond_dim,
+                chunk_size=chunk_size,
+                embed_dim=256,
+                depth=6,
+                num_heads=8
+            )
+        elif backbone_type == "unet1d":
+            self.backbone = ConditionalUnet1D(
+                action_dim=action_dim,
+                global_cond_dim=cond_dim,
+                down_dims=(128, 256, 512)
+            )
+        else:
+            raise NotImplementedError(f"Unsupported backbone: {backbone_type}")
+
+        # ====================================================================
+        # 3. 实例化 生成调度器 (Scheduler)
+        # ====================================================================
+        if self.algo_type == "flow":
+            self.scheduler = OTFlowMatching(sigma_min=1e-5)
+        elif self.algo_type == "diffusion":
+            self.scheduler = DDIMScheduler(num_train_timesteps=num_train_steps)
+        else:
+            raise ValueError("algo_type must be 'flow' or 'diffusion'")
+
+    def _get_condition(self, obs: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """ 内部辅助函数：将点云和本体状态打包喂给 Encoder """
+        obs_dict = {'point_cloud': obs}
+        if self.use_state and state is not None:
+            obs_dict['state'] = state
+        return self.encoder(obs_dict)
+
+    # ========================================================================
+    # [核心接口 1] Distillation / 基础前向计算
+    # 与 algos/distill.py 完全对齐 (student_v = self.student(obs, state, z_noise, t_zero))
+    # ========================================================================
+    def forward(self, obs: torch.Tensor, state: torch.Tensor, noisy_action: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        """
+        直接暴露底层计算流，专供 One-step Distillation 和 Teacher-forcing 使用。
+        """
+        cond = self._get_condition(obs, state)
+        
+        # 如果 time 的维度是 [B, 1]，需要 squeeze 成 [B] 给 Transformer/UNet
+        if time.dim() == 2 and time.shape[1] == 1:
+            time = time.squeeze(1)
+            
+        return self.backbone(noisy_action, time, cond)
+
+    # ========================================================================
+    # [核心接口 2] BC / IDQL 训练
+    # 与 algos/idql.py 完全对齐 (actor_loss = self.actor.compute_loss(filtered_states, filtered_actions))
+    # ========================================================================
+    def compute_loss(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        计算生成模型的训练 Loss (Vector Field MSE 或 Denoising MSE)
+        支持 IDQL 传入过滤后的高质量样本直接求导。
+        """
+        cond = self._get_condition(obs, state)
+
+        if self.algo_type == "flow":
+            # Flow Matching 直接利用你写好的 OTFlowMatching.compute_loss
+            # 注意：我们将 self.backbone 传入，巧妙解耦
+            return self.scheduler.compute_loss(self.backbone, actions, cond)
+            
+        elif self.algo_type == "diffusion":
+            # DDPM/DDIM 标准加噪与 MSE 训练逻辑
+            B = actions.shape[0]
+            device = actions.device
+            noise = torch.randn_like(actions)
+            # 随机采样整数时间步
+            timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (B,), device=device).long()
+            
+            # 加噪
+            noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)
+            
+            # 预测
+            pred = self.backbone(noisy_actions, timesteps, cond)
+            
+            # 假定 prediction_type == "epsilon" (预测噪声)
+            return F.mse_loss(pred, noise)
+
+    # ========================================================================
+    # [核心接口 3] 环境 Rollout / 动作推断
+    # ========================================================================
+    @torch.no_grad()
+    def sample(self, 
+               obs: torch.Tensor, 
+               state: Optional[torch.Tensor] = None, 
+               num_steps: int = 10, 
+               cfg_weight: float = 1.0) -> torch.Tensor:
+        """
+        用于环境交互期间生成动作 Chunk。
+        """
+        cond = self._get_condition(obs, state)
+        action_shape = (self.chunk_size, self.action_dim)
+        
+        if self.algo_type == "flow":
+            # [Fix: CFG 修复] - 补充 uncond_cond 生成逻辑，否则 cfg_weight 传入底层会失效
+            uncond_cond = None
+            if cfg_weight != 1.0:
+                dummy_obs = torch.zeros_like(obs)
+                dummy_state = torch.zeros_like(state) if (self.use_state and state is not None) else None
+                uncond_cond = self._get_condition(dummy_obs, dummy_state)
+            
+            # 调用你写好的 Flow ODE Solver
+            return self.scheduler.sample(
+                model=self.backbone, 
+                cond=cond, 
+                action_shape=action_shape, 
+                num_steps=num_steps,
+                solver='euler',       # Euler 对于 10 步通常足够且快
+                cfg_weight=cfg_weight,
+                uncond_cond=uncond_cond # [Fix] 将无条件特征传入 Flow Matching
+            )
+            
+        elif self.algo_type == "diffusion":
+            # 调用你写好的 DDIM Step 循环
+            B = cond.shape[0]
+            device = cond.device
+            self.scheduler.set_timesteps(num_steps, device=device)
+            
+            x_t = torch.randn((B, *action_shape), device=device)
+            for t in self.scheduler.timesteps:
+                t_batch = torch.full((B,), t.item(), device=device, dtype=torch.long)
+                pred = self.backbone(x_t, t_batch, cond)
+                x_t = self.scheduler.step(pred, int(t.item()), x_t)
+                
+            return x_t
+
+    # ========================================================================
+    # [核心接口 4] Policy Gradient (PPO) 辅助评估
+    # 与 algos/pg.py 完全对齐 (log_probs, entropy = self.policy.evaluate_actions(states, actions))
+    # ========================================================================
+    def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        【硬核提醒】计算 Flow/Diffusion 的精确 log_prob 需要解常微分方程(ODE)的迹，计算极慢。
+        在现代具身 RL 中 (如 DP3/RL-100)，PG 微调通常采用 "Denoising MSE 代理似然" 
+        或者直接通过 "Gaussian Proxy" 计算。
+        这里我们实现了一个基于 Denoising Error 的 Proxy Log-Prob，这不仅快，而且梯度稳定。
+        """
+        B = obs.shape[0]
+        device = obs.device
+        cond = self._get_condition(obs, state)
+        
+        # [Fix: PPO 稳定性危机] - PG 中的 evaluate_actions 多个 Epoch 会评测同样的 (s,a)。
+        # 如果使用随机 noise = torch.randn_like(actions)，每次算出的 log_prob 都会剧烈震荡，
+        # 导致 PPO 的 Ratio 疯狂触发错误 Clip。必须使用确定性（Deterministic）的 Proxy！
+        # 我们用全 0 Tensor 作为恒定的代理扰动起点。
+        deterministic_noise = torch.zeros_like(actions)
+
+        # 我们使用一个固定的居中时间步 (如 t=0.5) 评估一步去噪误差作为似然的代理
+        if self.algo_type == "flow":
+            t_fixed = torch.full((B,), 0.5, device=device)
+            # Flow 的 target 速度公式 [修复：传入确定性噪声]
+            xt = (1 - (1 - 1e-5) * t_fixed.view(B, 1, 1)) * deterministic_noise + t_fixed.view(B, 1, 1) * actions
+            target_v = actions - (1 - 1e-5) * deterministic_noise
+            pred_v = self.backbone(xt, t_fixed, cond)
+            
+            # 使用 MSE 作为负对数似然的代理 (代理高斯分布)
+            mse_error = torch.mean((pred_v - target_v) ** 2, dim=(-1, -2)) 
+            log_prob = -mse_error 
+            
+            # 启发式 Entropy (防止方差坍缩)
+            entropy = torch.ones_like(log_prob) * 1.0 # 占位，或者返回 action_var
+            
+        else: # diffusion
+            t_fixed = torch.full((B,), self.scheduler.num_train_timesteps // 2, device=device, dtype=torch.long)
+            # [修复：传入确定性噪声]
+            xt = self.scheduler.add_noise(actions, deterministic_noise, t_fixed)
+            pred_noise = self.backbone(xt, t_fixed, cond)
+            
+            mse_error = torch.mean((pred_noise - deterministic_noise) ** 2, dim=(-1, -2))
+            log_prob = -mse_error
+            entropy = torch.ones_like(log_prob) * 1.0
+            
+        return log_prob, entropy
+
+
+
+# ==============================================================================
+# 本地测试模块 
+# ==============================================================================
+if __name__ == "__main__":
+    print("🚀 启动 EmbodiedGenPolicy 大一统核心测试...\n")
+    
+    # 模拟超参数
+    BATCH_SIZE = 4
+    N_POINTS = 1024
+    OBS_DIM = 3
+    STATE_DIM = 7
+    CHUNK_SIZE = 16
+    ACTION_DIM = 7
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"🖥️  测试设备: {DEVICE}")
+    
+    # 初始化策略 (以最前沿的 Transformer + Flow Matching 为例)
+    print("1️⃣ 正在初始化 Flow Transformer Policy...")
+    policy = EmbodiedGenPolicy(
+        action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE, 
+        use_state=True, state_dim=STATE_DIM,
+        encoder_type="pointnext", backbone_type="transformer", algo_type="flow"
+    ).to(DEVICE)
+    print(f"✅ 初始化完成！总参数量: {sum(p.numel() for p in policy.parameters()) / 1e6:.2f} M\n")
+
+    # 模拟数据
+    dummy_obs = torch.randn((BATCH_SIZE, N_POINTS, OBS_DIM), device=DEVICE)
+    dummy_state = torch.randn((BATCH_SIZE, STATE_DIM), device=DEVICE)
+    dummy_actions = torch.randn((BATCH_SIZE, CHUNK_SIZE, ACTION_DIM), device=DEVICE)
+
+    # 测试 1: BC/IDQL Loss 计算
+    print("2️⃣ 测试 IDQL/BC 前向 Loss 计算 (compute_loss)...")
+    loss = policy.compute_loss(dummy_obs, dummy_actions, dummy_state)
+    print(f"✅ Loss 计算成功: {loss.item():.4f}\n")
+
+    # 测试 2: 环境推断 Sample
+    print("3️⃣ 测试 环境推断 (sample)...")
+    generated_actions = policy.sample(dummy_obs, dummy_state, num_steps=10)
+    print(f"✅ 推断成功，输出维度 (应与目标一致): {generated_actions.shape}\n")
+
+    # 测试 3: 蒸馏底层调用 Distill Forward
+    print("4️⃣ 测试 蒸馏底层调用 (forward)...")
+    t_zero = torch.zeros((BATCH_SIZE, 1), device=DEVICE)
+    z_noise = torch.randn_like(dummy_actions)
+    v_pred = policy(dummy_obs, dummy_state, z_noise, t_zero)
+    print(f"✅ 前向成功，输出维度: {v_pred.shape}\n")
+
+    # 测试 4: PG PPO 似然估计
+    print("5️⃣ 测试 PG 似然评估 (evaluate_actions)...")
+    log_probs, entropy = policy.evaluate_actions(dummy_obs, dummy_actions, dummy_state)
+    print(f"✅ 似然估计成功，Log Probs shape: {log_probs.shape}\n")
+
+    print("🎉 EmbodiedGenPolicy 完美契合你的所有底层协议，可以开服了！")

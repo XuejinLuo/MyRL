@@ -1,0 +1,11 @@
+# configs/model/diffusion_3d.yaml
+algo_type: "diffusion"
+action_dim: 7
+state_dim: 14
+chunk_size: 16
+use_state: true
+encoder_type: "pointnext"
+backbone_type: "unet1d"      # Diffusion 传统上多搭配 U-Net1D
+cond_dim: 256
+num_train_steps: 100         # 训练时加噪/去噪总步数 (DDPM)
+num_inference_steps: 10      # 推理时使用的 DDIM 截断步数
