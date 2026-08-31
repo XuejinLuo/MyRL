@@ -56,7 +56,7 @@ class PointCloudChunkDataset(Dataset):
         N = pc.shape[0]
         if N >= self.n_points:
             # 随机无放回采样
-            choices = np.random.choice(N, self.n_points, replace=False)
+            choices = np.random.permutation(N)[:self.n_points]
         else:
             # 如果点不够，有放回采样补齐
             choices = np.random.choice(N, self.n_points, replace=True)

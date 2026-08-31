@@ -2,7 +2,7 @@ import os
 
 # ================= 配置区 =================
 TARGET_DIR = "."              # 你要扫描的代码库文件夹路径，"." 表示当前目录
-OUTPUT_FILE = "llm_prompt.txt" # 输出的文本文件名
+OUTPUT_FILE = "outputs/llm_prompt.txt" # 输出的文本文件名
 
 # 允许提取内容的文件后缀
 ALLOWED_EXTENSIONS = {'.py', '.yaml', '.yml'}
@@ -11,7 +11,7 @@ ALLOWED_EXTENSIONS = {'.py', '.yaml', '.yml'}
 IGNORE_DIRS = {
     '.git', '__pycache__', 'venv', 'env', 
     '.idea', '.vscode', 'node_modules', 'dist', 'build',
-    'outputs', 'wandb', 'checkpoints'
+    'outputs', 'wandb', 'checkpoints', 'test'
 }
 # ==========================================
 
