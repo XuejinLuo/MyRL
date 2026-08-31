@@ -18,6 +18,7 @@ from models.policy import EmbodiedGenPolicy
 from models.encoders.pointnext import PointNeXtEncoder
 from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.idql import IDQL
+from utils.eval_utils import evaluate_and_record_video
 
 # =========================================================================
 # 桥接层 (Bridge Wrappers)
@@ -302,11 +303,12 @@ def main(cfg: DictConfig):
         print(f"Epoch {epoch:03d} | Actor Loss: {epoch_metrics['loss/actor']:.4f} | Q Value: {epoch_metrics['q_value']:.4f} | Accept Ratio: {epoch_metrics['metrics/accept_ratio']*100:.1f}%")
 
         # 定期保存权重 (Save Checkpoint)
-        if epoch % 10 == 0 or epoch == cfg.epochs:
+        if epoch % 2 == 0 or epoch == cfg.epochs:
             ckpt_path = os.path.join(cfg.save_dir, f"idql_policy_ep{epoch}.pth")
             # 仅保存 EmbodiedGenPolicy 的权重，方便后续推理和 Distill 直接加载
             torch.save(base_policy.state_dict(), ckpt_path)
             print(f"   💾 Saved Checkpoint to {ckpt_path}")
+            evaluate_and_record_video(cfg, base_policy, epoch, device)
 
     if cfg.wandb.enable:
         wandb.finish()

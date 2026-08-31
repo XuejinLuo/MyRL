@@ -2,3 +2,5 @@
 wandb/
 outputs/
 *.pyc
+*.mp4
+*.pth

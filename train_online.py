@@ -20,6 +20,7 @@ from algos.pg import FlowPolicyGradient
 from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
+from utils.eval_utils import evaluate_and_record_video
 
 # =========================================================================
 # 桥接层 (Bridge Wrappers)
@@ -124,7 +125,7 @@ def make_env_ManiSkill(cfg):
     env = gym.make(
         "PickCube-v1",
         obs_mode="pointcloud",           # 必须开启点云模式
-        control_mode="pd_joint_pos",    # 控制模式为关节位置
+        control_mode="pd_ee_delta_pose",    # 控制模式为关节位置
         render_mode="rgb_array",         # 用于 evaluation 录制视频
     )
     
@@ -338,6 +339,8 @@ def main(cfg: DictConfig):
             ckpt_path = os.path.join(cfg.save_dir, f"pg_finetuned_ep{epoch}.pth")
             torch.save(base_policy.state_dict(), ckpt_path)
             print(f"   💾 Saved Checkpoint to {ckpt_path}")
+            # 调用外置的评估接口
+            evaluate_and_record_video(cfg, base_policy, epoch, device)
 
     if cfg.wandb.enable:
         wandb.finish()

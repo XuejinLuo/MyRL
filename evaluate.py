@@ -110,7 +110,7 @@ def make_env_ManiSkill(cfg):
     env = gym.make(
         "PickCube-v1",
         obs_mode="pointcloud",           # 必须开启点云模式
-        control_mode="pd_joint_pos", # 控制模式为关节位置
+        control_mode="pd_ee_delta_pose", # 控制模式为关节位置
         render_mode="rgb_array",         # 用于 evaluation 录制视频
     )
     
