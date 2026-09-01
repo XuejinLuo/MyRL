@@ -162,6 +162,7 @@ def main(cfg: DictConfig):
 
     # 2. 准备策略模型
     policy = EmbodiedGenPolicy(
+        in_channels=cfg.model.get("in_channels", 3),
         action_dim=cfg.model.action_dim,
         chunk_size=cfg.model.chunk_size,
         use_state=cfg.model.use_state,

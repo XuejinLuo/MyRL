@@ -31,7 +31,7 @@ class CriticFeatureExtractor(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.encoder = PointNeXtEncoder(
-            in_channels=3,
+            in_channels=cfg.model.get("in_channels", 3),
             output_dim=cfg.model.cond_dim,
             use_state=cfg.model.use_state,
             state_dim=cfg.model.state_dim
@@ -231,6 +231,7 @@ def main(cfg: DictConfig):
     
     # Actor (Flow/Diffusion Policy)
     base_policy = EmbodiedGenPolicy(
+        in_channels=cfg.model.get("in_channels", 3),
         action_dim=cfg.model.action_dim,
         chunk_size=cfg.model.chunk_size,
         use_state=cfg.model.use_state,
@@ -316,7 +317,7 @@ def main(cfg: DictConfig):
         print(f"Epoch {epoch:03d} | Actor Loss: {epoch_metrics['loss/actor']:.4f} | Q Value: {epoch_metrics['q_value']:.4f} | Accept Ratio: {epoch_metrics['metrics/accept_ratio']*100:.1f}%")
 
         # 定期保存权重 (Save Checkpoint)
-        if epoch % 2 == 0 or epoch == cfg.epochs:
+        if epoch % 1 == 0 or epoch == cfg.epochs:
             ckpt_path = os.path.join(cfg.save_dir, f"idql_policy_ep{epoch}.pth")
             # 仅保存 EmbodiedGenPolicy 的权重，方便后续推理和 Distill 直接加载
             torch.save(base_policy.state_dict(), ckpt_path)

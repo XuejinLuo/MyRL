@@ -1,5 +1,6 @@
 # configs/dataset/offline_data.yaml
 n_points: 1024
+use_color: true
 # 数据集绝对路径或相对路径
 data_path: "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pose.physx_cpu.h5"
 # 最大加载的轨迹数（防 OOM），如果不限制则写 null

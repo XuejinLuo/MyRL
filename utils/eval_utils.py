@@ -93,8 +93,9 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, see
             bounds = [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]
         ws_bounds = np.array(bounds)
 
+        use_color = cfg.env.use_color if "env" in cfg else cfg.dataset.get("use_color", False)
         env = PointCloudObservationWrapper(
-            env=env, num_points=num_points, workspace_bounds=ws_bounds, use_color=False
+            env=env, num_points=num_points, workspace_bounds=ws_bounds, use_color=use_color
         )
         env = ChunkActionWrapper(
             env=env, chunk_size=cfg.model.chunk_size, exec_steps=exec_steps, exp_weight=exp_weight

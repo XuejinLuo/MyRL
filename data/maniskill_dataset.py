@@ -21,8 +21,14 @@ def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
             
             # 1. 提取点云 (取前三维 X, Y, Z)
             # 原始维度 [T, 16384, 4] -> 切片为 [T, 16384, 3]
-            xyzw = traj['obs']['pointcloud']['xyzw'][:]
+            pc_dict = traj['obs']['pointcloud']
+            xyzw = pc_dict['xyzw'][:]
             xyz = xyzw[..., :3].astype(np.float32)
+            
+            # 提取颜色并归一化到 [0, 1]，然后与 xyz 拼接
+            if 'rgb' in pc_dict:
+                rgb = (pc_dict['rgb'][:] / 255.0).astype(np.float32)
+                xyz = np.concatenate([xyz, rgb], axis=-1)  # 此时特征维度变为 6
 
             # 空间裁剪
             if workspace_bounds is not None:

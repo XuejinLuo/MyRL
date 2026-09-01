@@ -29,6 +29,7 @@ class EmbodiedGenPolicy(nn.Module):
         chunk_size: int = 16,
         use_state: bool = True,
         state_dim: int = 14,
+        in_channels: int = 3,
         
         # 2. 网络结构配置
         encoder_type: str = "pointnext", 
@@ -51,7 +52,7 @@ class EmbodiedGenPolicy(nn.Module):
         # ====================================================================
         if encoder_type == "pointnext":
             self.encoder = PointNeXtEncoder(
-                in_channels=3, 
+                in_channels=in_channels, 
                 output_dim=cond_dim, 
                 use_state=use_state, 
                 state_dim=state_dim

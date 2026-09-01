@@ -33,7 +33,7 @@ class CriticFeatureExtractor(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.encoder = PointNeXtEncoder(
-            in_channels=3,
+            in_channels=cfg.model.get("in_channels", 3),
             output_dim=cfg.model.cond_dim,
             use_state=cfg.model.use_state,
             state_dim=cfg.model.state_dim
@@ -212,6 +212,7 @@ def main(cfg: DictConfig):
     # 3. 初始化模型组件
     print("🧠 初始化 Actor (Policy) 与 Critic (Value Network)...")
     base_policy = EmbodiedGenPolicy(
+        in_channels=cfg.model.get("in_channels", 3),
         action_dim=cfg.model.action_dim, chunk_size=cfg.model.chunk_size,
         use_state=cfg.model.use_state, state_dim=cfg.model.state_dim,
         encoder_type=cfg.model.encoder_type, backbone_type=cfg.model.backbone_type,
