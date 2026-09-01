@@ -20,6 +20,7 @@ from models.encoders.pointnext import PointNeXtEncoder
 from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.idql import IDQL
 from utils.eval_utils import evaluate_and_record_video
+from utils.debug_logger import DebugLogger
 
 # =========================================================================
 # 桥接层 (Bridge Wrappers)
@@ -167,6 +168,7 @@ def main(cfg: DictConfig):
     cfg.run_name = run_name
     cfg.save_dir = os.path.join(cfg.save_dir, run_name)
     OmegaConf.set_struct(cfg, True)
+    debug_logger = DebugLogger(cfg.save_dir)
 
     # 1. 初始化实验记录 (Wandb 会自动使用新的带时间戳的 cfg.run_name)
     if cfg.wandb.enable:
@@ -276,7 +278,7 @@ def main(cfg: DictConfig):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{cfg.epochs}", leave=False)
         epoch_metrics = {}
 
-        for batch in pbar:
+        for step, batch in enumerate(pbar): 
             # 数据迁移至 Device 并拆解
             obs_dict = {
                 'pc': batch['pc'].to(device),
@@ -287,6 +289,7 @@ def main(cfg: DictConfig):
                 'state': batch['next_state'].to(device)
             }
             action_chunk = batch['action_chunk'].to(device)
+            debug_logger.log_io(epoch, step, obs_dict, action_chunk)
             
             # Note: RL 算法中 rewards 和 dones 需要 [Batch, 1] 形状才能与 V 值正常广播
             rewards = batch['reward'].to(device).unsqueeze(-1)
@@ -310,6 +313,7 @@ def main(cfg: DictConfig):
         # 计算 Epoch 平均指标并上传 WandB
         for k in epoch_metrics:
             epoch_metrics[k] /= len(dataloader)
+        debug_logger.log_metrics(epoch, epoch_metrics)
             
         if cfg.wandb.enable:
             wandb.log(epoch_metrics, step=epoch)

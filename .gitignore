@@ -1,6 +1,7 @@
 .vscode/
 wandb/
 outputs/
+checkpoints/
 *.pyc
 *.mp4
 *.pth

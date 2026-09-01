@@ -41,10 +41,8 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
             xyz, rgb = np.zeros((0, 3)), np.zeros((0, 3))
 
         # 2. 提取机器人本体状态 (Proprioception)
-        # 例如 7 DoF 关节位置 + 7 DoF 关节速度 = 14 维
         qpos = to_np(obs['agent']['qpos']).reshape(-1)
-        qvel = to_np(obs['agent']['qvel']).reshape(-1)
-        state = np.concatenate([qpos, qvel], axis=-1).astype(np.float32)
+        state = qpos.astype(np.float32) 
 
         return {
             'xyz': xyz, 

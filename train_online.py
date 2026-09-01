@@ -22,6 +22,7 @@ from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
 from utils.eval_utils import evaluate_and_record_video
+from utils.debug_logger import DebugLogger
 
 # =========================================================================
 # 桥接层 (Bridge Wrappers)
@@ -197,6 +198,7 @@ def main(cfg: DictConfig):
     cfg.run_name = run_name
     cfg.save_dir = os.path.join(cfg.save_dir, run_name)
     OmegaConf.set_struct(cfg, True)
+    debug_logger = DebugLogger(cfg.save_dir)
 
     # 1. 实验追踪
     if cfg.wandb.enable:
@@ -253,7 +255,7 @@ def main(cfg: DictConfig):
         # --- A. 轨迹收集阶段 (Rollout) ---
         actor.eval()
         critic.eval()
-        
+        step = 0
         for _ in tqdm(range(cfg.pg.steps_per_epoch), desc=f"Epoch {epoch} Rollout", leave=False):
             # 将 numpy 观测转为单 Batch Tensor
             obs_dict = {
@@ -266,7 +268,9 @@ def main(cfg: DictConfig):
                 value = critic(obs_dict).item()
                 # 策略前向生成动作 Chunk
                 action_chunk = actor.sample(obs_dict, num_steps=cfg.model.num_inference_steps)
-            
+
+            debug_logger.log_io(epoch, step, obs_dict, action_chunk)
+
             # 环境执行 (转换为 numpy)
             action_np = action_chunk.squeeze(0).cpu().numpy()
             next_obs, reward, done, truncated, info = env.step(action_np)
@@ -338,6 +342,7 @@ def main(cfg: DictConfig):
         log_metrics = {**epoch_losses, "Reward/Epoch": epoch_reward}
         if cfg.wandb.enable:
             wandb.log(log_metrics, step=epoch)
+        debug_logger.log_metrics(epoch, log_metrics)
             
         print(f"Epoch {epoch:03d} | Avg Reward: {epoch_reward:.2f} | Actor Loss: {epoch_losses['actor_loss']:.4f} | Critic Loss: {epoch_losses['critic_loss']:.4f}")
 

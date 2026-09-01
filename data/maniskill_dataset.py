@@ -52,10 +52,8 @@ def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
             xyz_cropped[:] = cropped_xyz_list
             
             # 2. 提取本体状态 (Proprioception)
-            # 拼接 qpos 和 qvel。假设是 PickCube 任务，通常加起来是 14 维左右
             qpos = traj['obs']['agent']['qpos'][:]
-            qvel = traj['obs']['agent']['qvel'][:]
-            state = np.concatenate([qpos, qvel], axis=-1).astype(np.float32)
+            state = qpos.astype(np.float32) 
             
             # 3. 提取动作
             action = traj['actions'][:].astype(np.float32)
