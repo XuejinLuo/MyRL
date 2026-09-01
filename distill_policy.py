@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from datetime import datetime
 
 # 引入你写好的核心组件
 from models.policy import EmbodiedGenPolicy
@@ -58,6 +59,8 @@ def generate_mock_trajectories(num_episodes=10, ep_len=100, n_points=2048, state
 
 def main():
     args = parse_args()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.save_dir = os.path.join(args.save_dir, f"run_{timestamp}")
     os.makedirs(args.save_dir, exist_ok=True)
     
     # =========================================================================

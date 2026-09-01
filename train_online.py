@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import hydra
+from datetime import datetime
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 import wandb
@@ -107,7 +108,8 @@ def make_env_dummy(cfg: DictConfig):
     env = DummyEmbodiedEnv()
 
     # 包装点云处理器
-    ws_bounds = np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+    bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+    ws_bounds = np.array(bounds)
     env = PointCloudObservationWrapper(
         env=env, num_points=cfg.env.num_points, workspace_bounds=ws_bounds, use_color=cfg.env.use_color
     )
@@ -133,12 +135,8 @@ def make_env_ManiSkill(cfg):
     env = ManiSkillToRL100Wrapper(env)
     
     # 3. 接入你原来写好的 PointCloud Wrapper
-    # 注意：这里的 workspace_bounds 需要根据 PickCube 任务的实际桌面范围做调整
-    # 例如只保留桌面上的物体和机械臂部分点云，剔除背景
-    ws_bounds = np.array([
-        [-0.5, -0.5, 0.0],  # [X_min, Y_min, Z_min] (Z > 0 保留桌面以上)
-        [ 0.5,  0.5, 0.5]   # [X_max, Y_max, Z_max]
-    ])
+    bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
+    ws_bounds = np.array(bounds)
     
     env = PointCloudObservationWrapper(
         env=env,
@@ -193,6 +191,13 @@ class RolloutBuffer:
 # =========================================================================
 @hydra.main(version_base=None, config_path="configs", config_name="train_online")
 def main(cfg: DictConfig):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{cfg.run_name}_{timestamp}"
+    OmegaConf.set_struct(cfg, False)
+    cfg.run_name = run_name
+    cfg.save_dir = os.path.join(cfg.save_dir, run_name)
+    OmegaConf.set_struct(cfg, True)
+
     # 1. 实验追踪
     if cfg.wandb.enable:
         wandb.init(project=cfg.wandb.project, name=cfg.run_name, config=OmegaConf.to_container(cfg, resolve=True))

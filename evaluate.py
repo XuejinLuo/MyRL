@@ -86,7 +86,8 @@ def make_env_dummy(cfg: DictConfig):
         env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda x: x % 5 == 0)
 
     # 2. 包装 PointCloud 处理器
-    ws_bounds = np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]) # 根据任务修改
+    bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+    ws_bounds = np.array(bounds)
     env = PointCloudObservationWrapper(
         env=env,
         num_points=cfg.env.num_points,
@@ -118,12 +119,8 @@ def make_env_ManiSkill(cfg):
     env = ManiSkillToRL100Wrapper(env)
     
     # 3. 接入你原来写好的 PointCloud Wrapper
-    # 注意：这里的 workspace_bounds 需要根据 PickCube 任务的实际桌面范围做调整
-    # 例如只保留桌面上的物体和机械臂部分点云，剔除背景
-    ws_bounds = np.array([
-        [-0.5, -0.5, 0.0],  # [X_min, Y_min, Z_min] (Z > 0 保留桌面以上)
-        [ 0.5,  0.5, 0.5]   # [X_max, Y_max, Z_max]
-    ])
+    bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
+    ws_bounds = np.array(bounds)
     
     env = PointCloudObservationWrapper(
         env=env,

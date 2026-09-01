@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import hydra
+from datetime import datetime 
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -159,12 +160,20 @@ class EmbodiedIDQL(IDQL):
 # =========================================================================
 @hydra.main(version_base=None, config_path="configs", config_name="train_offline")
 def main(cfg: DictConfig):
-    # 1. 初始化实验记录 (Wandb)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{cfg.run_name}_{timestamp}"
+    # 临时解除 Hydra 配置的只读限制，覆写内部路径
+    OmegaConf.set_struct(cfg, False)
+    cfg.run_name = run_name
+    cfg.save_dir = os.path.join(cfg.save_dir, run_name)
+    OmegaConf.set_struct(cfg, True)
+
+    # 1. 初始化实验记录 (Wandb 会自动使用新的带时间戳的 cfg.run_name)
     if cfg.wandb.enable:
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
-            name=cfg.run_name,
+            name=cfg.run_name, 
             config=OmegaConf.to_container(cfg, resolve=True)
         )
     
@@ -193,7 +202,11 @@ def main(cfg: DictConfig):
     max_episodes = cfg.dataset.get("max_episodes", None)
     
     # 动态加载数据
-    raw_trajectories = load_maniskill_h5(data_path, max_episodes=max_episodes)
+    raw_trajectories = load_maniskill_h5(
+        data_path, 
+        max_episodes=max_episodes,
+        workspace_bounds=cfg.dataset.get("workspace_bounds", None) 
+    )
     
     # 这里的 Dataset 内部会把你那 16384 个点，随机降采样到 cfg.dataset.n_points (比如 1024 个点)，防止显存 OOM
     dataset = PointCloudChunkDataset(

@@ -3,7 +3,7 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-def load_maniskill_h5(h5_path, max_episodes=None):
+def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
     """
     读取 ManiSkill 生成的点云 .h5 数据，转换为离线 RL 训练所需格式。
     """
@@ -23,6 +23,27 @@ def load_maniskill_h5(h5_path, max_episodes=None):
             # 原始维度 [T, 16384, 4] -> 切片为 [T, 16384, 3]
             xyzw = traj['obs']['pointcloud']['xyzw'][:]
             xyz = xyzw[..., :3].astype(np.float32)
+
+            # 空间裁剪
+            if workspace_bounds is not None:
+                bounds = np.array(workspace_bounds)
+            else:
+                bounds = np.array([[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
+            cropped_xyz_list = []
+            
+            # 逐帧过滤掉多余的背景点
+            for t in range(xyz.shape[0]):
+                pts = xyz[t]
+                mask = (
+                    (pts[:, 0] >= bounds[0, 0]) & (pts[:, 0] <= bounds[1, 0]) &
+                    (pts[:, 1] >= bounds[0, 1]) & (pts[:, 1] <= bounds[1, 1]) &
+                    (pts[:, 2] >= bounds[0, 2]) & (pts[:, 2] <= bounds[1, 2])
+                )
+                cropped_xyz_list.append(pts[mask])
+            
+            # 使用 object 类型的 array 存储不定长的点云帧
+            xyz_cropped = np.empty(len(cropped_xyz_list), dtype=object)
+            xyz_cropped[:] = cropped_xyz_list
             
             # 2. 提取本体状态 (Proprioception)
             # 拼接 qpos 和 qvel。假设是 PickCube 任务，通常加起来是 14 维左右
@@ -47,7 +68,7 @@ def load_maniskill_h5(h5_path, max_episodes=None):
             done[-1] = True # 强行确保最后一步为 Done
             
             trajectories.append({
-                'pc': xyz,
+                'pc': xyz_cropped,
                 'state': state,
                 'action': action,
                 'reward': reward,

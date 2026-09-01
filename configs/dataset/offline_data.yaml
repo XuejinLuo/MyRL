@@ -4,3 +4,5 @@ n_points: 1024
 data_path: "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pose.physx_cpu.h5"
 # 最大加载的轨迹数（防 OOM），如果不限制则写 null
 max_episodes: null
+# 点云裁剪范围 (Z轴 > 0 保留桌面以上)
+workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]

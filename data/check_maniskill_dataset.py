@@ -2,7 +2,7 @@
 import h5py
 
 # 指向你刚刚生成出的那个庞大的新文件
-h5_path = "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_joint_pos.physx_cpu.h5" 
+h5_path = "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pose.physx_cpu.h5" 
 
 with h5py.File(h5_path, 'r') as f:
     # 随便取第一条轨迹
