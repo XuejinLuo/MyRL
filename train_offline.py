@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import hydra
+import copy
 from datetime import datetime 
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -262,6 +263,15 @@ def main(cfg: DictConfig):
     ).to(device)
     wrapped_actor = Policy_IDQL_Wrapper(base_policy)
 
+    # 初始化 EMA 策略模型
+    print("🧠 正在初始化 EMA 策略模型...")
+    ema_policy = copy.deepcopy(base_policy).to(device)
+    ema_policy.eval() # EMA 模型不参与梯度传播，永远在 eval 模式
+    for param in ema_policy.parameters():
+        param.requires_grad = False
+    
+    ema_decay = 0.999 # Diffusion/Flow 常用指数衰减率 (建议 0.999 或 0.9999)
+
     # Critics (V & Q Networks)
     # [🔥 修复双重优化器冲突] 给 V 网络和 Q 网络分配各自独立的 PointCloud 编码器。
     # 这样防止 v_opt 和 q_opt 在 backward 时互相覆盖/破坏同一个 encoder 的动量与梯度。
@@ -317,6 +327,12 @@ def main(cfg: DictConfig):
             
             # --- B. 更新 Actor (Flow / Diffusion with Reject Sampling) ---
             actor_info = agent.update_actor(obs_dict, action_chunk, adv=critic_info.pop('adv_for_actor'))
+
+            # 每步软更新 EMA 权重
+            with torch.no_grad():
+                for ema_param, param in zip(ema_policy.parameters(), base_policy.parameters()):
+                    # ema_weight = decay * ema_weight + (1 - decay) * current_weight
+                    ema_param.data.mul_(ema_decay).add_(param.data, alpha=1.0 - ema_decay)
             
             # 合并日志
             step_metrics = {**critic_info, **actor_info}
@@ -340,10 +356,15 @@ def main(cfg: DictConfig):
         # 定期保存权重 (Save Checkpoint)
         if epoch % 1 == 0 or epoch == cfg.epochs:
             ckpt_path = os.path.join(cfg.save_dir, f"idql_policy_ep{epoch}.pth")
-            # 仅保存 EmbodiedGenPolicy 的权重，方便后续推理和 Distill 直接加载
-            torch.save(base_policy.state_dict(), ckpt_path)
-            print(f"   💾 Saved Checkpoint to {ckpt_path}")
-            evaluate_and_record_video(cfg, base_policy, epoch, device)
+            # 保存双份权重字典
+            torch.save({
+                'model_state_dict': base_policy.state_dict(),
+                'ema_model_state_dict': ema_policy.state_dict()
+            }, ckpt_path)
+            print(f"   💾 Saved Checkpoint (with EMA) to {ckpt_path}")
+            # 用 EMA 策略进行录像验证
+            # 注意第二入参：用平滑后的 ema_policy 去执行物理环境 Rollout
+            evaluate_and_record_video(cfg, ema_policy, epoch, device)
 
     if cfg.wandb.enable:
         wandb.finish()
