@@ -14,7 +14,8 @@ class PointCloudChunkDataset(Dataset):
         trajectories: list, 
         chunk_size: int = 16, 
         n_points: int = 1024,
-        is_training: bool = True
+        is_training: bool = True, 
+        normalizer=None
     ):
         """
         Args:
@@ -28,6 +29,7 @@ class PointCloudChunkDataset(Dataset):
         self.chunk_size = chunk_size
         self.n_points = n_points
         self.is_training = is_training
+        self.normalizer = normalizer
         
         self.trajectories = trajectories
         self.indices = self._build_indices()
@@ -121,6 +123,12 @@ class PointCloudChunkDataset(Dataset):
         next_step_idx = min(step_idx + 1, len(ep['action']) - 1)
         next_pc_t = self._sample_point_cloud(ep['pc'][next_step_idx])
         next_state_t = ep['state'][next_step_idx]
+
+        # 归一化处理
+        if self.normalizer is not None:
+            state_t = self.normalizer.normalize(state_t, 'state')
+            action_chunk = self.normalizer.normalize(action_chunk, 'action')
+            next_state_t = self.normalizer.normalize(next_state_t, 'state')
 
         # 微调：使用 np.ascontiguousarray 加速 PyTorch Tensor 的内存映射转换
         # 4. 组装并转换为 Tensor

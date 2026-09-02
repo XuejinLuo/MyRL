@@ -21,6 +21,7 @@ from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.idql import IDQL
 from utils.eval_utils import evaluate_and_record_video
 from utils.debug_logger import DebugLogger
+from utils.normalizer import MinMaxNormalizer
 
 # =========================================================================
 # 桥接层 (Bridge Wrappers)
@@ -209,12 +210,28 @@ def main(cfg: DictConfig):
         max_episodes=max_episodes,
         workspace_bounds=cfg.dataset.get("workspace_bounds", None) 
     )
+
+    print("📊 正在统计归一化参数 (Normalization Stats)...")
+    all_actions = np.concatenate([ep['action'] for ep in raw_trajectories], axis=0)
+    all_states = np.concatenate([ep['state'] for ep in raw_trajectories], axis=0)
+
+    normalizer = MinMaxNormalizer()
+    normalizer.fit({
+        'action': all_actions,
+        'state': all_states
+    })
+    # 保存到这次实验的文件夹下，确保跟 Checkpoint 绑定！
+    stats_path = os.path.join(cfg.save_dir, "dataset_stats.json")
+    normalizer.save(stats_path)
+    print(f"✅ 归一化参数已保存至 {stats_path}")
+
     
     # 这里的 Dataset 内部会把你那 16384 个点，随机降采样到 cfg.dataset.n_points (比如 1024 个点)，防止显存 OOM
     dataset = PointCloudChunkDataset(
         trajectories=raw_trajectories, 
         chunk_size=cfg.model.chunk_size, 
-        n_points=cfg.dataset.n_points 
+        n_points=cfg.dataset.n_points,
+        normalizer=normalizer 
     )
 
     dataloader = DataLoader(

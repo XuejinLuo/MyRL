@@ -16,31 +16,7 @@ from models.policy import EmbodiedGenPolicy
 from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
-
-# =========================================================================
-# 辅助模块: 归一化/反归一化 (根据你的实际需求修改)
-# =========================================================================
-class Normalizer:
-    def __init__(self, stats_dict=None):
-        """
-        stats_dict 应包含 {'action': {'min': ..., 'max': ...}, ...}
-        如果没有提供，默认不做归一化 (直接返回)
-        """
-        self.stats = stats_dict
-        
-    def normalize_obs(self, obs_dict):
-        # 如果你的 point cloud 和 state 在训练时做了归一化，在这里处理
-        # 为保持极简，假设点云在 Wrapper 中已处于合理范围，不做处理
-        return obs_dict
-
-    def unnormalize_action(self, action):
-        if self.stats is None or 'action' not in self.stats:
-            return action
-        action_min = self.stats['action']['min']
-        action_max = self.stats['action']['max']
-        # 将 [-1, 1] 的网络输出反归一化到真实物理环境动作空间
-        action = (action + 1) / 2 * (action_max - action_min) + action_min
-        return action
+from utils.normalizer import MinMaxNormalizer
 
 # =========================================================================
 # 核心评估逻辑
@@ -192,8 +168,11 @@ def main(cfg: DictConfig):
     policy.eval()
 
     # 4. 加载 Normalizer (假设你的 stats 与权重存在一起，或者有单独的文件)
-    # stats = torch.load(cfg.dataset_stats_path) if cfg.dataset_stats_path else None
-    normalizer = Normalizer(stats_dict=None) 
+    stats_path = os.path.join(os.path.dirname(cfg.eval.ckpt_path), "dataset_stats.json")
+    normalizer = MinMaxNormalizer()
+    normalizer.load(stats_path)
+    print("✅ 成功加载环境归一化参数！")
+
 
     # 5. 评估循环
     all_rewards = []
@@ -212,39 +191,29 @@ def main(cfg: DictConfig):
 
         while not (done or truncated):
             # (A) 准备观测数据: 增加 Batch 维度并发送到 Device
-            obs_normalized = normalizer.normalize_obs(obs)
-            pc_tensor = torch.from_numpy(obs_normalized['point_cloud']).unsqueeze(0).to(device)
-            state_tensor = torch.from_numpy(obs_normalized['state']).unsqueeze(0).to(device)
+            # 1. 对环境传出的状态进行归一化 (网络期望 [-1,1] 的输入)
+            obs_state = normalizer.normalize(obs['state'], 'state')
+            pc_tensor = torch.from_numpy(obs['point_cloud']).unsqueeze(0).to(device)
+            state_tensor = torch.from_numpy(obs_state).unsqueeze(0).to(device)
 
             # (B) 策略推理: 返回形状为 [1, chunk_size, action_dim]
-            # [新增] 计时开始，并引入自动混合精度 (AMP) 提速
-            torch.cuda.synchronize() if device.type == 'cuda' else None
-            t0 = time.perf_counter()
-            
             with torch.no_grad():
-                # [新增] AMP 自动混合精度，极大地加速 3D Transformer 的推理
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if device.type == 'cuda' else torch.no_grad():
-                    action_chunk = policy.sample(
-                        obs=pc_tensor, 
-                        state=state_tensor, 
-                        num_steps=num_inference_steps, # [修改] 使用顶部提取并校验过的 steps
-                        cfg_weight=cfg.eval.get("cfg_weight", 1.0)
-                    )
-            
-            # [新增] 计时结束
-            torch.cuda.synchronize() if device.type == 'cuda' else None
-            inference_time = (time.perf_counter() - t0) * 1000  # ms
-            latencies.append(inference_time)
+                action_chunk = policy.sample(
+                    obs=pc_tensor, 
+                    state=state_tensor, 
+                    num_steps=num_inference_steps,
+                    cfg_weight=cfg.eval.get("cfg_weight", 1.0)
+                )
 
             # (C) 转换为 NumPy 并去掉 Batch 维度 -> [chunk_size, action_dim]
-            action_chunk_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy() # [修改] 加上 .to(float32) 防 bf16 报错
+            action_chunk_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
 
-            # (D) 反归一化动作
-            action_chunk_np = normalizer.unnormalize_action(action_chunk_np)
+            # (D) 反归一化动作, 将动作反归一化回 ManiSkill 物理引擎的真实增量范围
+            real_action_chunk = normalizer.unnormalize(action_chunk_np, 'action')
 
             # (E) 在 Wrapper 环境中步进 
             # (ChunkActionWrapper 内部会自动做滑动窗口集成并步进 exec_steps 步)
-            obs, reward, done, truncated, info = env.step(action_chunk_np)
+            obs, reward, done, truncated, info = env.step(real_action_chunk)
             ep_reward += reward
             
             # 判断是否成功 (根据具体环境调整，比如 info['success'])
