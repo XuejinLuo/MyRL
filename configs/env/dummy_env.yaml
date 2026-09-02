@@ -13,9 +13,9 @@ num_points: 1024
 use_color: false
 
 # Action Chunk 的执行步数 (Temporal Ensembling)
-exec_steps: 2
+exec_steps: 4
 
 # Action Chunk 时序集成的指数衰减权重
-exp_weight: 0.01
+exp_weight: 1
 
 workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]
