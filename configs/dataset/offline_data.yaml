@@ -7,4 +7,4 @@ workspace_bounds: ${env.workspace_bounds}
 data_path: "/home/luo/.maniskill/demos/${env.env_id}/motionplanning/trajectory.pointcloud.${env.control_mode}.physx_cpu.h5"
 
 # 最大加载的轨迹数（防 OOM），如果不限制则写 null
-max_episodes: null
+max_episodes: 1

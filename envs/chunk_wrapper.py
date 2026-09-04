@@ -11,7 +11,7 @@ class ChunkActionWrapper(gym.Wrapper):
     2. 维护历史预测序列，通过 Temporal Ensembling (时序集成) 平滑动作。
     3. 在底层环境执行 `exec_steps` 步动作后，返回最新状态给外部模型再次推理。
     """
-    def __init__(self, env: gym.Env, chunk_size: int = 16, exec_steps: int = 1, exp_weight: float = 0.01):
+    def __init__(self, env: gym.Env, chunk_size: int = 16, exec_steps: int = 1, exp_weight: float = 0.01, use_ensembling: bool = False):
         """
         :param env: 原始环境
         :param chunk_size: 策略网络单次预测的未来动作步数 (Horizon)
@@ -24,6 +24,7 @@ class ChunkActionWrapper(gym.Wrapper):
         self.chunk_size = chunk_size
         self.exec_steps = exec_steps
         self.exp_weight = exp_weight
+        self.use_ensembling = use_ensembling 
         
         # 记录全局步数
         self.global_step = 0
@@ -72,11 +73,17 @@ class ChunkActionWrapper(gym.Wrapper):
         for i in range(self.exec_steps):
             current_t = self.global_step + i
             
-            # 使用时序集成计算出【当前时刻】最合适的单步动作
-            ensembled_action = self._get_ensembled_action(current_t)
+            if self.use_ensembling:
+                # 计算复杂的指数加权平均
+                action_to_execute = self._get_ensembled_action(current_t)
+            else:
+                # 纯净模式：直接取当前网络预测的第 i 步动作
+                action_to_execute = action_chunk[i]
+                # 简单做个安全裁剪，防止越界
+                action_to_execute = np.clip(action_to_execute, self._orig_low, self._orig_high)
             
             # 丢给真实环境去执行
-            obs, reward, done, truncated, info = self.env.step(ensembled_action)
+            obs, reward, done, truncated, info = self.env.step(action_to_execute)
             
             total_reward += reward
             latest_obs = obs

@@ -137,10 +137,14 @@ class EmbodiedIDQL(IDQL):
             weights = torch.exp(self.beta * adv_stable)
             accept_prob = (weights / weights.max()).squeeze(-1)
             
-            random_u = torch.rand_like(accept_prob)
-            keep_mask = random_u < accept_prob
-            if keep_mask.sum() == 0:
-                keep_mask[torch.argmax(accept_prob)] = True
+            # 关闭拒绝采样，强行全盘接收
+            # random_u = torch.rand_like(accept_prob)
+            # keep_mask = random_u < accept_prob
+            # if keep_mask.sum() == 0:
+            #     keep_mask[torch.argmax(accept_prob)] = True
+            
+            # 纯 BC 模式：所有样本强制设为 True
+            keep_mask = torch.ones_like(accept_prob, dtype=torch.bool)
 
         # [核心] 使用 mask 过滤字典中的张量
         filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
@@ -232,7 +236,8 @@ def main(cfg: DictConfig):
         trajectories=raw_trajectories, 
         chunk_size=cfg.model.chunk_size, 
         n_points=cfg.dataset.n_points,
-        normalizer=normalizer 
+        normalizer=normalizer,
+        workspace_bounds=cfg.dataset.get("workspace_bounds", None)
     )
 
     dataloader = DataLoader(

@@ -183,6 +183,7 @@ def main(cfg: DictConfig):
     all_rewards = []
     all_success = []
     latencies = [] # [新增] 用于记录推理耗时
+    ws_bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
 
     print(f"\n🏃 开始进行 {cfg.eval.num_episodes} 个 Episode 的测试...")
     for ep in tqdm(range(cfg.eval.num_episodes), desc="Evaluating"):
@@ -198,7 +199,8 @@ def main(cfg: DictConfig):
             # (A) 准备观测数据: 增加 Batch 维度并发送到 Device
             # 1. 对环境传出的状态进行归一化 (网络期望 [-1,1] 的输入)
             obs_state = normalizer.normalize(obs['state'], 'state')
-            pc_tensor = torch.from_numpy(obs['point_cloud']).unsqueeze(0).to(device)
+            pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
+            pc_tensor = torch.from_numpy(pc_centered).unsqueeze(0).to(device)
             state_tensor = torch.from_numpy(obs_state).unsqueeze(0).to(device)
 
             # (B) 策略推理: 返回形状为 [1, chunk_size, action_dim]

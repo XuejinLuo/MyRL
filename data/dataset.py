@@ -15,7 +15,8 @@ class PointCloudChunkDataset(Dataset):
         chunk_size: int = 16, 
         n_points: int = 1024,
         is_training: bool = True, 
-        normalizer=None
+        normalizer=None,
+        workspace_bounds=None
     ):
         """
         Args:
@@ -30,6 +31,10 @@ class PointCloudChunkDataset(Dataset):
         self.n_points = n_points
         self.is_training = is_training
         self.normalizer = normalizer
+        if workspace_bounds is not None:
+            self.workspace_bounds = np.array(workspace_bounds)
+        else:
+            self.workspace_bounds = np.array([[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
         
         self.trajectories = trajectories
         self.indices = self._build_indices()
@@ -129,6 +134,8 @@ class PointCloudChunkDataset(Dataset):
             state_t = self.normalizer.normalize(state_t, 'state')
             action_chunk = self.normalizer.normalize(action_chunk, 'action')
             next_state_t = self.normalizer.normalize(next_state_t, 'state')
+            pc_t = self.normalizer.center_point_cloud(pc_t, self.workspace_bounds)
+            next_pc_t = self.normalizer.center_point_cloud(next_pc_t, self.workspace_bounds)
 
         # 微调：使用 np.ascontiguousarray 加速 PyTorch Tensor 的内存映射转换
         # 4. 组装并转换为 Tensor

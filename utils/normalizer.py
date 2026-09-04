@@ -24,8 +24,8 @@ class MinMaxNormalizer:
             if data.size == 0:
                 continue
             self.stats[key] = {
-                'min': np.min(data, axis=0).tolist(),
-                'max': np.max(data, axis=0).tolist()
+                'min': np.min(data, axis=0).astype(float).tolist(),
+                'max': np.max(data, axis=0).astype(float).tolist()
             }
             
     def normalize(self, data: Union[np.ndarray, torch.Tensor], key: str):
@@ -40,6 +40,12 @@ class MinMaxNormalizer:
         normalized = (data - stat_min) / (stat_max - stat_min + self.eps)
         # 映射到 [-1, 1]
         normalized = normalized * 2.0 - 1.0
+
+        if isinstance(normalized, torch.Tensor):
+            normalized = torch.clamp(normalized, -1.0, 1.0)
+        else:
+            normalized = np.clip(normalized, -1.0, 1.0)
+
         return normalized
 
     def unnormalize(self, data: Union[np.ndarray, torch.Tensor], key: str):
@@ -52,9 +58,9 @@ class MinMaxNormalizer:
 
         # 防御性裁剪，防止模型刚开始训练时输出飞车导致物理引擎崩溃
         if isinstance(data, torch.Tensor):
-            data = torch.clamp(data, -1.0, 1.0)
+            data = torch.clamp(data, -1.1, 1.1)
         else:
-            data = np.clip(data, -1.0, 1.0)
+            data = np.clip(data, -1.1, 1.1)
 
         # 反映射
         unnormalized = (data + 1.0) / 2.0 * (stat_max - stat_min + self.eps) + stat_min
@@ -79,3 +85,21 @@ class MinMaxNormalizer:
             raise FileNotFoundError(f"找不到归一化配置文件: {file_path}")
         with open(file_path, 'r', encoding='utf-8') as f:
             self.stats = json.load(f)
+
+    def center_point_cloud(self, pc: Union[np.ndarray, torch.Tensor], bounds: np.ndarray):
+        """
+        点云的零均值化：根据 workspace bounds 的中心点进行平移。
+        pc: [N, 3] 或 [Batch, N, 3]
+        bounds: [[xmin, ymin, zmin], [xmax, ymax, zmax]]
+        """
+        # 计算工作空间的几何中心
+        center = (bounds[0] + bounds[1]) / 2.0
+        center = self._to_same_type(center, pc)
+        
+        # 只平移前三个维度 (X, Y, Z)，防止误伤 RGB
+        if isinstance(pc, torch.Tensor):
+            pc[..., :3] = pc[..., :3] - center
+        else:
+            pc[..., :3] = pc[..., :3] - center
+            
+        return pc
