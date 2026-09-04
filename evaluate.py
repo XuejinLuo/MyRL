@@ -82,13 +82,18 @@ def make_env_dummy(cfg: DictConfig):
 
 def make_env_ManiSkill(cfg):
     """ 创建并包装 ManiSkill 真实仿真环境 """
-    
+
+    env_id = cfg.env.get("env_id", "PushCube-v1")
+    obs_mode = cfg.env.get("obs_mode", "pointcloud")
+    control_mode = cfg.env.get("control_mode", "pd_ee_delta_pose")
+    render_mode = cfg.env.get("render_mode", "rgb_array")
+
     # 1. 实例化 ManiSkill 环境 (以最经典的抓取方块任务为例)
     env = gym.make(
-        "PickCube-v1",
-        obs_mode="pointcloud",           # 必须开启点云模式
-        control_mode="pd_ee_delta_pose", # 控制模式为关节位置
-        render_mode="rgb_array",         # 用于 evaluation 录制视频
+        env_id,
+        obs_mode=obs_mode,
+        control_mode=control_mode,
+        render_mode=render_mode,
     )
     
     # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})

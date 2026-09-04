@@ -1,7 +1,7 @@
 # configs/eval.yaml
 defaults:
   - model: flow_3d
-  - env: dummy_env
+  - env: maniskill
   - _self_
 
 eval:

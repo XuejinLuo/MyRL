@@ -2,7 +2,7 @@
 defaults:
   - model: flow_3d
   - algo: pg              # 在线训练切换为 PG 算法
-  - env: dummy_env        # 在线训练需要环境 Rollout
+  - env: maniskill        # 在线训练需要环境 Rollout
   - _self_
 
 run_name: "pg_finetune_flow"

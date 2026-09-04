@@ -58,14 +58,18 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, see
         torch.cuda.empty_cache()
 
     try:
+        env_id = cfg.env.get("env_id", "PushCube-v1") if "env" in cfg else "PushCube-v1"
+        obs_mode = cfg.env.get("obs_mode", "pointcloud") if "env" in cfg else "pointcloud"
+        control_mode = cfg.env.get("control_mode", "pd_ee_delta_pose") if "env" in cfg else "pd_ee_delta_pose"
+
         # 1. 创建 ManiSkill 环境并强制开启录像支持 (rgb_array)
         env = gym.make(
-            "PickCube-v1",
-            obs_mode="pointcloud",
-            control_mode="pd_ee_delta_pose", 
+            env_id,
+            obs_mode=obs_mode,
+            control_mode=control_mode, 
             render_mode="rgb_array",
         )
-
+        
         # 2. 先挂载渲染类型转换 Wrapper
         env = RenderToNumpyWrapper(env)
         

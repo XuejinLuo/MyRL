@@ -4,6 +4,7 @@ defaults:
   - model: flow_3d         # 加载 configs/model/flow_3d.yaml 作为 cfg.model
   - algo: idql             # 加载 configs/algo/idql.yaml 作为 cfg.algo
   - dataset: offline_data  # 加载 configs/dataset/offline_data.yaml 作为 cfg.dataset
+  - env: maniskill 
   - _self_                 # _self_ 保证下方定义的全局变量优先级最高，可覆盖子配置
 
 # 全局工程设置

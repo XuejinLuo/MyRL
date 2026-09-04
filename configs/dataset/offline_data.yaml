@@ -1,9 +1,10 @@
 # configs/dataset/offline_data.yaml
-n_points: 1024
-use_color: true
+n_points: ${env.num_points}
+use_color: ${env.use_color}
+workspace_bounds: ${env.workspace_bounds}
+
 # 数据集绝对路径或相对路径
-data_path: "/home/luo/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pose.physx_cpu.h5"
+data_path: "/home/luo/.maniskill/demos/${env.env_id}/motionplanning/trajectory.pointcloud.${env.control_mode}.physx_cpu.h5"
+
 # 最大加载的轨迹数（防 OOM），如果不限制则写 null
 max_episodes: null
-# 点云裁剪范围 (Z轴 > 0 保留桌面以上)
-workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]
