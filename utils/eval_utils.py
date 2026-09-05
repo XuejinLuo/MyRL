@@ -36,7 +36,7 @@ class RenderToNumpyWrapper(gym.Wrapper):
             frame = frame.astype(np.uint8)
             
         return frame
-def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, normalizer=None, seed: int = 42, max_steps: int = 500):
+def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, normalizer=None, seed: int = 42, max_steps: int = 300):
     """
     独立且解耦的验证与录像接口
     Args:
