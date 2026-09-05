@@ -12,7 +12,8 @@ run_name: "idql_flow_chunk16"
 project: "my_rl100_infra"
 seed: 42
 device: "cuda"
-epochs: 100
+epochs: 5000
+save_epoch: 50
 batch_size: 64
 save_dir: "./checkpoints/offline"
 

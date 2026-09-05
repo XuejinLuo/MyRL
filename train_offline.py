@@ -359,7 +359,7 @@ def main(cfg: DictConfig):
         print(f"Epoch {epoch:03d} | Actor Loss: {epoch_metrics['loss/actor']:.4f} | Q Value: {epoch_metrics['q_value']:.4f} | Accept Ratio: {epoch_metrics['metrics/accept_ratio']*100:.1f}%")
 
         # 定期保存权重 (Save Checkpoint)
-        if epoch % 1 == 0 or epoch == cfg.epochs:
+        if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
             ckpt_path = os.path.join(cfg.save_dir, f"idql_policy_ep{epoch}.pth")
             # 保存双份权重字典
             torch.save({
@@ -369,7 +369,9 @@ def main(cfg: DictConfig):
             print(f"   💾 Saved Checkpoint (with EMA) to {ckpt_path}")
             # 用 EMA 策略进行录像验证
             # 注意第二入参：用平滑后的 ema_policy 去执行物理环境 Rollout
-            evaluate_and_record_video(cfg, ema_policy, epoch, device)
+            # evaluate_and_record_video(cfg, ema_policy, epoch, device, normalizer=normalizer)
+            # 临时改成评估基础策略，看看是否过拟合
+            evaluate_and_record_video(cfg, base_policy, epoch, device, normalizer=normalizer)
 
     if cfg.wandb.enable:
         wandb.finish()

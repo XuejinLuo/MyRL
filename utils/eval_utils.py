@@ -36,7 +36,7 @@ class RenderToNumpyWrapper(gym.Wrapper):
             frame = frame.astype(np.uint8)
             
         return frame
-def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, seed: int = 42, max_steps: int = 100):
+def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, normalizer=None, seed: int = 42, max_steps: int = 100):
     """
     独立且解耦的验证与录像接口
     Args:
@@ -102,7 +102,7 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, see
             env=env, num_points=num_points, workspace_bounds=ws_bounds, use_color=use_color
         )
         env = ChunkActionWrapper(
-            env=env, chunk_size=cfg.model.chunk_size, exec_steps=exec_steps, exp_weight=exp_weight
+            env=env, chunk_size=cfg.model.chunk_size, exec_steps=exec_steps, exp_weight=exp_weight, use_ensembling=False
         )
         
         # 4. 执行测试环境 Rollout
@@ -114,9 +114,25 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, see
         num_infer_steps = cfg.model.get("num_inference_steps", 10)
         
         while not (done or truncated) and step_count < max_steps:
+            # 点云零均值化
+            if normalizer is not None and hasattr(normalizer, 'center_point_cloud'):
+                pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
+            else:
+                pc_centered = obs['point_cloud']
+            # State 归一化
+            if normalizer is not None:
+                obs_state = normalizer.normalize(obs['state'], 'state')
+            else:
+                obs_state = obs['state']
+
             # 观测转 Tensor
-            pc_tensor = torch.from_numpy(obs['point_cloud']).unsqueeze(0).to(device)
-            state_tensor = torch.from_numpy(obs['state']).unsqueeze(0).to(device)
+            pc_tensor = torch.from_numpy(
+                np.ascontiguousarray(pc_centered)
+            ).float().unsqueeze(0).to(device)
+
+            state_tensor = torch.from_numpy(
+                np.ascontiguousarray(obs_state)
+            ).float().unsqueeze(0).to(device)
 
             # 模型推断 (使用 AMP 自动混合精度加速)
             with torch.no_grad():
@@ -127,7 +143,11 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, see
             
             # 环境执行
             action_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
-            obs, reward, done, truncated, info = env.step(action_np)
+            if normalizer is not None:
+                real_action = normalizer.unnormalize(action_np, 'action')
+            else:
+                real_action = action_np
+            obs, reward, done, truncated, info = env.step(real_action)
             
             if hasattr(reward, 'item'):
                 reward = reward.item()
