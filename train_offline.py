@@ -137,14 +137,15 @@ class EmbodiedIDQL(IDQL):
             weights = torch.exp(self.beta * adv_stable)
             accept_prob = (weights / weights.max()).squeeze(-1)
             
-            # 关闭拒绝采样，强行全盘接收
-            # random_u = torch.rand_like(accept_prob)
-            # keep_mask = random_u < accept_prob
-            # if keep_mask.sum() == 0:
-            #     keep_mask[torch.argmax(accept_prob)] = True
+            # 开启拒绝采样（Reject Sampling），让网络只学习高质量的动作
+            random_u = torch.rand_like(accept_prob)
+            keep_mask = random_u < accept_prob
+            # 安全校验：万一这个 batch 的动作都很烂，强行保留优势最大的那一个，防止 Loss 变成 NaN
+            if keep_mask.sum() == 0:
+                keep_mask[torch.argmax(accept_prob)] = True
             
             # 纯 BC 模式：所有样本强制设为 True
-            keep_mask = torch.ones_like(accept_prob, dtype=torch.bool)
+            # keep_mask = torch.ones_like(accept_prob, dtype=torch.bool)
 
         # [核心] 使用 mask 过滤字典中的张量
         filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
@@ -429,12 +430,13 @@ def main(cfg: DictConfig):
             # 保存双份权重字典
             torch.save({
                 'model_state_dict': base_policy.state_dict(),
-                # 'ema_model_state_dict': ema_policy.state_dict()
+                'ema_model_state_dict': ema_policy.state_dict()
             }, ckpt_path)
             print(f"   💾 Saved Checkpoint (with EMA) to {ckpt_path}")
             # 用 EMA 策略进行录像验证
             # 注意第二入参：用平滑后的 ema_policy 去执行物理环境 Rollout
             evaluate_and_record_video(cfg, ema_policy, epoch, device, normalizer=normalizer)
+            verify_overfitting_actions(cfg, ema_policy, dataloader, normalizer, epoch, device)
             # 临时改成评估基础策略，看看是否过拟合
             # evaluate_and_record_video(cfg, base_policy, epoch, device, normalizer=normalizer)
             # verify_overfitting_actions(cfg, base_policy, dataloader, normalizer, epoch, device)
