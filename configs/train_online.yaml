@@ -9,7 +9,7 @@ run_name: "pg_finetune_flow"
 seed: 42
 device: "cuda"
 epochs: 200
-save_dir: "./checkpoints/online"
+save_dir: "./outputs/online"
 
 wandb:
   enable: true

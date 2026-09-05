@@ -31,7 +31,7 @@ def parse_args():
     
     # 路径与工程超参数
     parser.add_argument("--teacher_ckpt", type=str, default="", help="Path to pre-trained teacher checkpoint (optional)")
-    parser.add_argument("--save_dir", type=str, default="./checkpoints/distill", help="Directory to save student checkpoints")
+    parser.add_argument("--save_dir", type=str, default="./outputs/distill", help="Directory to save student checkpoints")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     
     # [性能核心] 是否开启伪标签预计算 (强烈建议开启)
@@ -198,7 +198,10 @@ def main():
         
         # 定期保存权重 (保存 EMA 版本的 Student 性能更稳定)
         if epoch % 10 == 0 or epoch == args.epochs:
-            ckpt_path = os.path.join(args.save_dir, f"student_distilled_ep{epoch}.pth")
+            ckpt_dir = os.path.join(args.save_dir, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"student_distilled_ep{epoch}.pth")
+            
             torch.save(distiller.ema_student.state_dict(), ckpt_path)
             print(f"   💾 Saved EMA Student Checkpoint to {ckpt_path}")
 

@@ -352,7 +352,10 @@ def main(cfg: DictConfig):
         print(f"Epoch {epoch:03d} | Avg Reward: {epoch_reward:.2f} | Actor Loss: {epoch_losses['actor_loss']:.4f} | Critic Loss: {epoch_losses['critic_loss']:.4f}")
 
         if epoch % 10 == 0 or epoch == cfg.epochs:
-            ckpt_path = os.path.join(cfg.save_dir, f"pg_finetuned_ep{epoch}.pth")
+            ckpt_dir = os.path.join(cfg.save_dir, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"pg_finetuned_ep{epoch}.pth")
+            
             torch.save(base_policy.state_dict(), ckpt_path)
             print(f"   💾 Saved Checkpoint to {ckpt_path}")
             # 调用外置的评估接口
@@ -371,7 +374,7 @@ if __name__ == "__main__":
     dummy_yaml = """
     run_name: "Flow-PG-Finetune"
     device: "cuda"
-    save_dir: "./checkpoints/online"
+    save_dir: "./outputs/online"
     epochs: 200
     
     env:

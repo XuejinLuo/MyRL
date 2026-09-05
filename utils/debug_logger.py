@@ -9,7 +9,7 @@ class DebugLogger:
         :param save_dir: 实验保存路径
         :param max_steps_per_epoch: 每个 Epoch 最多只记录前多少个 step/batch 的 I/O，防止文件爆炸
         """
-        self.save_dir = save_dir
+        self.save_dir = os.path.join(save_dir, "debug_logs")
         self.max_steps_per_epoch = max_steps_per_epoch
         os.makedirs(self.save_dir, exist_ok=True)
         self.metrics_file = os.path.join(self.save_dir, "epoch_losses.txt")

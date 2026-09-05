@@ -15,7 +15,7 @@ device: "cuda"
 epochs: 5000
 save_epoch: 50
 batch_size: 64
-save_dir: "./checkpoints/offline"
+save_dir: "./outputs/offline"
 
 wandb:
   enable: true

@@ -162,6 +162,68 @@ class EmbodiedIDQL(IDQL):
             "metrics/adv_mean": adv.mean().item()
         }
 
+def verify_overfitting_actions(cfg, policy, dataloader, normalizer, epoch, device):
+    """
+    直接从 DataLoader 中抽取一个样本，通过网络推理，并与真实的 Action 对比。
+    结果将被保存至 txt 文件中，供肉眼对比！
+    """
+    policy.eval()
+    
+    # 抽取 DataLoader 的第一个 Batch
+    batch = next(iter(dataloader))
+    
+    # 我们只取 Batch 中的第 0 个样本进行详细对比
+    pc_t = batch['pc'][0:1].to(device)            # shape: [1, N, 3(或6)]
+    state_t = batch['state'][0:1].to(device)      # shape: [1, State_Dim]
+    gt_action = batch['action_chunk'][0:1].cpu().numpy() # 归一化状态下的真实动作 [1, Chunk, A_Dim]
+    
+    # 通过网络生成预测动作 (Diffusion/Flow 需要采样多步)
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if device.type == 'cuda' else torch.no_grad():
+            pred_action = policy.sample(
+                obs=pc_t, 
+                state=state_t, 
+                num_steps=cfg.model.get("num_inference_steps", 10)
+            )
+    pred_action = pred_action.cpu().float().numpy()
+
+    # 反归一化，还原到真实的物理物理范围
+    if normalizer is not None:
+        # normalizer 处理时通常只关注最后一维，切片去掉 Batch 维度
+        gt_action_real = normalizer.unnormalize(gt_action[0], 'action')
+        pred_action_real = normalizer.unnormalize(pred_action[0], 'action')
+    else:
+        gt_action_real = gt_action[0]
+        pred_action_real = pred_action[0]
+
+    # 将结果写入文本文件
+    debug_dir = os.path.join(cfg.save_dir, "debug_logs")
+    os.makedirs(debug_dir, exist_ok=True)
+    out_file = os.path.join(debug_dir, f"action_compare_ep{epoch}.txt")
+    with open(out_file, 'w', encoding='utf-8') as f:
+        f.write(f"========== Epoch {epoch} 动作过拟合对比 ==========\n")
+        f.write("说明: 比较网络推理出的 Action 与 数据集中的真实 Action\n\n")
+        
+        # 遍历 Chunk 中的每一步
+        for i in range(gt_action_real.shape[0]):
+            f.write(f"--- Chunk Step {i} ---\n")
+            
+            # 使用 np.round 保留 4 位小数，使对齐更好看
+            gt_str = np.array2string(gt_action_real[i], precision=4, suppress_small=True, separator=', ')
+            pred_str = np.array2string(pred_action_real[i], precision=4, suppress_small=True, separator=', ')
+            
+            # 计算这一步的绝对误差
+            error = np.mean(np.abs(gt_action_real[i] - pred_action_real[i]))
+            
+            f.write(f"真实 (GT)  : {gt_str}\n")
+            f.write(f"预测 (Pred): {pred_str}\n")
+            f.write(f"MAE 误差   : {error:.6f}\n\n")
+
+    print(f"\n✅ 动作直观对比已生成，请在左侧文件树查看: {out_file}")
+    
+    # 恢复训练模式
+    policy.train()
+
 # =========================================================================
 # Main 训练循环
 # =========================================================================
@@ -225,8 +287,11 @@ def main(cfg: DictConfig):
         'action': all_actions,
         'state': all_states
     })
+    
+    ckpt_dir = os.path.join(cfg.save_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
     # 保存到这次实验的文件夹下，确保跟 Checkpoint 绑定！
-    stats_path = os.path.join(cfg.save_dir, "dataset_stats.json")
+    stats_path = os.path.join(ckpt_dir, "dataset_stats.json")
     normalizer.save(stats_path)
     print(f"✅ 归一化参数已保存至 {stats_path}")
 
@@ -270,10 +335,10 @@ def main(cfg: DictConfig):
 
     # 初始化 EMA 策略模型
     print("🧠 正在初始化 EMA 策略模型...")
-    ema_policy = copy.deepcopy(base_policy).to(device)
-    ema_policy.eval() # EMA 模型不参与梯度传播，永远在 eval 模式
-    for param in ema_policy.parameters():
-        param.requires_grad = False
+    # ema_policy = copy.deepcopy(base_policy).to(device)
+    # ema_policy.eval() # EMA 模型不参与梯度传播，永远在 eval 模式
+    # for param in ema_policy.parameters():
+    #     param.requires_grad = False
     
     ema_decay = 0.999 # Diffusion/Flow 常用指数衰减率 (建议 0.999 或 0.9999)
 
@@ -333,11 +398,11 @@ def main(cfg: DictConfig):
             # --- B. 更新 Actor (Flow / Diffusion with Reject Sampling) ---
             actor_info = agent.update_actor(obs_dict, action_chunk, adv=critic_info.pop('adv_for_actor'))
 
-            # 每步软更新 EMA 权重
-            with torch.no_grad():
-                for ema_param, param in zip(ema_policy.parameters(), base_policy.parameters()):
-                    # ema_weight = decay * ema_weight + (1 - decay) * current_weight
-                    ema_param.data.mul_(ema_decay).add_(param.data, alpha=1.0 - ema_decay)
+            # # 每步软更新 EMA 权重
+            # with torch.no_grad():
+            #     for ema_param, param in zip(ema_policy.parameters(), base_policy.parameters()):
+            #         # ema_weight = decay * ema_weight + (1 - decay) * current_weight
+            #         ema_param.data.mul_(ema_decay).add_(param.data, alpha=1.0 - ema_decay)
             
             # 合并日志
             step_metrics = {**critic_info, **actor_info}
@@ -360,11 +425,11 @@ def main(cfg: DictConfig):
 
         # 定期保存权重 (Save Checkpoint)
         if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
-            ckpt_path = os.path.join(cfg.save_dir, f"idql_policy_ep{epoch}.pth")
+            ckpt_path = os.path.join(ckpt_dir, f"idql_policy_ep{epoch}.pth")
             # 保存双份权重字典
             torch.save({
                 'model_state_dict': base_policy.state_dict(),
-                'ema_model_state_dict': ema_policy.state_dict()
+                # 'ema_model_state_dict': ema_policy.state_dict()
             }, ckpt_path)
             print(f"   💾 Saved Checkpoint (with EMA) to {ckpt_path}")
             # 用 EMA 策略进行录像验证
@@ -372,6 +437,7 @@ def main(cfg: DictConfig):
             # evaluate_and_record_video(cfg, ema_policy, epoch, device, normalizer=normalizer)
             # 临时改成评估基础策略，看看是否过拟合
             evaluate_and_record_video(cfg, base_policy, epoch, device, normalizer=normalizer)
+            verify_overfitting_actions(cfg, base_policy, dataloader, normalizer, epoch, device)
 
     if cfg.wandb.enable:
         wandb.finish()

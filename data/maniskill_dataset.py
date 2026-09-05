@@ -78,6 +78,7 @@ def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
                 'reward': reward,
                 'done': done
             })
-            
+
+            print(f"Raw RGB Max: {pc_dict['rgb'][:].max()}, Min: {pc_dict['rgb'][:].min()}")
     print(f"✅ 成功加载 {len(trajectories)} 条专家轨迹！")
     return trajectories
