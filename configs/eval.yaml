@@ -5,7 +5,7 @@ defaults:
   - _self_
 
 eval:
-  ckpt_path: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_pushcube_20260906_150541/checkpoints/idql_policy_ep80.pth"
+  ckpt_path: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_pickcube_20260906_174059/checkpoints/idql_policy_ep90.pth"
   num_episodes: 20
   num_inference_steps: 10      # 蒸馏后单步推理填1，普通Flow填10
   cfg_weight: 1.0             
