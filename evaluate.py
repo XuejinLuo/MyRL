@@ -220,8 +220,9 @@ def main(cfg: DictConfig):
             pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
             pc_tensor = torch.from_numpy(pc_centered).unsqueeze(0).to(device)
             state_tensor = torch.from_numpy(obs_state).unsqueeze(0).to(device)
-
+            
             # (B) 策略推理: 返回形状为 [1, chunk_size, action_dim]
+            t_start = time.time() 
             with torch.no_grad():
                 action_chunk = policy.sample(
                     obs=pc_tensor, 
@@ -229,6 +230,8 @@ def main(cfg: DictConfig):
                     num_steps=num_inference_steps,
                     cfg_weight=cfg.eval.get("cfg_weight", 1.0)
                 )
+            t_end = time.time()
+            latencies.append((t_end - t_start) * 1000.0)
 
             # (C) 转换为 NumPy 并去掉 Batch 维度 -> [chunk_size, action_dim]
             action_chunk_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
@@ -264,6 +267,7 @@ def main(cfg: DictConfig):
     print(f"Success Rate      : {success_rate:.1f} %")
     print(f"Inference Latency : {mean_latency:.2f} ms/step (≈ {1000/mean_latency if mean_latency > 0 else 0:.1f} FPS)")
     print("=" * 40)
+    env.close()
 
 if __name__ == "__main__":
     main()
