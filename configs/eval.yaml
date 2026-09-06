@@ -5,11 +5,11 @@ defaults:
   - _self_
 
 eval:
-  ckpt_path: "/home/luo/MyRL/checkpoints/offline/idql_flow_chunk16_20260904_163830/idql_policy_ep100.pth"
-  num_episodes: 20
+  ckpt_path: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_20260905_221706/checkpoints/idql_policy_ep120.pth"
+  num_episodes: 10
   num_inference_steps: 10      # 蒸馏后单步推理填1，普通Flow填10
   cfg_weight: 1.0             
-  record_video: false         
-  log_dir: "./logs"
+  record_video: true         
+  log_dir: "./outputs/eval"
   device: "cuda"
   seed: 42

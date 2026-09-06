@@ -10,6 +10,7 @@ from tqdm import tqdm
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo # [新增] 视频录制
 import mani_skill.envs
+from datetime import datetime
 
 # 导入你的核心架构
 from models.policy import EmbodiedGenPolicy
@@ -17,6 +18,7 @@ from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
 from utils.normalizer import MinMaxNormalizer
+from utils.eval_utils import RenderToNumpyWrapper 
 
 # =========================================================================
 # 核心评估逻辑
@@ -94,7 +96,16 @@ def make_env_ManiSkill(cfg):
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
+        max_episode_steps=300
     )
+
+    if cfg.eval.get("record_video", False):
+        # 必须在 RecordVideo 之前转换图像数据类型
+        env = RenderToNumpyWrapper(env)
+        video_dir = os.path.join(cfg.eval.get("log_dir", "./logs"), "videos")
+        os.makedirs(video_dir, exist_ok=True)
+        # episode_trigger=lambda x: True 表示每个 Episode 都强制录像
+        env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda x: True, disable_logger=True)
     
     # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
     env = ManiSkillToRL100Wrapper(env)
@@ -126,6 +137,12 @@ def main(cfg: DictConfig):
     print("🚀 开始具身策略评估 (Evaluation)")
     print(OmegaConf.to_yaml(cfg))
     print("=" * 60)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    OmegaConf.set_struct(cfg, False)
+    base_log_dir = cfg.eval.get("log_dir", "./outputs/eval")
+    cfg.eval.log_dir = os.path.join(base_log_dir, f"run_{timestamp}")
+    OmegaConf.set_struct(cfg, True)
 
     device = torch.device(cfg.eval.device)
     
@@ -183,7 +200,8 @@ def main(cfg: DictConfig):
     all_rewards = []
     all_success = []
     latencies = [] # [新增] 用于记录推理耗时
-    ws_bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+    bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+    ws_bounds = np.array(bounds)
 
     print(f"\n🏃 开始进行 {cfg.eval.num_episodes} 个 Episode 的测试...")
     for ep in tqdm(range(cfg.eval.num_episodes), desc="Evaluating"):
