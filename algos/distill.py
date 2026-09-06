@@ -46,6 +46,8 @@ class OneStepDistiller:
         with torch.no_grad():
             for ema_param, param in zip(self.ema_student.parameters(), self.student.parameters()):
                 ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+            for ema_buffer, buffer in zip(self.ema_student.buffers(), self.student.buffers()):
+                ema_buffer.data.copy_(buffer.data)
 
     @torch.no_grad()
     def teacher_generate(self, obs: torch.Tensor, state: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:

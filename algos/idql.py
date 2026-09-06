@@ -117,7 +117,8 @@ class IDQL:
         beta=3.0,            # Reject Sampling 温度系数
         actor_lr=1e-4,
         critic_lr=3e-4,
-        tau_target=0.005     # Target 网络软更新系数
+        tau_target=0.005,     # Target 网络软更新系数
+        use_bc_only=False
     ):
         self.actor = actor.to(device)
         self.q_net = q_network.to(device)
@@ -129,6 +130,7 @@ class IDQL:
         self.discount = discount
         self.beta = beta
         self.tau_target = tau_target
+        self.use_bc_only = use_bc_only
         
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.q_opt = torch.optim.Adam(self.q_net.parameters(), lr=critic_lr)

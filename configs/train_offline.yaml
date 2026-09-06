@@ -8,11 +8,11 @@ defaults:
   - _self_                 # _self_ 保证下方定义的全局变量优先级最高，可覆盖子配置
 
 # 全局工程设置
-run_name: "idql_flow_chunk16"
+run_name: "bc_flow_chunk16"
 project: "my_rl100_infra"
 seed: 42
 device: "cuda"
-epochs: 300
+epochs: 160
 save_epoch: 10
 batch_size: 64
 save_dir: "./outputs/offline"

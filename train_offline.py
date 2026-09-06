@@ -137,17 +137,22 @@ class EmbodiedIDQL(IDQL):
             weights = torch.exp(self.beta * adv_stable)
             accept_prob = (weights / weights.max()).squeeze(-1)
             
-            # 开启拒绝采样（Reject Sampling），让网络只学习高质量的动作
-            random_u = torch.rand_like(accept_prob)
-            keep_mask = random_u < accept_prob
-            # 安全校验：万一这个 batch 的动作都很烂，强行保留优势最大的那一个，防止 Loss 变成 NaN
-            if keep_mask.sum() == 0:
-                keep_mask[torch.argmax(accept_prob)] = True
-            
-            # 纯 BC 模式：所有样本强制设为 True
-            # keep_mask = torch.ones_like(accept_prob, dtype=torch.bool)
+            if self.use_bc_only:
+                # 纯 BC 模式：所有样本强制设为 True，跳过过滤
+                keep_mask = torch.ones(actions.shape[0], dtype=torch.bool, device=actions.device)
+            else:
+                # IDQL 模式：计算优势权重并进行拒绝采样 (Reject Sampling)
+                adv_stable = adv - adv.max() 
+                weights = torch.exp(self.beta * adv_stable)
+                accept_prob = (weights / weights.max()).squeeze(-1)
+                
+                random_u = torch.rand_like(accept_prob)
+                keep_mask = random_u < accept_prob
+                # 安全校验：防止全部被拒绝导致 Loss 为 NaN
+                if keep_mask.sum() == 0:
+                    keep_mask[torch.argmax(accept_prob)] = True
 
-        # [核心] 使用 mask 过滤字典中的张量
+        # 使用 mask 过滤字典中的张量
         filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
         filtered_actions = actions[keep_mask]
         
@@ -366,7 +371,8 @@ def main(cfg: DictConfig):
         beta=cfg.algo.beta,
         tau_target=cfg.algo.tau_target,
         actor_lr=cfg.algo.actor_lr,
-        critic_lr=cfg.algo.critic_lr
+        critic_lr=cfg.algo.critic_lr,
+        use_bc_only=cfg.algo.get("use_bc_only", False)
     )
 
     # 5. 开始训练 (Training Loop)
@@ -401,9 +407,14 @@ def main(cfg: DictConfig):
 
             # 每步软更新 EMA 权重
             with torch.no_grad():
+                # 1. 更新网络权重参数
                 for ema_param, param in zip(ema_policy.parameters(), base_policy.parameters()):
                     # ema_weight = decay * ema_weight + (1 - decay) * current_weight
                     ema_param.data.mul_(ema_decay).add_(param.data, alpha=1.0 - ema_decay)
+                # 2. 同步网络缓冲区 (核心：同步 BatchNorm 的 running_mean 和 running_var)
+                for ema_buffer, buffer in zip(ema_policy.buffers(), base_policy.buffers()):
+                    # 由于 buffers 中通常存的是统计量或常数，推荐直接 hard copy
+                    ema_buffer.data.copy_(buffer.data)
             
             # 合并日志
             step_metrics = {**critic_info, **actor_info}
