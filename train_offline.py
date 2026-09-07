@@ -168,15 +168,11 @@ class EmbodiedIDQL(IDQL):
             "metrics/adv_mean": adv.mean().item()
         }
 
-def verify_overfitting_actions(cfg, policy, dataloader, normalizer, epoch, device):
+def verify_overfitting_actions(cfg, policy, batch, normalizer, epoch, device):
     """
-    直接从 DataLoader 中抽取一个样本，通过网络推理，并与真实的 Action 对比。
-    结果将被保存至 txt 文件中，供肉眼对比！
+    直接传入从主循环截获的 batch,通过网络推理,并与真实的 Action 对比。
     """
     policy.eval()
-    
-    # 抽取 DataLoader 的第一个 Batch
-    batch = next(iter(dataloader))
     
     # 我们只取 Batch 中的第 0 个样本进行详细对比
     pc_t = batch['pc'][0:1].to(device)            # shape: [1, N, 3(或6)]
@@ -448,7 +444,7 @@ def main(cfg: DictConfig):
             # 用 EMA 策略进行录像验证
             # 注意第二入参：用平滑后的 ema_policy 去执行物理环境 Rollout
             evaluate_and_record_video(cfg, ema_policy, epoch, device, normalizer=normalizer)
-            verify_overfitting_actions(cfg, ema_policy, dataloader, normalizer, epoch, device)
+            verify_overfitting_actions(cfg, ema_policy, batch, normalizer, epoch, device)
             # 临时改成评估基础策略，看看是否过拟合
             # evaluate_and_record_video(cfg, base_policy, epoch, device, normalizer=normalizer)
             # verify_overfitting_actions(cfg, base_policy, dataloader, normalizer, epoch, device)
