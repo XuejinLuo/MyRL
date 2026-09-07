@@ -1,14 +1,14 @@
 # evaluate.py
 
 import os
-import time # [新增] 用于测试高频推理延迟
+import time # 用于测试高频推理延迟
 import torch
 import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 import gymnasium as gym
-from gymnasium.wrappers import RecordVideo # [新增] 视频录制
+from gymnasium.wrappers import RecordVideo # 视频录制
 import mani_skill.envs
 from datetime import datetime
 
@@ -39,7 +39,7 @@ def make_env_dummy(cfg: DictConfig):
             })
             self.action_space = gym.spaces.Box(-1, 1, shape=(cfg.model.action_dim,), dtype=np.float32)
             self.step_count = 0
-            # [新增] 模拟渲染接口，供 RecordVideo 调用
+            # 模拟渲染接口，供 RecordVideo 调用
             self.render_mode = "rgb_array" 
             
         def reset(self, seed=None, options=None):
@@ -52,13 +52,13 @@ def make_env_dummy(cfg: DictConfig):
             reward = 1.0 if done else 0.0
             return self.observation_space.sample(), reward, done, False, {"success": done}
             
-        # [新增] 假渲染
+        # 假渲染
         def render(self):
             return np.zeros((240, 320, 3), dtype=np.uint8)
 
     env = DummyEmbodiedEnv()
 
-    # [新增] 包装 RecordVideo (按需开启，这里默认每 5 个 episode 录制一次)
+    # 包装 RecordVideo (按需开启，这里默认每 5 个 episode 录制一次)
     if cfg.eval.get("record_video", False):
         video_dir = os.path.join(cfg.eval.get("log_dir", "./logs"), "videos")
         env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda x: x % 5 == 0)
@@ -146,7 +146,7 @@ def main(cfg: DictConfig):
 
     device = torch.device(cfg.eval.device)
     
-    # [新增] 提取基础配置 (防止用户在使用蒸馏模型时忘了改 step)
+    # 提取基础配置 (防止用户在使用蒸馏模型时忘了改 step)
     num_inference_steps = cfg.eval.get("num_inference_steps", 10)
     is_distilled = cfg.eval.get("is_distilled", False)
     if is_distilled and num_inference_steps != 1:
@@ -199,15 +199,27 @@ def main(cfg: DictConfig):
     # 5. 评估循环
     all_rewards = []
     all_success = []
-    latencies = [] # [新增] 用于记录推理耗时
+    latencies = [] # 用于记录推理耗时
     bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
     ws_bounds = np.array(bounds)
 
     print(f"\n🏃 开始进行 {cfg.eval.num_episodes} 个 Episode 的测试...")
+    saved_first_pc = False # 用于保存第一个点云
     for ep in tqdm(range(cfg.eval.num_episodes), desc="Evaluating"):
-        # [新增] 传入固定的 base_seed 以确保测试环境的一致性和可复现性
+        # 传入固定的 base_seed 以确保测试环境的一致性和可复现性
         base_seed = cfg.eval.get("seed", 42)
         obs, info = env.reset(seed=base_seed + ep)
+
+        if not saved_first_pc:
+            pc_data = obs['point_cloud'] 
+            
+            # 保存为 .npy 文件
+            pc_save_path = os.path.join(cfg.eval.log_dir, "first_frame_pc.npy")
+            np.save(pc_save_path, pc_data)
+            
+            print(f"\n📸 第一帧 3D 点云已保存至: {pc_save_path}")
+            print(f"👉 请将其下载到本地，使用可视化脚本查看。")
+            saved_first_pc = True
         
         done, truncated = False, False
         ep_reward = 0.0
@@ -255,7 +267,7 @@ def main(cfg: DictConfig):
     # 6. 统计结果
     mean_reward = np.mean(all_rewards)
     success_rate = np.mean(all_success) * 100.0
-    # [新增] 推理延迟统计 (去除前 5 个 warmup 样本以保证准确)
+    # 推理延迟统计 (去除前 5 个 warmup 样本以保证准确)
     valid_latencies = latencies[5:] if len(latencies) > 5 else latencies
     mean_latency = np.mean(valid_latencies) if valid_latencies else 0.0
     
