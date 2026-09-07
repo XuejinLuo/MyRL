@@ -86,20 +86,20 @@ class MinMaxNormalizer:
         with open(file_path, 'r', encoding='utf-8') as f:
             self.stats = json.load(f)
 
-    def center_point_cloud(self, pc: Union[np.ndarray, torch.Tensor], bounds: np.ndarray):
-        """
-        点云的零均值化：根据 workspace bounds 的中心点进行平移。
-        pc: [N, 3] 或 [Batch, N, 3]
-        bounds: [[xmin, ymin, zmin], [xmax, ymax, zmax]]
-        """
-        # 计算工作空间的几何中心
-        center = (bounds[0] + bounds[1]) / 2.0
-        center = self._to_same_type(center, pc)
-        
-        # 只平移前三个维度 (X, Y, Z)，防止误伤 RGB
+    def center_point_cloud(
+        self,
+        pc: Union[np.ndarray, torch.Tensor],
+        bounds: np.ndarray,
+    ):
+        """返回中心化后的副本，不修改输入点云。"""
         if isinstance(pc, torch.Tensor):
-            pc[..., :3] = pc[..., :3] - center
+            out = pc.clone()
         else:
-            pc[..., :3] = pc[..., :3] - center
-            
-        return pc
+            out = pc.copy()
+
+        center = (bounds[0] + bounds[1]) / 2.0
+        center = self._to_same_type(center, out)
+
+        # 只平移 XYZ，保留 RGB 等其他通道。
+        out[..., :3] = out[..., :3] - center
+        return out

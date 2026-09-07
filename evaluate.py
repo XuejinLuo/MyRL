@@ -96,7 +96,7 @@ def make_env_ManiSkill(cfg):
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
-        max_episode_steps=300
+        max_episode_steps=400
     )
 
     if cfg.eval.get("record_video", False):

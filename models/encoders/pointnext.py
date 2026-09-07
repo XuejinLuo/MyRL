@@ -1,28 +1,4 @@
 # models/encoders/pointnext.py
-"""
-PointNeXt Encoder (Optimized Version v1.1)
-
-【当前版本的核心升级】
-✅ FPS 算子加速 (Speedup)：已成功引入 `torch_cluster` 的 C++/CUDA 预编译 fps 算子，
-   彻底解决了原先纯 PyTorch 版 for 循环导致的 CPU 阻塞与 CUDA Kernel 启动开销问题。
-   GPU 利用率大幅提升，完美适配 One-step Distillation 的高频真机部署（如 50Hz+）。
-
-【🚨 当前版本仍存的隐患】
-1. OOM 显存爆炸风险 (Ball Query Bottleneck)：
-   虽然 FPS 已优化，但局部分组 `query_ball_point` 仍在使用纯 PyTorch 的 `square_distance`。
-   其空间复杂度为 O(B * N * M)，如果直接传入未降采样的高密度点云（如 >4096 点），极易导致显存溢出。
-2. 空间拓扑信息的丢失：
-   网络末端使用了 Global Average Pooling，将 3D 点云压缩成了 1D 向量。这在传统的 Diffusion Policy 中可用，
-   但在追求极致精度的 3D Diffusion Policy (DP3) 中，会丢失部分精细的三维拓扑特征。
-
-【🚀 未来进一步的优化方向】
-1. Ball Query 算子替换：未来可将 `query_ball_point` 也替换为 `torch_cluster.radius`，
-   彻底消除 OOM 风险并榨干最后一点显存和计算性能。
-2. 前置降采样约束：在 envs/pointcloud_wrapper.py 中强制要求，输入前必须通过 Open3D 或 Voxel Downsample，
-   将点数死死控制在 1024 或 2048 以下。
-3. 保留 Token 序列 (Architecture)：去掉 `torch.mean`，将 `l3_points` 展平为 Token 序列 (如 [B, 16, 256])，
-   通过 Cross-Attention 注入到后续的 Transformer 中以保留局部空间几何结构。
-"""
 
 import torch
 import torch.nn as nn
@@ -35,13 +11,17 @@ import time
 # =====================================================================
 
 def square_distance(src, dst):
-    """计算两组点之间的平方距离"""
-    B, N, _ = src.shape
-    _, M, _ = dst.shape
-    dist = -2 * torch.matmul(src, dst.transpose(1, 2))
-    dist += torch.sum(src ** 2, -1).view(B, N, 1)
-    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
-    return dist
+    """使用 FP32 计算平方距离，避免外层 AMP 影响几何查询。"""
+    with torch.autocast(device_type=src.device.type, enabled=False):
+        src = src.float()
+        dst = dst.float()
+
+        dist = (
+            src.square().sum(dim=-1, keepdim=True)
+            + dst.square().sum(dim=-1).unsqueeze(1)
+            - 2.0 * torch.matmul(src, dst.transpose(1, 2))
+        )
+        return dist.clamp_min(0.0)
 
 def index_points(points, idx):
     """根据索引提取点"""
@@ -66,17 +46,37 @@ def farthest_point_sample(xyz, npoint):
     
     return idx.view(B, npoint) % N
 def query_ball_point(radius, nsample, xyz, new_xyz):
-    """球查询 (Ball Query)"""
-    device = xyz.device
-    B, N, C = xyz.shape
-    _, S, _ = new_xyz.shape
-    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+    """球查询；邻域为空时使用最近点兜底。"""
+    B, N, _ = xyz.shape
+    S = new_xyz.shape[1]
+
+    if N == 0 or nsample <= 0:
+        raise ValueError("点云不能为空，且 nsample 必须大于 0")
+
     sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
-    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
-    mask = group_idx == N
-    group_idx[mask] = group_first[mask]
+
+    group_idx = (
+        torch.arange(N, device=xyz.device, dtype=torch.long)
+        .view(1, 1, N)
+        .expand(B, S, N)
+    )
+    group_idx = group_idx.masked_fill(sqrdists > radius ** 2, N)
+
+    k = min(nsample, N)
+    group_idx = group_idx.sort(dim=-1).values[..., :k]
+
+    first = group_idx[..., :1]
+    nearest = sqrdists.argmin(dim=-1, keepdim=True)
+
+    # 有邻居：用第一个有效邻居补齐。
+    # 无邻居：用最近点补齐，保证索引落在 [0, N-1]。
+    fallback = torch.where(first < N, first, nearest)
+    group_idx = torch.where(group_idx < N, group_idx, fallback)
+
+    if k < nsample:
+        padding = fallback.expand(B, S, nsample - k)
+        group_idx = torch.cat([group_idx, padding], dim=-1)
+
     return group_idx
 
 def sample_and_group(npoint, radius, nsample, xyz, points):
