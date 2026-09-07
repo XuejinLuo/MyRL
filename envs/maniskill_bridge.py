@@ -8,11 +8,11 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
     """
     def __init__(self, env):
         super().__init__(env)
-        # 你可以根据真实的 action_dim (比如 8) 和 state_dim (比如 18) 修改下面
+        # 你可以根据真实的 action_dim (比如 8) 和 state_dim (比如 16) 修改下面
         self.observation_space = gym.spaces.Dict({
             'xyz': gym.spaces.Box(-np.inf, np.inf, shape=(100000, 3), dtype=np.float32),
             'rgb': gym.spaces.Box(0, 1, shape=(100000, 3), dtype=np.float32),
-            'state': gym.spaces.Box(-np.inf, np.inf, shape=(18,), dtype=np.float32)
+            'state': gym.spaces.Box(-np.inf, np.inf, shape=(16,), dtype=np.float32)
         })
 
     def observation(self, obs):
@@ -42,7 +42,17 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
 
         # 2. 提取机器人本体状态 (Proprioception)
         qpos = to_np(obs['agent']['qpos']).reshape(-1)
-        state = qpos.astype(np.float32) 
+        # 提取 TCP Pose (具体键名需根据你的 ManiSkill 环境确定，通常是 'tcp_pose' 或 'ee_pose')
+        # TCP Pose 通常包含 7 维：[x, y, z, qw, qx, qy, qz]
+        if 'extra' in obs and 'tcp_pose' in obs['extra']:
+            tcp_pose = to_np(obs['extra']['tcp_pose']).reshape(-1)
+        elif 'tcp_pose' in obs['agent']:
+            tcp_pose = to_np(obs['agent']['tcp_pose']).reshape(-1)
+        else:
+            tcp_pose = np.zeros(7, dtype=np.float32)
+            
+        # 将 qpos 和 tcp_pose 拼接
+        state = np.concatenate([qpos, tcp_pose]).astype(np.float32) 
 
         return {
             'xyz': xyz, 

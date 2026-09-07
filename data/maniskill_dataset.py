@@ -64,7 +64,17 @@ def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None, n_point
             
             # 2. 提取本体状态 (Proprioception)
             qpos = traj['obs']['agent']['qpos'][:]
-            state = qpos.astype(np.float32) 
+            # ManiSkill 中 tcp_pose 可能存放在 extra 字典或 agent 字典下
+            if 'extra' in traj['obs'] and 'tcp_pose' in traj['obs']['extra']:
+                tcp_pose = traj['obs']['extra']['tcp_pose'][:]
+            elif 'tcp_pose' in traj['obs']['agent']:
+                tcp_pose = traj['obs']['agent']['tcp_pose'][:]
+            else:
+                # 防御性编程：如果没有找到，用全 0 补齐，防止 shape 错位
+                tcp_pose = np.zeros((qpos.shape[0], 7), dtype=np.float32)
+                
+            # 拼接 qpos (9维) 和 tcp_pose (7维)，形成 16维 的 state
+            state = np.concatenate([qpos, tcp_pose], axis=-1).astype(np.float32)
             
             # 3. 提取动作
             action = traj['actions'][:].astype(np.float32)
