@@ -3,7 +3,7 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
+def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None, n_points=1024):
     """
     读取 ManiSkill 生成的点云 .h5 数据，转换为离线 RL 训练所需格式。
     """
@@ -35,21 +35,32 @@ def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
                 bounds = np.array(workspace_bounds)
             else:
                 bounds = np.array([[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
-            cropped_xyz_list = []
+                
+            T = xyz.shape[0]
+            C = xyz.shape[2]
+            fixed_xyz = np.zeros((T, n_points, C), dtype=np.float32)
             
-            # 逐帧过滤掉多余的背景点
-            for t in range(xyz.shape[0]):
+            # 逐帧过滤掉多余的背景点，并立即降采样
+            for t in range(T):
                 pts = xyz[t]
                 mask = (
                     (pts[:, 0] >= bounds[0, 0]) & (pts[:, 0] <= bounds[1, 0]) &
                     (pts[:, 1] >= bounds[0, 1]) & (pts[:, 1] <= bounds[1, 1]) &
                     (pts[:, 2] >= bounds[0, 2]) & (pts[:, 2] <= bounds[1, 2])
                 )
-                cropped_xyz_list.append(pts[mask])
-            
-            # 使用 object 类型的 array 存储不定长的点云帧
-            xyz_cropped = np.empty(len(cropped_xyz_list), dtype=object)
-            xyz_cropped[:] = cropped_xyz_list
+                valid_pts = pts[mask]
+                num_valid = valid_pts.shape[0]
+                
+                # 提前进行目标数量的点云采样
+                if num_valid >= n_points:
+                    choices = np.random.choice(num_valid, n_points, replace=False)
+                    fixed_xyz[t] = valid_pts[choices]
+                elif num_valid > 0:
+                    choices = np.random.choice(num_valid, n_points, replace=True)
+                    fixed_xyz[t] = valid_pts[choices]
+                else:
+                    # 如果这帧画面里没有有效的点（全被裁剪掉了），维持 zeros 不变
+                    pass
             
             # 2. 提取本体状态 (Proprioception)
             qpos = traj['obs']['agent']['qpos'][:]
@@ -72,7 +83,7 @@ def load_maniskill_h5(h5_path, max_episodes=None, workspace_bounds=None):
             done[-1] = True # 强行确保最后一步为 Done
             
             trajectories.append({
-                'pc': xyz_cropped,
+                'pc': fixed_xyz,
                 'state': state,
                 'action': action,
                 'reward': reward,

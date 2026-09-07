@@ -57,20 +57,10 @@ class PointCloudChunkDataset(Dataset):
 
     def _sample_point_cloud(self, pc: np.ndarray):
         """
-        点云降采样 (Random Sampling 比 Farthest Point Sampling 快很多，适合 DataLoader)
-        pc shape: [N_original, 3] or [N_original, 3+C]
+        数据已经在 load_maniskill_h5 时固定为 [n_points, C] 的连续矩阵，
+        这里直接返回，免除 DataLoader 的瓶颈耗时。
         """
-        N = pc.shape[0]
-        if N >= self.n_points:
-            # 随机无放回采样
-            choices = np.random.permutation(N)[:self.n_points]
-            
-            # 在过拟合测试时，使用固定的步长采样代替随机采样
-            # choices = np.linspace(0, N-1, self.n_points, dtype=int) 
-        else:
-            # 如果点不够，有放回采样补齐
-            choices = np.random.choice(N, self.n_points, replace=True)
-        return pc[choices]
+        return pc
 
     def _get_chunk(self, array: np.ndarray, start_idx: int, length: int, pad_value='last'):
         """

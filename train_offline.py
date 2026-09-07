@@ -281,7 +281,8 @@ def main(cfg: DictConfig):
     raw_trajectories = load_maniskill_h5(
         data_path, 
         max_episodes=max_episodes,
-        workspace_bounds=cfg.dataset.get("workspace_bounds", None) 
+        workspace_bounds=cfg.dataset.get("workspace_bounds", None),
+        n_points=cfg.dataset.n_points
     )
 
     print("📊 正在统计归一化参数 (Normalization Stats)...")
