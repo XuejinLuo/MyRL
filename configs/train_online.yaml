@@ -29,7 +29,7 @@ algo:
   
   # 强化学习微调超参
   entropy_coef: 0.01     # 熵系数：如果发现机械臂在环境中很快陷入死锁不探索，可微微调大至 0.02
-  steps_per_epoch: 64    # 每次 PPO 网络更新前，在环境中 Rollout 收集的步数
+  steps_per_epoch: 1024    # 每次 PPO 网络更新前，在环境中 Rollout 收集的步数
   update_epochs: 4       # 收集完数据后，PPO 网络内部循环微调的次数
 
 wandb:

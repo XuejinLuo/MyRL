@@ -207,6 +207,9 @@ def main(cfg: DictConfig):
         cond_dim=cfg.model.cond_dim, algo_type=cfg.model.algo_type
     ).to(device)
     actor = Policy_PG_Wrapper(base_policy)
+    print("🔒 正在冻结 PointNeXt 视觉编码器...")
+    for param in base_policy.encoder.parameters():
+        param.requires_grad = False
     
     # 适配含 EMA/Model 嵌套大字典的 Checkpoint 格式
     if cfg.algo.pretrained_ckpt and os.path.exists(cfg.algo.pretrained_ckpt):
@@ -273,6 +276,14 @@ def main(cfg: DictConfig):
 
             # 环境执行 (转换为 numpy)
             action_np = action_chunk.squeeze(0).cpu().numpy()
+
+            # 仅在训练 Rollout 阶段注入噪声 (评估时 evaluate.py 会保持纯净)
+            noise_scale = 0.05  # 探索方差，如果机械臂不乱动可以稍微调大到 0.1
+            exploration_noise = np.random.normal(loc=0.0, scale=noise_scale, size=(1, action_np.shape[1]))
+            action_np = action_np + exploration_noise
+            # 必须 Clip 回 [-1, 1] 范围，防止传给 Normalizer 时导致物理引擎崩溃
+            action_np = np.clip(action_np, -1.0, 1.0)
+
             real_action = normalizer.unnormalize(action_np, 'action')
             next_obs, reward, done, truncated, info = env.step(real_action)
 
@@ -330,22 +341,45 @@ def main(cfg: DictConfig):
             old_log_probs, _ = actor.evaluate_actions(flat_obs_dict, flat_actions)
 
         # PPO 循环微调
-        epoch_losses = {}
+        epoch_losses = {"actor_loss": 0, "critic_loss": 0, "entropy": 0, "total_loss": 0}
+        num_samples = flat_adv.shape[0]
+        batch_size = 128  # 可根据你的显存大小调整 (64 或 128)
+        indices = np.arange(num_samples)
+
         for ppo_epoch in range(cfg.algo.update_epochs):
-            loss_dict = trainer.update_step(
-                states=flat_obs_dict, 
-                actions=flat_actions, 
-                old_log_probs=old_log_probs, 
-                returns=flat_returns, 
-                advantages=flat_adv
-            )
+            np.random.shuffle(indices) # 打乱数据打破时序相关性
+            num_batches = 0
             
-            for k, v in loss_dict.items():
-                epoch_losses[k] = epoch_losses.get(k, 0) + v
+            for start_idx in range(0, num_samples, batch_size):
+                end_idx = start_idx + batch_size
+                mb_idx = indices[start_idx:end_idx]
+
+                # 构建 Mini-batch 字典
+                mb_obs_dict = {
+                    'pc': flat_obs_dict['pc'][mb_idx],
+                    'state': flat_obs_dict['state'][mb_idx]
+                }
+                mb_actions = flat_actions[mb_idx]
+                mb_old_log_probs = old_log_probs[mb_idx]
+                mb_returns = flat_returns[mb_idx]
+                mb_adv = flat_adv[mb_idx]
+
+                loss_dict = trainer.update_step(
+                    states=mb_obs_dict, 
+                    actions=mb_actions, 
+                    old_log_probs=mb_old_log_probs, 
+                    returns=mb_returns, 
+                    advantages=mb_adv
+                )
                 
-        # 平均 Loss
+                # 累加 Loss
+                for k, v in loss_dict.items():
+                    epoch_losses[k] += v
+                num_batches += 1
+                
+        # 计算多次 Epoch 和 Mini-batch 的平均 Loss
         for k in epoch_losses:
-            epoch_losses[k] /= cfg.algo.update_epochs
+            epoch_losses[k] /= (cfg.algo.update_epochs * num_batches)
 
         # --- D. 打印与保存 ---
         log_metrics = {**epoch_losses, "Reward/Epoch": epoch_reward}
