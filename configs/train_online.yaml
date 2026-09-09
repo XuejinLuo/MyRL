@@ -1,15 +1,36 @@
 # configs/train_online.yaml
 defaults:
   - model: flow_3d
-  - algo: pg              # 在线训练切换为 PG 算法
+  - algo: pg              # 在线训练切换为 PG 算法 (加载 configs/algo/pg.yaml)
   - env: maniskill        # 在线训练需要环境 Rollout
   - _self_
 
-run_name: "pg_finetune_flow"
+# =========================================================
+# 1. 全局工程设置
+# =========================================================
+run_name: "pg_finetune_flow_${env.env_id}"  # 建议后缀加上任务名，方便在 wandb 中区分
 seed: 42
 device: "cuda"
-epochs: 200
+epochs: 100
 save_dir: "./outputs/online"
+save_epoch: 10          # 每隔 10 个 Epoch 保存一次权重并录制验证视频
+
+# =========================================================
+# 2. 🚨 [核心覆盖] 在线微调专用的 PPO 核心参数
+# =========================================================
+algo:
+  # 【必填】离线预训练 (IDQL) 跑出来的最佳权重路径！
+  # 💡 提示: train_online.py 会自动去该权重所在的文件夹下读取 dataset_stats.json 进行归一化
+  pretrained_ckpt: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_PullCubeTool_20260908_105144/checkpoints/idql_policy_ep60.pth"
+  
+  # 学习率控制 (Catastrophic Forgetting 防御)
+  actor_lr: 1e-5         # Actor 包含巨大的 Diffusion/Flow 网络，必须保持极小 (可尝试 1e-5 ~ 5e-6)
+  critic_lr: 3e-4        # Critic 价值网络是全新初始化的，需要较大的学习率快速收敛
+  
+  # 强化学习微调超参
+  entropy_coef: 0.01     # 熵系数：如果发现机械臂在环境中很快陷入死锁不探索，可微微调大至 0.02
+  steps_per_epoch: 64    # 每次 PPO 网络更新前，在环境中 Rollout 收集的步数
+  update_epochs: 4       # 收集完数据后，PPO 网络内部循环微调的次数
 
 wandb:
   enable: true
