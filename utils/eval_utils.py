@@ -68,7 +68,7 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, nor
             obs_mode=obs_mode,
             control_mode=control_mode, 
             render_mode="rgb_array",
-            max_episode_steps=500
+            max_episode_steps=int(cfg.env.get("max_episode_steps", 300))
         )
         
         # 2. 先挂载渲染类型转换 Wrapper
@@ -135,15 +135,14 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, nor
                 np.ascontiguousarray(obs_state)
             ).float().unsqueeze(0).to(device)
 
-            # 模型推断 (使用 AMP 自动混合精度加速)
+            # Match training numerical precision; eval() already disables BN updates.
             with torch.no_grad():
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if device.type == 'cuda' else torch.no_grad():
-                    action_chunk = policy.sample(
-                        obs=pc_tensor, state=state_tensor, num_steps=num_infer_steps
-                    )
-            
+                action_chunk = policy.sample(
+                    obs=pc_tensor, state=state_tensor, num_steps=num_infer_steps)
+
             # 环境执行
             action_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
+            action_np = np.clip(action_np, -1.0, 1.0)
             if normalizer is not None:
                 real_action = normalizer.unnormalize(action_np, 'action')
             else:

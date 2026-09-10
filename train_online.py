@@ -1,5 +1,8 @@
 # train_online.py
 import os
+import copy
+import random
+from algos.flow_ppo_policy import FlowPPOPolicy
 import torch
 import torch.nn as nn
 import numpy as np
@@ -59,37 +62,6 @@ class Critic_PG_Wrapper(nn.Module):
         feat = self.encoder(obs_dict)
         return self.v_net(feat)
 
-class Policy_PG_Wrapper(nn.Module):
-    """ 将 EmbodiedGenPolicy 包装，对齐 evaluate_actions 和 sample 的字典解包 """
-    def __init__(self, policy):
-        super().__init__()
-        self.policy = policy
-        
-    def evaluate_actions(self, obs_dict, actions):
-        # 匹配 algos/pg.py 中 trainer.update_step 的调用
-        log_prob_proxy, entropy = self.policy.evaluate_actions(
-            obs=obs_dict['pc'], 
-            actions=actions, 
-            state=obs_dict['state']
-        )
-        # 这里加入一个经验放缩系数，将 MSE 转化为合理的似然差异，激活 PPO 裁剪机制。
-        scale_factor = 10.0 
-        scaled_log_prob = log_prob_proxy * scale_factor
-        
-        return scaled_log_prob, entropy
-        
-    def sample(self, obs_dict, num_steps=10):
-        # 环境 Rollout 交互调用
-        return self.policy.sample(
-            obs=obs_dict['pc'], 
-            state=obs_dict['state'], 
-            num_steps=num_steps
-        )
-
-# =========================================================================
-# 环境构建
-# =========================================================================
-
 def make_env_ManiSkill(cfg):
     """ 创建并包装 ManiSkill 真实仿真环境 """
 
@@ -104,7 +76,7 @@ def make_env_ManiSkill(cfg):
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
-        max_episode_steps=300
+        max_episode_steps=int(cfg.env.get("max_episode_steps", 300))
     )
     
     # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
@@ -131,278 +103,229 @@ def make_env_ManiSkill(cfg):
     
     return env
 
-# =========================================================================
-# Rollout Buffer (On-policy 数据收集器)
-# =========================================================================
 class RolloutBuffer:
     def __init__(self, device):
         self.device = device
-        self.clear()
-        
-    def clear(self):
-        self.obs_pc, self.obs_state = [], []
-        self.actions, self.rewards, self.dones, self.values = [], [], [], []
-        
-    def add(self, pc, state, action, reward, done, value):
-        self.obs_pc.append(pc)
-        self.obs_state.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        self.values.append(value)
-        
-    def get_tensors(self):
-        # 转化为 Tensor, 维度: [Time_Steps, Batch_Size(1), ...]
-        return {
-            'pc': torch.FloatTensor(np.array(self.obs_pc)).unsqueeze(1).to(self.device),
-            'state': torch.FloatTensor(np.array(self.obs_state)).unsqueeze(1).to(self.device),
-            'actions': torch.FloatTensor(np.array(self.actions)).unsqueeze(1).to(self.device),
-            'rewards': torch.FloatTensor(np.array(self.rewards)).unsqueeze(1).to(self.device),
-            'dones': torch.FloatTensor(np.array(self.dones)).unsqueeze(1).to(self.device),
-            'values': torch.FloatTensor(np.array(self.values)).unsqueeze(1).to(self.device),
-        }
+        self.rows = []
 
-# =========================================================================
-# Main 训练循环
-# =========================================================================
-@hydra.main(version_base=None, config_path="configs", config_name="train_online")
+    def clear(self):
+        self.rows.clear()
+
+    def add(self, **row):
+        self.rows.append({k: np.array(v, copy=True) for k, v in row.items()})
+
+    def get_tensors(self):
+        return {k: torch.as_tensor(np.stack([r[k] for r in self.rows]),
+                                  dtype=torch.float32, device=self.device)
+                for k in self.rows[0]}
+
+
+def scalar(x):
+    return x.item() if hasattr(x, 'item') else x
+
+
+@hydra.main(version_base=None, config_path='configs', config_name='train_online')
 def main(cfg: DictConfig):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{cfg.run_name}_{timestamp}"
+    seed = int(cfg.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    device = torch.device(cfg.device)
+    run_name = f'{cfg.run_name}_{datetime.now():%Y%m%d_%H%M%S}'
     OmegaConf.set_struct(cfg, False)
     cfg.run_name = run_name
     cfg.save_dir = os.path.join(cfg.save_dir, run_name)
     OmegaConf.set_struct(cfg, True)
-    debug_logger = DebugLogger(cfg.save_dir)
-
-    # 1. 实验追踪
-    if cfg.wandb.enable:
-        wandb.init(project=cfg.wandb.project, name=cfg.run_name, config=OmegaConf.to_container(cfg, resolve=True))
-        
-    device = torch.device(cfg.device)
     os.makedirs(cfg.save_dir, exist_ok=True)
+    OmegaConf.save(cfg, os.path.join(cfg.save_dir, 'config.yaml'))
+    debug_logger = DebugLogger(cfg.save_dir)
+    if cfg.wandb.enable:
+        wandb.init(project=cfg.wandb.project, name=run_name,
+                   config=OmegaConf.to_container(cfg, resolve=True))
 
-    # 2. 初始化环境
-    env = make_env_ManiSkill(cfg)
+    ckpt = cfg.algo.pretrained_ckpt
+    if not ckpt or not os.path.isfile(ckpt):
+        raise FileNotFoundError(f'Offline checkpoint required: {ckpt}')
+    stats = os.path.join(os.path.dirname(ckpt), 'dataset_stats.json')
+    if not os.path.isfile(stats):
+        raise FileNotFoundError(f'Offline normalization statistics required: {stats}')
     normalizer = MinMaxNormalizer()
-    if cfg.algo.pretrained_ckpt and os.path.exists(cfg.algo.pretrained_ckpt):
-        stats_path = os.path.join(os.path.dirname(cfg.algo.pretrained_ckpt), "dataset_stats.json")
-        if os.path.exists(stats_path):
-            normalizer.load(stats_path)
-            print(f"✅ 成功加载环境归一化参数: {stats_path}")
-        else:
-            print(f"⚠️ 警告: 找不到归一化文件 {stats_path}，使用默认空 Normalizer!")
-    else:
-        print("⚠️ 警告: 未提供预训练权重路径(pretrained_ckpt)，Normalizer将为空!")
-    bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
-    ws_bounds = np.array(bounds)
-    
-    # 3. 初始化模型组件
-    print("🧠 初始化 Actor (Policy) 与 Critic (Value Network)...")
+    normalizer.load(stats)
+    ws_bounds = np.asarray(cfg.env.workspace_bounds)
     base_policy = EmbodiedGenPolicy(
-        in_channels=cfg.model.get("in_channels", 3),
+        in_channels=cfg.model.get('in_channels', 3),
         action_dim=cfg.model.action_dim, chunk_size=cfg.model.chunk_size,
         use_state=cfg.model.use_state, state_dim=cfg.model.state_dim,
         encoder_type=cfg.model.encoder_type, backbone_type=cfg.model.backbone_type,
-        cond_dim=cfg.model.cond_dim, algo_type=cfg.model.algo_type
-    ).to(device)
-    actor = Policy_PG_Wrapper(base_policy)
-    print("🔒 正在冻结 PointNeXt 视觉编码器...")
-    for param in base_policy.encoder.parameters():
-        param.requires_grad = False
-    
-    # 适配含 EMA/Model 嵌套大字典的 Checkpoint 格式
-    if cfg.algo.pretrained_ckpt and os.path.exists(cfg.algo.pretrained_ckpt):
-        state_dict = torch.load(cfg.algo.pretrained_ckpt, map_location=device)
-        if 'ema_model_state_dict' in state_dict:
-            base_policy.load_state_dict(state_dict['ema_model_state_dict'])
-            print("✅ 成功加载 IDQL 离线预训练权重 (EMA)，在此基础上启动 PG 微调！")
-        elif 'model_state_dict' in state_dict:
-            base_policy.load_state_dict(state_dict['model_state_dict'])
-            print("✅ 成功加载 IDQL 离线预训练权重 (Model)，在此基础上启动 PG 微调！")
-        else:
-            base_policy.load_state_dict(state_dict)
-            print("✅ 成功加载 IDQL 离线预训练权重 (Raw)，在此基础上启动 PG 微调！")
+        cond_dim=cfg.model.cond_dim, algo_type=cfg.model.algo_type).to(device)
+    weights = torch.load(ckpt, map_location=device)
+    if 'ema_model_state_dict' in weights:
+        weights = weights['ema_model_state_dict']
+    elif 'model_state_dict' in weights:
+        weights = weights['model_state_dict']
+    base_policy.load_state_dict(weights, strict=True)
+    del weights
+    base_policy.encoder.requires_grad_(False)
+    base_policy.eval()
+    actor = FlowPPOPolicy(base_policy, num_steps=cfg.model.num_inference_steps,
+                          exec_steps=cfg.env.exec_steps,
+                          std=cfg.algo.exploration_std).to(device)
+    actor.eval()
+    reference = copy.deepcopy(actor).eval()
+    reference.requires_grad_(False)
 
     critic_encoder = CriticFeatureExtractor(cfg).to(device)
-    base_v_net = VNetwork(state_dim=cfg.model.cond_dim).to(device)
-    critic = Critic_PG_Wrapper(critic_encoder, base_v_net)
-    
-    # 4. 初始化 PG Trainer
+    # Same architecture, copied parameters; no shared optimizer parameters.
+    critic_encoder.encoder.load_state_dict(base_policy.encoder.state_dict())
+    critic_encoder.requires_grad_(False)
+    critic = Critic_PG_Wrapper(critic_encoder,
+                VNetwork(state_dim=cfg.model.cond_dim).to(device)).to(device).eval()
     trainer = FlowPolicyGradient(
-        policy=actor, critic=critic,
-        actor_lr=cfg.algo.actor_lr,
-        critic_lr=cfg.algo.critic_lr,
-        gamma=cfg.algo.gamma, 
-        gae_lambda=cfg.algo.gae_lambda, 
-        clip_ratio=cfg.algo.clip_ratio,
-        entropy_coef=cfg.algo.get("entropy_coef", 0.01),
-        v_loss_coef=cfg.algo.get("v_loss_coef", 0.5),
-        max_grad_norm=cfg.algo.get("max_grad_norm", 1.0),
-        device=device
-    )
+        actor, critic, actor_lr=cfg.algo.actor_lr, critic_lr=cfg.algo.critic_lr,
+        gamma=cfg.algo.gamma, gae_lambda=cfg.algo.gae_lambda,
+        clip_ratio=cfg.algo.clip_ratio, entropy_coef=cfg.algo.entropy_coef,
+        v_loss_coef=cfg.algo.v_loss_coef, max_grad_norm=cfg.algo.max_grad_norm,
+        device=device, target_kl=cfg.algo.target_kl, anchor_coef=cfg.algo.anchor_coef)
 
+    def encode(obs):
+        pc = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
+        state = normalizer.normalize(obs['state'], 'state')
+        return {'pc': torch.as_tensor(pc, dtype=torch.float32, device=device).unsqueeze(0),
+                'state': torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)}
+
+    ckpt_dir = os.path.join(cfg.save_dir, 'checkpoints')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    normalizer.save(os.path.join(ckpt_dir, 'dataset_stats.json'))
+    # Preserve global RNG state around video evaluation.
+    def video(epoch):
+        np_state, py_state = np.random.get_state(), random.getstate()
+        try:
+            with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+                evaluate_and_record_video(cfg, base_policy, epoch, device,
+                                          normalizer=normalizer, seed=seed)
+        finally:
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+            actor.eval()
+
+    video(0)  # baseline before ANY update, same evaluation path
+    env = make_env_ManiSkill(cfg)
+    obs, _ = env.reset(seed=seed)
     buffer = RolloutBuffer(device)
-    obs, _ = env.reset()
+    ep_reward, ep_success = 0.0, False
+    try:
+        for epoch in range(1, cfg.epochs+1):
+            buffer.clear()
+            actor.eval()
+            critic.eval()
+            epoch_reward, finished_rewards, finished_successes = 0.0, [], []
+            for step in tqdm(range(cfg.algo.steps_per_epoch), desc=f'Epoch {epoch} Rollout'):
+                obs_dict = encode(obs)
+                with torch.no_grad():
+                    value = critic(obs_dict).item()
+                    action, z, old_logp, old_mean = actor.sample_with_log_prob(obs_dict)
+                    ref_mean = reference.mean(obs_dict, z)
+                debug_logger.log_io(epoch, step, obs_dict, action)
+                raw_action = action[0].cpu().numpy()
+                # STORE raw action; only clip the separate environment copy.
+                real_action = normalizer.unnormalize(np.clip(raw_action, -1, 1), 'action')
+                next_obs, reward, terminated, truncated, info = env.step(real_action)
+                reward = float(scalar(reward))
+                terminated, truncated = bool(scalar(terminated)), bool(scalar(truncated))
+                done = terminated or truncated
+                epoch_reward += reward
+                ep_reward += reward
+                ep_success |= bool(scalar(info.get('success', False)))
+                gae_reward = reward
+                # Timeout bootstraps from FINAL observation, before env.reset().
+                if truncated and not terminated:
+                    with torch.no_grad():
+                        gae_reward += trainer.gamma * critic(encode(next_obs)).item()
+                buffer.add(pc=obs_dict['pc'][0].cpu().numpy(),
+                           state=obs_dict['state'][0].cpu().numpy(),
+                           actions=raw_action, z=z[0].cpu().numpy(),
+                           old_logp=old_logp.item(), old_mean=old_mean[0].cpu().numpy(),
+                           ref_mean=ref_mean[0].cpu().numpy(), rewards=gae_reward,
+                           dones=float(done), values=value)
+                obs = next_obs
+                if done:
+                    finished_rewards.append(ep_reward)
+                    finished_successes.append(float(ep_success))
+                    ep_reward, ep_success = 0.0, False
+                    obs, _ = env.reset()
 
-    # 5. 主循环 (Epochs)
-    print(f"🚀 开始在线强化微调 (Total Epochs: {cfg.epochs})")
-    
-    for epoch in range(1, cfg.epochs + 1):
-        buffer.clear()
-        epoch_reward = 0.0
-        
-        # --- A. 轨迹收集阶段 (Rollout) ---
-        actor.eval()
-        critic.eval()
-        step = 0
-        for _ in tqdm(range(cfg.algo.steps_per_epoch), desc=f"Epoch {epoch} Rollout", leave=False):
-            # 观测喂给网络前必须使用 Normalizer 进行点云中心化和归一化
-            pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
-            obs_state = normalizer.normalize(obs['state'], 'state')
-
-            obs_dict = {
-                'pc': torch.FloatTensor(pc_centered).unsqueeze(0).to(device),
-                'state': torch.FloatTensor(obs_state).unsqueeze(0).to(device)
-            }
-            
+            data = buffer.get_tensors()
             with torch.no_grad():
-                # 计算当前状态的 Value
-                value = critic(obs_dict).item()
-                # 策略前向生成动作 Chunk
-                action_chunk = actor.sample(obs_dict, num_steps=cfg.model.num_inference_steps)
+                next_value = critic(encode(obs)).squeeze(-1)
+            adv, returns = trainer.compute_gae(data['rewards'][:, None],
+                data['values'][:, None], data['dones'][:, None], next_value)
+            adv, returns = adv.flatten(), returns.flatten()
+            adv = (adv-adv.mean()) / (adv.std(unbiased=False)+1e-8)
+            batch_size = int(cfg.algo.minibatch_size)
+            n = len(adv)
+            # All samples, minibatched: old-policy likelihood must reproduce before update.
+            max_error = 0.0
+            with torch.no_grad():
+                for start in range(0, n, batch_size):
+                    sl = slice(start, start+batch_size)
+                    obs_batch = {'pc': data['pc'][sl], 'state': data['state'][sl]}
+                    
+                    # 以 Batch 模式重新计算当前的 old_logp, mean 以及 ref_mean
+                    lp, _, mean_val = actor.evaluate_actions(obs_batch, data['actions'][sl], data['z'][sl])
+                    ref_mean_val = reference.mean(obs_batch, data['z'][sl])
+                    
+                    err = (lp - data['old_logp'][sl]).abs().max().item()
+                    if not np.isfinite(err):
+                        raise FloatingPointError('Nonfinite old log-probability')
+                    max_error = max(max_error, err)
+                    
+                    # 💡 【核心修复】：直接用 Batched 计算结果覆盖 Rollout(Batch=1) 时的单样本结果！
+                    # 这样可以完美抵消掉所有由于 cuBLAS 批处理和 ODE 积分带来的正常浮点误差，
+                    # 确保 PPO 更新时 Importance Ratio 绝对从 1.0 开始！
+                    data['old_logp'][sl] = lp
+                    data['old_mean'][sl] = mean_val
+                    data['ref_mean'][sl] = ref_mean_val
 
-            debug_logger.log_io(epoch, step, obs_dict, action_chunk)
-
-            # 环境执行 (转换为 numpy)
-            action_np = action_chunk.squeeze(0).cpu().numpy()
-
-            # 仅在训练 Rollout 阶段注入噪声 (评估时 evaluate.py 会保持纯净)
-            noise_scale = 0.05  # 探索方差，如果机械臂不乱动可以稍微调大到 0.1
-            exploration_noise = np.random.normal(loc=0.0, scale=noise_scale, size=(1, action_np.shape[1]))
-            action_np = action_np + exploration_noise
-            # 必须 Clip 回 [-1, 1] 范围，防止传给 Normalizer 时导致物理引擎崩溃
-            action_np = np.clip(action_np, -1.0, 1.0)
-
-            real_action = normalizer.unnormalize(action_np, 'action')
-            next_obs, reward, done, truncated, info = env.step(real_action)
-
-            reward_val = float(reward.item() if hasattr(reward, 'item') else reward)
-            done_val = bool(done.item() if hasattr(done, 'item') else done)
-            trunc_val = bool(truncated.item() if hasattr(truncated, 'item') else truncated)
-            epoch_reward += reward_val  
-            
-            # 注意：Buffer 中必须存入的是归一化后的数据！以供后续 PPO 用原比例计算 Loss
-            buffer.add(pc_centered, obs_state, action_np, reward_val, done_val or trunc_val, value)
-            
-            obs = next_obs
-            if done_val or trunc_val:
-                obs, _ = env.reset()
-                
-        # --- B. 计算 GAE 与 Returns ---
-        rollout_data = buffer.get_tensors()
-        
-        # 获取下一个状态的 value (用于 Bootstrapping)
-        with torch.no_grad():
-            next_pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
-            next_obs_state = normalizer.normalize(obs['state'], 'state')
-            next_obs_dict = {
-                'pc': torch.FloatTensor(next_pc_centered).unsqueeze(0).to(device),
-                'state': torch.FloatTensor(next_obs_state).unsqueeze(0).to(device)
-            }
-            next_value = critic(next_obs_dict).squeeze(-1)
-            
-        advantages, returns = trainer.compute_gae(
-            rollout_data['rewards'], rollout_data['values'], rollout_data['dones'], next_value
-        )
-        
-        # PPO Trick: Advantage 归一化 (极大提升微调稳定性)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # --- C. PPO 网络更新阶段 ---
-        actor.train()
-        for module in actor.modules():
-            if isinstance(module, torch.nn.BatchNorm1d) or isinstance(module, torch.nn.BatchNorm2d):
-                module.eval()
-        critic.train()
-        
-        # 将 [Time, Batch, ...] 拍扁为 [Batch_size, ...]
-        actual_channels = rollout_data['pc'].shape[-1]  # <--- 获取真实的通道数
-        flat_obs_dict = {
-            'pc': rollout_data['pc'].view(-1, cfg.env.num_points, actual_channels),
-            'state': rollout_data['state'].view(-1, cfg.model.state_dim)
-        }
-        flat_actions = rollout_data['actions'].view(-1, cfg.model.chunk_size, cfg.model.action_dim)
-        flat_adv = advantages.view(-1)
-        flat_returns = returns.view(-1)
-
-        # 事先计算 old_log_probs
-        with torch.no_grad():
-            old_log_probs, _ = actor.evaluate_actions(flat_obs_dict, flat_actions)
-
-        # PPO 循环微调
-        epoch_losses = {"actor_loss": 0, "critic_loss": 0, "entropy": 0, "total_loss": 0}
-        num_samples = flat_adv.shape[0]
-        batch_size = 128  # 可根据你的显存大小调整 (64 或 128)
-        indices = np.arange(num_samples)
-
-        for ppo_epoch in range(cfg.algo.update_epochs):
-            np.random.shuffle(indices) # 打乱数据打破时序相关性
-            num_batches = 0
-            
-            for start_idx in range(0, num_samples, batch_size):
-                end_idx = start_idx + batch_size
-                mb_idx = indices[start_idx:end_idx]
-
-                # 构建 Mini-batch 字典
-                mb_obs_dict = {
-                    'pc': flat_obs_dict['pc'][mb_idx],
-                    'state': flat_obs_dict['state'][mb_idx]
-                }
-                mb_actions = flat_actions[mb_idx]
-                mb_old_log_probs = old_log_probs[mb_idx]
-                mb_returns = flat_returns[mb_idx]
-                mb_adv = flat_adv[mb_idx]
-
-                loss_dict = trainer.update_step(
-                    states=mb_obs_dict, 
-                    actions=mb_actions, 
-                    old_log_probs=mb_old_log_probs, 
-                    returns=mb_returns, 
-                    advantages=mb_adv
-                )
-                
-                # 累加 Loss
-                for k, v in loss_dict.items():
-                    epoch_losses[k] += v
-                num_batches += 1
-                
-        # 计算多次 Epoch 和 Mini-batch 的平均 Loss
-        for k in epoch_losses:
-            epoch_losses[k] /= (cfg.algo.update_epochs * num_batches)
-
-        # --- D. 打印与保存 ---
-        log_metrics = {**epoch_losses, "Reward/Epoch": epoch_reward}
+            metrics, count = {}, 0
+            actor_enabled = epoch > cfg.algo.critic_warmup_epochs
+            for _ in range(cfg.algo.update_epochs):
+                for idx in np.array_split(np.random.permutation(n), max(1, (n+batch_size-1)//batch_size)):
+                    losses = trainer.update_step(
+                        states={'pc': data['pc'][idx], 'state': data['state'][idx]},
+                        actions=data['actions'][idx], old_log_probs=data['old_logp'][idx],
+                        returns=returns[idx], advantages=adv[idx], z=data['z'][idx],
+                        old_mean=data['old_mean'][idx], ref_mean=data['ref_mean'][idx],
+                        actor_enabled=actor_enabled)
+                    if losses['stop_actor']:
+                        actor_enabled = False  # remaining minibatches update critic only
+                    for key, val in losses.items():
+                        metrics[key] = metrics.get(key, 0.0)+val
+                    count += 1
+            metrics = {k: v/count for k, v in metrics.items()}
+            metrics.update({'Reward/EpochSum': epoch_reward,
+                            'PPO/old_logp_max_error': max_error,
+                            'Episodes/completed': len(finished_rewards)})
+            if finished_rewards:
+                metrics['Reward/EpisodeMean'] = float(np.mean(finished_rewards))
+                metrics['Success/TrainEpisodeRate'] = float(np.mean(finished_successes))
+            if cfg.wandb.enable:
+                wandb.log(metrics, step=epoch)
+            debug_logger.log_metrics(epoch, metrics)
+            print(f'Epoch {epoch:03d} | Reward Sum: {epoch_reward:.2f} | '
+                  f'Actor: {metrics["actor_loss"]:.4f} | Critic: {metrics["critic_loss"]:.4f} | '
+                  f'Conditional KL: {metrics["conditional_kl"]:.6f}')
+            if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
+                # Compatible with existing evaluate.py; this is deployment, not resume state.
+                torch.save(base_policy.state_dict(),
+                           os.path.join(ckpt_dir, f'pg_finetuned_ep{epoch}.pth'))
+                video(epoch)
+    finally:
+        env.close()
         if cfg.wandb.enable:
-            wandb.log(log_metrics, step=epoch)
-        debug_logger.log_metrics(epoch, log_metrics)
-            
-        print(f"Epoch {epoch:03d} | Avg Reward: {epoch_reward:.2f} | Actor Loss: {epoch_losses['actor_loss']:.4f} | Critic Loss: {epoch_losses['critic_loss']:.4f}")
-
-        if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
-            ckpt_dir = os.path.join(cfg.save_dir, "checkpoints")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f"pg_finetuned_ep{epoch}.pth")
-            
-            torch.save(base_policy.state_dict(), ckpt_path)
-            print(f"   💾 Saved Checkpoint to {ckpt_path}")
-            # 调用外置的评估接口
-            evaluate_and_record_video(cfg, base_policy, epoch, device, normalizer=normalizer)
-
-    if cfg.wandb.enable:
-        wandb.finish()
-    print("🎉 在线 PG 微调完成！可以接入 distill_policy.py 开始进行单步蒸馏！")
+            wandb.finish()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

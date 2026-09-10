@@ -9,7 +9,7 @@ ALLOWED_EXTENSIONS = {'.py', '.yaml', '.yml'}
 
 # 生成文件树和遍历时需要忽略的常见无关文件夹
 IGNORE_DIRS = {
-    '.git', '__pycache__', 'venv', 'env', 
+    '.git', '__pycache__', 'venv',
     '.idea', '.vscode', 'node_modules', 'dist', 'build',
     'outputs', 'wandb', 'checkpoints', 'test'
 }
