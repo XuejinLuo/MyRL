@@ -100,10 +100,10 @@ class FlowPolicyGradient:
         # 将 Actor 的 Loss 分开处理，如果是导致发散的负优势，限制其对 MSE 的无限推远
         actor_loss_raw = -torch.min(surr1, surr2)
 
-        # 当 advantages < 0 时，ratio 试图变小，MSE 试图变大，引发崩溃。
-        # 对于负的 Advantage 样本，我们可以对其产生的 Loss 乘以一个极小的惩罚系数，或直接清零梯度（只向好样本学习）
+        # 彻底丢弃负优势的样本，只保留好的行为进行梯度更新
         mask = (advantages >= 0).float()
-        actor_loss = (actor_loss_raw * mask).mean() + 0.1 * (actor_loss_raw * (1.0 - mask)).mean() 
+        # 使用 sum 除以有效样本数，防止全负 batch 导致 0 除问题
+        actor_loss = (actor_loss_raw * mask).sum() / (mask.sum() + 1e-8)
         
         # 4. 计算 Critic Loss (MSE)
         critic_loss = F.mse_loss(values, returns)

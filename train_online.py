@@ -73,8 +73,7 @@ class Policy_PG_Wrapper(nn.Module):
             state=obs_dict['state'],
             noise=noise
         )
-        # 这里加入一个经验放缩系数，将 MSE 转化为合理的似然差异，激活 PPO 裁剪机制。
-        scale_factor = 10.0 
+        scale_factor = 1
         scaled_log_prob = log_prob_proxy * scale_factor
         
         return scaled_log_prob, entropy
@@ -193,8 +192,6 @@ def main(cfg: DictConfig):
             print(f"✅ 成功加载环境归一化参数: {stats_path}")
         else:
             print(f"⚠️ 警告: 找不到归一化文件 {stats_path}，使用默认空 Normalizer!")
-        critic_encoder.encoder.load_state_dict(base_policy.encoder.state_dict())
-        print("✅ 成功将 Actor 的预训练 3D 编码器权重同步给 Critic！")
     else:
         print("⚠️ 警告: 未提供预训练权重路径(pretrained_ckpt)，Normalizer将为空!")
     bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
@@ -210,6 +207,9 @@ def main(cfg: DictConfig):
         cond_dim=cfg.model.cond_dim, algo_type=cfg.model.algo_type
     ).to(device)
     actor = Policy_PG_Wrapper(base_policy)
+    critic_encoder = CriticFeatureExtractor(cfg).to(device)
+    base_v_net = VNetwork(state_dim=cfg.model.cond_dim).to(device)
+    critic = Critic_PG_Wrapper(critic_encoder, base_v_net)
     
     # 适配含 EMA/Model 嵌套大字典的 Checkpoint 格式
     if cfg.algo.pretrained_ckpt and os.path.exists(cfg.algo.pretrained_ckpt):
@@ -223,10 +223,8 @@ def main(cfg: DictConfig):
         else:
             base_policy.load_state_dict(state_dict)
             print("✅ 成功加载 IDQL 离线预训练权重 (Raw)，在此基础上启动 PG 微调！")
-
-    critic_encoder = CriticFeatureExtractor(cfg).to(device)
-    base_v_net = VNetwork(state_dim=cfg.model.cond_dim).to(device)
-    critic = Critic_PG_Wrapper(critic_encoder, base_v_net)
+        critic_encoder.encoder.load_state_dict(base_policy.encoder.state_dict())
+        print("✅ 成功将 Actor 的预训练 3D 编码器权重同步给 Critic！")
     
     # 4. 初始化 PG Trainer
     trainer = FlowPolicyGradient(
@@ -330,39 +328,68 @@ def main(cfg: DictConfig):
                 module.eval()
         critic.train()
         
-        # 将 [Time, Batch, ...] 拍扁为 [Batch_size, ...]
-        actual_channels = rollout_data['pc'].shape[-1]  # <--- 获取真实的通道数
-        flat_obs_dict = {
-            'pc': rollout_data['pc'].view(-1, cfg.env.num_points, actual_channels),
-            'state': rollout_data['state'].view(-1, cfg.model.state_dim)
-        }
+        actual_channels = rollout_data['pc'].shape[-1]
+        flat_pc = rollout_data['pc'].view(-1, cfg.env.num_points, actual_channels)
+        flat_state = rollout_data['state'].view(-1, cfg.model.state_dim)
         flat_actions = rollout_data['actions'].view(-1, cfg.model.chunk_size, cfg.model.action_dim)
         flat_adv = advantages.view(-1)
         flat_returns = returns.view(-1)
 
+        dataset_size = flat_returns.size(0)
+        mini_batch_size = cfg.get("batch_size", 32) 
+
         fixed_noise = torch.randn_like(flat_actions)
 
+        old_log_probs_list = []
         with torch.no_grad():
-            old_log_probs, _ = actor.evaluate_actions(flat_obs_dict, flat_actions, noise=fixed_noise)
+            for i in range(0, dataset_size, mini_batch_size):
+                mb_pc = flat_pc[i : i + mini_batch_size]
+                mb_state = flat_state[i : i + mini_batch_size]
+                mb_actions = flat_actions[i : i + mini_batch_size]
+                mb_noise = fixed_noise[i : i + mini_batch_size]
+                
+                mb_obs_dict = {'pc': mb_pc, 'state': mb_state}
+                mb_old_log_prob, _ = actor.evaluate_actions(mb_obs_dict, mb_actions, noise=mb_noise)
+                old_log_probs_list.append(mb_old_log_prob)
+                
+        old_log_probs = torch.cat(old_log_probs_list, dim=0)
 
         # PPO 循环微调
         epoch_losses = {}
+        total_updates = 0
         for ppo_epoch in range(cfg.algo.update_epochs):
-            loss_dict = trainer.update_step(
-                states=flat_obs_dict, 
-                actions=flat_actions, 
-                old_log_probs=old_log_probs, 
-                returns=flat_returns, 
-                advantages=flat_adv,
-                noise=fixed_noise
-            )
+            indices = torch.randperm(dataset_size, device=device)
             
-            for k, v in loss_dict.items():
-                epoch_losses[k] = epoch_losses.get(k, 0) + v
+            for start_idx in range(0, dataset_size, mini_batch_size):
+                end_idx = min(start_idx + mini_batch_size, dataset_size)
+                mb_inds = indices[start_idx:end_idx]
+                
+                mb_obs_dict = {
+                    'pc': flat_pc[mb_inds],
+                    'state': flat_state[mb_inds]
+                }
+                mb_actions = flat_actions[mb_inds]
+                mb_old_log_probs = old_log_probs[mb_inds]
+                mb_returns = flat_returns[mb_inds]
+                mb_adv = flat_adv[mb_inds]
+                mb_noise = fixed_noise[mb_inds]
+                
+                loss_dict = trainer.update_step(
+                    states=mb_obs_dict, 
+                    actions=mb_actions, 
+                    old_log_probs=mb_old_log_probs, 
+                    returns=mb_returns, 
+                    advantages=mb_adv,
+                    noise=mb_noise
+                )
+                
+                for k, v in loss_dict.items():
+                    epoch_losses[k] = epoch_losses.get(k, 0) + v
+                total_updates += 1
                 
         # 平均 Loss
         for k in epoch_losses:
-            epoch_losses[k] /= cfg.algo.update_epochs
+            epoch_losses[k] /= total_updates
 
         # --- D. 打印与保存 ---
         log_metrics = {

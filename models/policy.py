@@ -199,7 +199,16 @@ class EmbodiedGenPolicy(nn.Module):
     # [核心接口 4] Policy Gradient (PPO) 辅助评估
     # 与 algos/pg.py 完全对齐 (log_probs, entropy = self.policy.evaluate_actions(states, actions))
     # ========================================================================
-    def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def evaluate_actions(
+        self, 
+        obs: torch.Tensor, 
+        actions: torch.Tensor, 
+        state: Optional[torch.Tensor] = None, 
+        noise: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算代理似然估计
+        """        
         B = obs.shape[0]
         device = obs.device
         cond = self._get_condition(obs, state)
