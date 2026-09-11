@@ -27,6 +27,7 @@ from envs.maniskill_bridge import ManiSkillToRL100Wrapper
 from utils.eval_utils import evaluate_and_record_video
 from utils.debug_logger import DebugLogger
 from utils.normalizer import MinMaxNormalizer
+from utils.ppo_checks import configure_ppo_numerics, replay_diagnostics
 
 # =========================================================================
 # 桥接层 (Bridge Wrappers)
@@ -126,6 +127,7 @@ def scalar(x):
 
 @hydra.main(version_base=None, config_path='configs', config_name='train_online')
 def main(cfg: DictConfig):
+    configure_ppo_numerics()
     seed = int(cfg.seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -203,14 +205,17 @@ def main(cfg: DictConfig):
         np_state, py_state = np.random.get_state(), random.getstate()
         try:
             with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
-                evaluate_and_record_video(cfg, base_policy, epoch, device,
+                return evaluate_and_record_video(cfg, base_policy, epoch, device,
                                           normalizer=normalizer, seed=seed)
         finally:
             np.random.set_state(np_state)
             random.setstate(py_state)
             actor.eval()
 
-    video(0)  # baseline before ANY update, same evaluation path
+    baseline_metrics = video(0)  # same multi-episode evaluation before any update
+    debug_logger.log_metrics(0, baseline_metrics)
+    if cfg.wandb.enable:
+        wandb.log(baseline_metrics, step=0)
     env = make_env_ManiSkill(cfg)
     obs, _ = env.reset(seed=seed)
     buffer = RolloutBuffer(device)
@@ -224,6 +229,9 @@ def main(cfg: DictConfig):
             for step in tqdm(range(cfg.algo.steps_per_epoch), desc=f'Epoch {epoch} Rollout'):
                 obs_dict = encode(obs)
                 with torch.no_grad():
+                    # Frozen actor/reference encoders are identical. Cache the
+                    # exact rollout feature so PPO never recomputes its point grouping.
+                    obs_dict['cond'] = actor.encode_condition(obs_dict)
                     value = critic(obs_dict).item()
                     action, z, old_logp, old_mean = actor.sample_with_log_prob(obs_dict)
                     ref_mean = reference.mean(obs_dict, z)
@@ -245,6 +253,7 @@ def main(cfg: DictConfig):
                         gae_reward += trainer.gamma * critic(encode(next_obs)).item()
                 buffer.add(pc=obs_dict['pc'][0].cpu().numpy(),
                            state=obs_dict['state'][0].cpu().numpy(),
+                           cond=obs_dict['cond'][0].cpu().numpy(),
                            actions=raw_action, z=z[0].cpu().numpy(),
                            old_logp=old_logp.item(), old_mean=old_mean[0].cpu().numpy(),
                            ref_mean=ref_mean[0].cpu().numpy(), rewards=gae_reward,
@@ -265,62 +274,104 @@ def main(cfg: DictConfig):
             adv = (adv-adv.mean()) / (adv.std(unbiased=False)+1e-8)
             batch_size = int(cfg.algo.minibatch_size)
             n = len(adv)
-            # All samples, minibatched: old-policy likelihood must reproduce before update.
-            max_error = 0.0
-            with torch.no_grad():
-                for start in range(0, n, batch_size):
-                    sl = slice(start, start+batch_size)
-                    obs_batch = {'pc': data['pc'][sl], 'state': data['state'][sl]}
-                    
-                    # 以 Batch 模式重新计算当前的 old_logp, mean 以及 ref_mean
-                    lp, _, mean_val = actor.evaluate_actions(obs_batch, data['actions'][sl], data['z'][sl])
-                    ref_mean_val = reference.mean(obs_batch, data['z'][sl])
-                    
-                    err = (lp - data['old_logp'][sl]).abs().max().item()
-                    if not np.isfinite(err):
-                        raise FloatingPointError('Nonfinite old log-probability')
-                    max_error = max(max_error, err)
-                    
-                    # 💡 【核心修复】：直接用 Batched 计算结果覆盖 Rollout(Batch=1) 时的单样本结果！
-                    # 这样可以完美抵消掉所有由于 cuBLAS 批处理和 ODE 积分带来的正常浮点误差，
-                    # 确保 PPO 更新时 Importance Ratio 绝对从 1.0 开始！
-                    data['old_logp'][sl] = lp
-                    data['old_mean'][sl] = mean_val
-                    data['ref_mean'][sl] = ref_mean_val
+            # Preserve behavior logp, means and reference means exactly as sampled.
+            # This includes the autograd path used during an actual actor update.
+            initial = replay_diagnostics(
+                actor, data, batch_size, check=True,
+                logprob_tolerance=float(cfg.algo.logprob_tolerance),
+                initial_kl_tolerance=float(cfg.algo.initial_kl_tolerance))
 
-            metrics, count = {}, 0
+            records = []
             actor_enabled = epoch > cfg.algo.critic_warmup_epochs
+            stop_kl_value = None
+            first_kl = None
             for _ in range(cfg.algo.update_epochs):
-                for idx in np.array_split(np.random.permutation(n), max(1, (n+batch_size-1)//batch_size)):
+                indices = np.random.permutation(n)
+                for start in range(0, n, batch_size):
+                    idx = indices[start:start + batch_size]
                     losses = trainer.update_step(
-                        states={'pc': data['pc'][idx], 'state': data['state'][idx]},
+                        states={key: data[key][idx] for key in ('pc', 'state', 'cond')},
                         actions=data['actions'][idx], old_log_probs=data['old_logp'][idx],
                         returns=returns[idx], advantages=adv[idx], z=data['z'][idx],
                         old_mean=data['old_mean'][idx], ref_mean=data['ref_mean'][idx],
                         actor_enabled=actor_enabled)
+                    losses['batch_n'] = len(idx)
+                    if losses['actor_checked'] and first_kl is None:
+                        first_kl = losses['conditional_kl']
                     if losses['stop_actor']:
-                        actor_enabled = False  # remaining minibatches update critic only
-                    for key, val in losses.items():
-                        metrics[key] = metrics.get(key, 0.0)+val
-                    count += 1
-            metrics = {k: v/count for k, v in metrics.items()}
-            metrics.update({'Reward/EpochSum': epoch_reward,
-                            'PPO/old_logp_max_error': max_error,
-                            'Episodes/completed': len(finished_rewards)})
+                        actor_enabled = False
+                        stop_kl_value = losses['conditional_kl']
+                    records.append(losses)
+
+            active = [r for r in records if r['actor_updated']]
+            checked = [r for r in records if r['actor_checked']]
+            count, actor_updates = len(records), len(active)
+            def weighted_mean(rows, key):
+                return sum(r[key] * r['batch_n'] for r in rows) / sum(r['batch_n'] for r in rows)
+
+            metrics = {
+                'critic_loss': weighted_mean(records, 'critic_loss'),
+                'PPO/critic_grad_norm': weighted_mean(records, 'critic_grad_norm'),
+                'PPO/actor_updates': actor_updates,
+                'PPO/actor_update_fraction': actor_updates / count,
+                'PPO/actor_lr': trainer.optimizer_policy.param_groups[0]['lr'],
+                'PPO/old_logp_max_error': initial['logp_max_error'],
+                'PPO/old_mean_max_error': initial['mean_max_error'],
+                'KL/initial_mean': initial['kl_mean'],
+                'KL/initial_max': initial['kl_max'],
+                'Reward/EpochSum': epoch_reward,
+                'Episodes/completed': len(finished_rewards),
+            }
+            for key in ('stop_nonfinite', 'stop_kl', 'stop_ratio'):
+                metrics[f'PPO/{key}_count'] = int(sum(r[key] for r in records))
+            if active:
+                for source, dest in (
+                    ('actor_loss', 'actor_loss_active'),
+                    ('anchor_loss', 'anchor_loss_active'),
+                    ('actor_grad_norm', 'actor_grad_norm_active'),
+                    ('clipfrac', 'clipfrac_active')):
+                    metrics[f'PPO/{dest}'] = weighted_mean(active, source)
+            if checked:
+                metrics['KL/checked_mean'] = weighted_mean(checked, 'conditional_kl')
+                metrics['KL/checked_max'] = max(r['conditional_kl'] for r in checked)
+                metrics['KL/first_before_update'] = first_kl
+            if stop_kl_value is not None:
+                metrics['KL/trigger_at_stop'] = stop_kl_value
+
+            # Fixed, evenly spaced rollout subset; diagnostic only, no rollback.
+            monitor_n = min(n, int(cfg.algo.kl_monitor_size))
+            monitor_idx = torch.linspace(0, n - 1, monitor_n, device=device).long()
+            final = replay_diagnostics(actor, {k: v[monitor_idx] for k, v in data.items()}, batch_size)
+            metrics['KL/final_fixed_batch'] = final['kl_mean']
+            metrics['KL/final_max_sample'] = final['kl_max']
             if finished_rewards:
                 metrics['Reward/EpisodeMean'] = float(np.mean(finished_rewards))
                 metrics['Success/TrainEpisodeRate'] = float(np.mean(finished_successes))
-            if cfg.wandb.enable:
-                wandb.log(metrics, step=epoch)
-            debug_logger.log_metrics(epoch, metrics)
-            print(f'Epoch {epoch:03d} | Reward Sum: {epoch_reward:.2f} | '
-                  f'Actor: {metrics["actor_loss"]:.4f} | Critic: {metrics["critic_loss"]:.4f} | '
-                  f'Conditional KL: {metrics["conditional_kl"]:.6f}')
+
+            def fmt(value):
+                return 'N/A' if value is None else f'{value:.6f}'
+            print(
+                f'Epoch {epoch:03d} | Reward Sum: {epoch_reward:.2f} | '
+                f'Actor updates: {actor_updates}/{count} | '
+                f'Actor loss: {fmt(metrics.get("PPO/actor_loss_active"))} | '
+                f'Actor grad(pre-clip): {fmt(metrics.get("PPO/actor_grad_norm_active"))} | '
+                f'Critic: {metrics["critic_loss"]:.4f} | '
+                f'Old logp error: {initial["logp_max_error"]:.3e} | '
+                f'KL initial/stop/final: {initial["kl_mean"]:.3e}/'
+                f'{fmt(stop_kl_value)}/{final["kl_mean"]:.6f} | '
+                f'Episode reward: {fmt(metrics.get("Reward/EpisodeMean"))} | '
+                f'Train success: {fmt(metrics.get("Success/TrainEpisodeRate"))} | '
+                f'Stop KL/nonfinite/ratio: {metrics["PPO/stop_kl_count"]}/'
+                f'{metrics["PPO/stop_nonfinite_count"]}/{metrics["PPO/stop_ratio_count"]}'
+            )
             if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
                 # Compatible with existing evaluate.py; this is deployment, not resume state.
                 torch.save(base_policy.state_dict(),
                            os.path.join(ckpt_dir, f'pg_finetuned_ep{epoch}.pth'))
-                video(epoch)
+                metrics.update(video(epoch))
+            if cfg.wandb.enable:
+                wandb.log(metrics, step=epoch)
+            debug_logger.log_metrics(epoch, metrics)
     finally:
         env.close()
         if cfg.wandb.enable:
@@ -329,3 +380,4 @@ def main(cfg: DictConfig):
 
 if __name__ == '__main__':
     main()
+

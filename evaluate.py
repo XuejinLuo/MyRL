@@ -1,6 +1,7 @@
 # evaluate.py
 
 import os
+import random
 import time # 用于测试高频推理延迟
 import torch
 import numpy as np
@@ -18,6 +19,7 @@ from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 from envs.maniskill_bridge import ManiSkillToRL100Wrapper 
 from utils.normalizer import MinMaxNormalizer
+from utils.ppo_checks import configure_ppo_numerics
 from utils.eval_utils import RenderToNumpyWrapper 
 
 # =========================================================================
@@ -96,7 +98,7 @@ def make_env_ManiSkill(cfg):
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
-        max_episode_steps=400
+        max_episode_steps=int(cfg.env.get("max_episode_steps", 300))
     )
 
     if cfg.eval.get("record_video", False):
@@ -133,6 +135,7 @@ def make_env_ManiSkill(cfg):
 
 @hydra.main(version_base=None, config_path="configs", config_name="eval")
 def main(cfg: DictConfig):
+    configure_ppo_numerics()
     print("=" * 60)
     print("🚀 开始具身策略评估 (Evaluation)")
     print(OmegaConf.to_yaml(cfg))
@@ -208,6 +211,11 @@ def main(cfg: DictConfig):
     for ep in tqdm(range(cfg.eval.num_episodes), desc="Evaluating"):
         # 传入固定的 base_seed 以确保测试环境的一致性和可复现性
         base_seed = cfg.eval.get("seed", 42)
+        random.seed(base_seed + ep)
+        np.random.seed(base_seed + ep)
+        torch.manual_seed(base_seed + ep)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(base_seed + ep)
         obs, info = env.reset(seed=base_seed + ep)
 
         if not saved_first_pc:
@@ -247,6 +255,7 @@ def main(cfg: DictConfig):
 
             # (C) 转换为 NumPy 并去掉 Batch 维度 -> [chunk_size, action_dim]
             action_chunk_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
+            action_chunk_np = np.clip(action_chunk_np, -1.0, 1.0)
 
             # (D) 反归一化动作, 将动作反归一化回 ManiSkill 物理引擎的真实增量范围
             real_action_chunk = normalizer.unnormalize(action_chunk_np, 'action')

@@ -21,14 +21,20 @@ class FlowPPOPolicy(nn.Module):
         self.exec_steps = int(exec_steps)
         self.std = float(std)
 
+    @torch.no_grad()
+    def encode_condition(self, obs):
+        self.policy.encoder.eval()
+        return self.policy._get_condition(obs['pc'], obs['state']).detach()
+
     def mean(self, obs, z):
         # Encoder is frozen and stays in eval mode. ODE backbone retains gradients.
-        with torch.no_grad():
-            cond = self.policy._get_condition(obs['pc'], obs['state'])
+        cond = obs['cond'].detach() if 'cond' in obs else self.encode_condition(obs)
         x = z.detach()
         dt = 1.0 / self.num_steps
-        for i in range(self.num_steps):
-            t = torch.full((x.shape[0],), i * dt, device=x.device, dtype=x.dtype)
+        # Match OTFlowMatching.sample's inference time grid.
+        times = torch.linspace(0, 1.0 - dt, self.num_steps, device=x.device)
+        for t_val in times:
+            t = torch.full((x.shape[0],), t_val, device=x.device, dtype=x.dtype)
             x = x + dt * self.policy.backbone(x, t, cond)
         return x
 
@@ -52,3 +58,4 @@ class FlowPPOPolicy(nn.Module):
         logp = dist.log_prob(actions[:, :self.exec_steps].detach()).sum((-1, -2))
         entropy = dist.entropy().sum((-1, -2))
         return logp, entropy, mean
+

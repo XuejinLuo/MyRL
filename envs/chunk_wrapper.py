@@ -65,6 +65,7 @@ class ChunkActionWrapper(gym.Wrapper):
         done, truncated = False, False
         latest_obs = None
         latest_info = {}
+        success_any = False
         
         # [Fix] 记录实际执行的步数，防止因为 done/truncated 提前结束导致 global_step 错误
         actual_steps = 0
@@ -88,6 +89,7 @@ class ChunkActionWrapper(gym.Wrapper):
             total_reward += reward
             latest_obs = obs
             latest_info = info
+            success_any |= bool(info.get("success", False))
             actual_steps += 1
             
             if done or truncated:
@@ -103,6 +105,9 @@ class ChunkActionWrapper(gym.Wrapper):
             if t_g + self.chunk_size > self.global_step
         ]
         
+        latest_info = dict(latest_info)
+        latest_info["success"] = success_any
+        latest_info["actual_steps"] = actual_steps
         return latest_obs, total_reward, done, truncated, latest_info
 
     def _get_ensembled_action(self, target_t: int) -> np.ndarray:

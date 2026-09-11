@@ -1,5 +1,6 @@
 # utils/eval_utils.py
 import os
+import random
 import torch
 import numpy as np
 import gymnasium as gym
@@ -36,140 +37,104 @@ class RenderToNumpyWrapper(gym.Wrapper):
             frame = frame.astype(np.uint8)
             
         return frame
-def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, normalizer=None, seed: int = 42, max_steps: int = 300):
+def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device,
+                              normalizer=None, seed: int = 42, max_steps=None):
+    """Evaluate fixed environment/NumPy/Torch seed pairs; record a subset.
+
+    max_steps, when explicitly supplied, limits chunk decisions per episode.
+    Normally termination is controlled only by cfg.env.max_episode_steps.
+    Online training sets eval.num_episodes=20; legacy offline callers default
+    to one episode. All global RNG states are restored, even on exceptions.
+    Evaluation uses the deployment Flow policy without extra PPO Gaussian noise.
     """
-    独立且解耦的验证与录像接口
-    Args:
-        cfg: Hydra 传入的全局配置
-        policy: 当前训练的策略网络 (无需手动切换 eval 模式，内部会自动处理并还原)
-        epoch: 当前训练的 Epoch
-        device: 运行设备
-        seed: 环境随机种子，固定种子可以更好地观察模型在同一初始状态下的演进
-        max_steps: 强制截断步数，防止策略在早期未收敛时陷入死循环
-    """
-    print(f"\n🎬 正在为 Epoch {epoch} 进行 ManiSkill 验证测试并录制视频...")
-    
-    # 记录模型原本的模式，并在测试后还原
-    original_training_mode = policy.training 
+    eval_cfg = cfg.get('eval', {})
+    episodes = int(eval_cfg.get('num_episodes', 1))
+    if episodes < 1:
+        raise ValueError('eval.num_episodes must be positive')
+    record = bool(eval_cfg.get('record_video', True))
+    video_episodes = max(0, int(eval_cfg.get('video_episodes', 1)))
+    original_training_mode = policy.training
+    np_state, py_state = np.random.get_state(), random.getstate()
     policy.eval()
-    
-    # 清理显存，防止 ManiSkill 开启 RGB 渲染相机时导致 OOM
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
+    env = None
+    print(f'\nEvaluating epoch {epoch}: {episodes} fixed-seed episodes...')
     try:
-        env_id = cfg.env.get("env_id", "PushCube-v1") if "env" in cfg else "PushCube-v1"
-        obs_mode = cfg.env.get("obs_mode", "pointcloud") if "env" in cfg else "pointcloud"
-        control_mode = cfg.env.get("control_mode", "pd_ee_delta_pose") if "env" in cfg else "pd_ee_delta_pose"
-
-        # 1. 创建 ManiSkill 环境并强制开启录像支持 (rgb_array)
-        env = gym.make(
-            env_id,
-            obs_mode=obs_mode,
-            control_mode=control_mode, 
-            render_mode="rgb_array",
-            max_episode_steps=int(cfg.env.get("max_episode_steps", 300))
-        )
-        
-        # 2. 先挂载渲染类型转换 Wrapper
-        env = RenderToNumpyWrapper(env)
-        
-        # 3. 再挂载录制 Wrapper
-        video_folder = os.path.join(cfg.save_dir, "eval_videos", f"epoch_{epoch}")
-        os.makedirs(video_folder, exist_ok=True)
-        # episode_trigger=lambda x: True 表示逢 Episode 必录制
-        env = RecordVideo(env, video_folder=video_folder, episode_trigger=lambda x: True, disable_logger=True)
-        
-        # 4. 最后挂载数据对齐与状态 Wrapper
-        env = ManiSkillToRL100Wrapper(env)
-        
-        ws_bounds = np.array([[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
-        
-        # 动态提取配置 (兼容 offline 和 online 两套参数树结构)
-        num_points = cfg.env.num_points if "env" in cfg else cfg.dataset.n_points
-        exec_steps = cfg.env.exec_steps if "env" in cfg else 2
-        exp_weight = cfg.env.exp_weight if "env" in cfg else 0.01
-
-        if "env" in cfg and "workspace_bounds" in cfg.env:
-            bounds = cfg.env.workspace_bounds
-        elif "dataset" in cfg and "workspace_bounds" in cfg.dataset:
-            bounds = cfg.dataset.workspace_bounds
-        else:
-            bounds = [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]
-        ws_bounds = np.array(bounds)
-
-        use_color = cfg.env.use_color if "env" in cfg else cfg.dataset.get("use_color", False)
-        env = PointCloudObservationWrapper(
-            env=env, num_points=num_points, workspace_bounds=ws_bounds, use_color=use_color
-        )
-        env = ChunkActionWrapper(
-            env=env, chunk_size=cfg.model.chunk_size, exec_steps=exec_steps, exp_weight=exp_weight, use_ensembling=False
-        )
-        
-        # 4. 执行测试环境 Rollout
-        obs, _ = env.reset(seed=seed)
-        done, truncated = False, False
-        ep_reward = 0.0
-        success = False
-        step_count = 0
-        num_infer_steps = cfg.model.get("num_inference_steps", 10)
-        
-        while not (done or truncated) and step_count < max_steps:
-            # 点云零均值化
-            if normalizer is not None and hasattr(normalizer, 'center_point_cloud'):
-                pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
-            else:
-                pc_centered = obs['point_cloud']
-            # State 归一化
-            if normalizer is not None:
-                obs_state = normalizer.normalize(obs['state'], 'state')
-            else:
-                obs_state = obs['state']
-
-            # 观测转 Tensor
-            pc_tensor = torch.from_numpy(
-                np.ascontiguousarray(pc_centered)
-            ).float().unsqueeze(0).to(device)
-
-            state_tensor = torch.from_numpy(
-                np.ascontiguousarray(obs_state)
-            ).float().unsqueeze(0).to(device)
-
-            # Match training numerical precision; eval() already disables BN updates.
-            with torch.no_grad():
-                action_chunk = policy.sample(
-                    obs=pc_tensor, state=state_tensor, num_steps=num_infer_steps)
-
-            # 环境执行
-            action_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
-            action_np = np.clip(action_np, -1.0, 1.0)
-            if normalizer is not None:
-                real_action = normalizer.unnormalize(action_np, 'action')
-            else:
-                real_action = action_np
-            obs, reward, done, truncated, info = env.step(real_action)
-            
-            if hasattr(reward, 'item'):
-                reward = reward.item()
-            ep_reward += float(reward)
-            
-            if hasattr(done, 'item'):
-                done = done.item()
-            if hasattr(truncated, 'item'):
-                truncated = truncated.item()
-                
-            _succ = info.get('success', False)
-            if hasattr(_succ, 'item'):
-                _succ = _succ.item()
-            if _succ:
-                success = True
-            step_count += 1
-
-        print(f"✅ Epoch {epoch} 测试完成 | 总奖励: {ep_reward:.2f} | 是否成功: {success}")
-        print(f"🎞️ 视频已保存至: {video_folder}\n")
-
+        with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+            env = gym.make(
+                cfg.env.get('env_id', 'PushCube-v1'),
+                obs_mode=cfg.env.get('obs_mode', 'pointcloud'),
+                control_mode=cfg.env.get('control_mode', 'pd_ee_delta_pose'),
+                render_mode='rgb_array',
+                max_episode_steps=int(cfg.env.get('max_episode_steps', 300)))
+            if record and video_episodes:
+                env = RenderToNumpyWrapper(env)
+                folder = os.path.join(cfg.save_dir, 'eval_videos', f'epoch_{epoch}')
+                # RecordVideo creates its own folder; avoid misleading overwrite warnings.
+                env = RecordVideo(
+                    env, video_folder=folder,
+                    episode_trigger=lambda ep: ep < video_episodes,
+                    disable_logger=True)
+            env = ManiSkillToRL100Wrapper(env)
+            ws_bounds = np.asarray(cfg.env.workspace_bounds)
+            env = PointCloudObservationWrapper(
+                env=env, num_points=cfg.env.num_points,
+                workspace_bounds=ws_bounds, use_color=cfg.env.use_color)
+            env = ChunkActionWrapper(
+                env=env, chunk_size=cfg.model.chunk_size,
+                exec_steps=cfg.env.exec_steps, exp_weight=cfg.env.exp_weight,
+                use_ensembling=False)
+            rewards, successes = [], []
+            for ep in range(episodes):
+                ep_seed = int(seed) + ep
+                random.seed(ep_seed)
+                np.random.seed(ep_seed)
+                torch.manual_seed(ep_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(ep_seed)
+                obs, _ = env.reset(seed=ep_seed)
+                done, truncated, success = False, False, False
+                ep_reward, decisions = 0.0, 0
+                while not (done or truncated):
+                    if max_steps is not None and decisions >= max_steps:
+                        break
+                    pc, state = obs['point_cloud'], obs['state']
+                    if normalizer is not None:
+                        pc = normalizer.center_point_cloud(pc, ws_bounds)
+                        state = normalizer.normalize(state, 'state')
+                    pc_t = torch.as_tensor(np.ascontiguousarray(pc), dtype=torch.float32,
+                                           device=device).unsqueeze(0)
+                    state_t = torch.as_tensor(np.ascontiguousarray(state), dtype=torch.float32,
+                                              device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        action = policy.sample(
+                            obs=pc_t, state=state_t,
+                            num_steps=cfg.model.get('num_inference_steps', 10))
+                    action = np.clip(action[0].cpu().float().numpy(), -1.0, 1.0)
+                    if normalizer is not None:
+                        action = normalizer.unnormalize(action, 'action')
+                    obs, reward, done, truncated, info = env.step(action)
+                    ep_reward += float(reward.item() if hasattr(reward, 'item') else reward)
+                    done, truncated = bool(done), bool(truncated)
+                    success |= bool(info.get('success', False))
+                    decisions += 1
+                rewards.append(ep_reward)
+                successes.append(float(success))
+            result = {
+                'Eval/RewardMean': float(np.mean(rewards)),
+                'Eval/RewardStd': float(np.std(rewards)),
+                'Eval/SuccessRate': float(np.mean(successes)),
+                'Eval/Episodes': episodes,
+            }
+            print(f'Epoch {epoch} eval | Reward: {result["Eval/RewardMean"]:.2f} '
+                  f'+/- {result["Eval/RewardStd"]:.2f} | '
+                  f'Success: {int(sum(successes))}/{episodes} '
+                  f'({result["Eval/SuccessRate"]:.1%})')
+            return result
     finally:
-        # 6. 安全清理 (确保发生异常也会关闭环境并还原模型状态)
-        if 'env' in locals():
-            env.close()
-        policy.train(original_training_mode)
+        try:
+            if env is not None:
+                env.close()
+        finally:
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+            policy.train(original_training_mode)
