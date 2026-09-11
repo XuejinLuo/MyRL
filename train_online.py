@@ -248,7 +248,10 @@ def main(cfg: DictConfig):
     for epoch in range(1, cfg.epochs + 1):
         buffer.clear()
         epoch_reward = 0.0
-        
+        successes = 0             # 累计成功次数
+        episodes_completed = 0    # 发生 done 或 truncate 的完整回合数
+        step_values = []          # 收集每一步 Critic 的预期价值预测
+
         # --- A. 轨迹收集阶段 (Rollout) ---
         actor.eval()
         critic.eval()
@@ -275,6 +278,13 @@ def main(cfg: DictConfig):
             action_np = action_chunk.squeeze(0).cpu().numpy()
             real_action = normalizer.unnormalize(action_np, 'action')
             next_obs, reward, done, truncated, info = env.step(real_action)
+
+            _succ = info.get('success', False)
+            if hasattr(_succ, 'item'): _succ = _succ.item()
+            if _succ:
+                successes += 1
+            if done_val or trunc_val:
+                episodes_completed += 1
 
             reward_val = float(reward.item() if hasattr(reward, 'item') else reward)
             done_val = bool(done.item() if hasattr(done, 'item') else done)
@@ -304,6 +314,7 @@ def main(cfg: DictConfig):
         advantages, returns = trainer.compute_gae(
             rollout_data['rewards'], rollout_data['values'], rollout_data['dones'], next_value
         )
+        mean_return = returns.mean().item()
         
         # PPO Trick: Advantage 归一化 (极大提升微调稳定性)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -348,13 +359,22 @@ def main(cfg: DictConfig):
             epoch_losses[k] /= cfg.algo.update_epochs
 
         # --- D. 打印与保存 ---
-        log_metrics = {**epoch_losses, "Reward/Epoch": epoch_reward}
+        log_metrics = {
+            "Env/Reward": epoch_reward,
+            "Env/Success_Count": successes,
+            "Env/Episodes_Done": episodes_completed,
+            "Value/Mean_V_Pred": np.mean(step_values),
+            "Value/Mean_Return": mean_return,
+            **epoch_losses  # 这里自动包含了 ppo/approx_kl 等指标
+        }
         if cfg.wandb.enable:
             wandb.log(log_metrics, step=epoch)
         debug_logger.log_metrics(epoch, log_metrics)
             
-        print(f"Epoch {epoch:03d} | Avg Reward: {epoch_reward:.2f} | Actor Loss: {epoch_losses['actor_loss']:.4f} | Critic Loss: {epoch_losses['critic_loss']:.4f}")
-
+        print(f"Epoch {epoch:03d} | Rew: {epoch_reward:.1f} | Succ: {successes} | "
+              f"V_Pred: {np.mean(step_values):.2f} | KL: {epoch_losses.get('ppo/approx_kl',0):.4f} | "
+              f"EV: {epoch_losses.get('ppo/explained_var',0):.3f}")
+        
         if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
             ckpt_dir = os.path.join(cfg.save_dir, "checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)

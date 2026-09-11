@@ -83,6 +83,16 @@ class FlowPolicyGradient:
         log_ratio = log_probs - old_log_probs
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=5.0) 
         ratio = torch.exp(log_ratio)
+
+        with torch.no_grad():
+            # 1. 近似 KL 散度 (使用更稳健的近似法)
+            approx_kl = torch.mean((ratio - 1.0) - log_ratio).item()
+            # 2. 截断率
+            clip_fraction = torch.mean((torch.abs(ratio - 1.0) > self.clip_ratio).float()).item()
+            # 3. 解释方差 (Explained Variance)
+            var_y = torch.var(returns)
+            explained_var = 1.0 - torch.var(returns - values) / (var_y + 1e-8)
+            explained_var = explained_var.item()
         
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
@@ -118,10 +128,12 @@ class FlowPolicyGradient:
         self.optimizer_critic.step()
         
         return {
-            "actor_loss": actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "entropy": entropy_loss.item(),
-            "total_loss": total_loss.item()
+            "loss/actor": actor_loss.item(),
+            "loss/critic": critic_loss.item(),
+            "loss/entropy": entropy_loss.item(),
+            "ppo/approx_kl": approx_kl,            # <-- 监控: 新旧策略偏差
+            "ppo/clip_frac": clip_fraction,        # <-- 监控: 截断比例
+            "ppo/explained_var": explained_var,    # <-- 监控: Critic 拟合度
         }
 
 
