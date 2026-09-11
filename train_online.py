@@ -65,12 +65,13 @@ class Policy_PG_Wrapper(nn.Module):
         super().__init__()
         self.policy = policy
         
-    def evaluate_actions(self, obs_dict, actions):
+    def evaluate_actions(self, obs_dict, actions, noise=None):
         # 匹配 algos/pg.py 中 trainer.update_step 的调用
         log_prob_proxy, entropy = self.policy.evaluate_actions(
             obs=obs_dict['pc'], 
             actions=actions, 
-            state=obs_dict['state']
+            state=obs_dict['state'],
+            noise=noise
         )
         # 这里加入一个经验放缩系数，将 MSE 转化为合理的似然差异，激活 PPO 裁剪机制。
         scale_factor = 10.0 
@@ -192,6 +193,8 @@ def main(cfg: DictConfig):
             print(f"✅ 成功加载环境归一化参数: {stats_path}")
         else:
             print(f"⚠️ 警告: 找不到归一化文件 {stats_path}，使用默认空 Normalizer!")
+        critic_encoder.encoder.load_state_dict(base_policy.encoder.state_dict())
+        print("✅ 成功将 Actor 的预训练 3D 编码器权重同步给 Critic！")
     else:
         print("⚠️ 警告: 未提供预训练权重路径(pretrained_ckpt)，Normalizer将为空!")
     bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
@@ -272,19 +275,13 @@ def main(cfg: DictConfig):
                 # 策略前向生成动作 Chunk
                 action_chunk = actor.sample(obs_dict, num_steps=cfg.model.num_inference_steps)
 
+            step_values.append(value)
             debug_logger.log_io(epoch, step, obs_dict, action_chunk)
 
             # 环境执行 (转换为 numpy)
             action_np = action_chunk.squeeze(0).cpu().numpy()
             real_action = normalizer.unnormalize(action_np, 'action')
             next_obs, reward, done, truncated, info = env.step(real_action)
-
-            _succ = info.get('success', False)
-            if hasattr(_succ, 'item'): _succ = _succ.item()
-            if _succ:
-                successes += 1
-            if done_val or trunc_val:
-                episodes_completed += 1
 
             reward_val = float(reward.item() if hasattr(reward, 'item') else reward)
             done_val = bool(done.item() if hasattr(done, 'item') else done)
@@ -297,6 +294,13 @@ def main(cfg: DictConfig):
             obs = next_obs
             if done_val or trunc_val:
                 obs, _ = env.reset()
+
+            _succ = info.get('success', False)
+            if hasattr(_succ, 'item'): _succ = _succ.item()
+            if _succ:
+                successes += 1
+            if done_val or trunc_val:
+                episodes_completed += 1
                 
         # --- B. 计算 GAE 与 Returns ---
         rollout_data = buffer.get_tensors()
@@ -336,9 +340,10 @@ def main(cfg: DictConfig):
         flat_adv = advantages.view(-1)
         flat_returns = returns.view(-1)
 
-        # 事先计算 old_log_probs
+        fixed_noise = torch.randn_like(flat_actions)
+
         with torch.no_grad():
-            old_log_probs, _ = actor.evaluate_actions(flat_obs_dict, flat_actions)
+            old_log_probs, _ = actor.evaluate_actions(flat_obs_dict, flat_actions, noise=fixed_noise)
 
         # PPO 循环微调
         epoch_losses = {}
@@ -348,7 +353,8 @@ def main(cfg: DictConfig):
                 actions=flat_actions, 
                 old_log_probs=old_log_probs, 
                 returns=flat_returns, 
-                advantages=flat_adv
+                advantages=flat_adv,
+                noise=fixed_noise
             )
             
             for k, v in loss_dict.items():

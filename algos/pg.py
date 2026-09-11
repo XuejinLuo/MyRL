@@ -65,7 +65,7 @@ class FlowPolicyGradient:
         returns = advantages + values
         return advantages, returns
 
-    def update_step(self, states, actions, old_log_probs, returns, advantages):
+    def update_step(self, states, actions, old_log_probs, returns, advantages, noise=None):
         """
         执行一次 PG/PPO 网络更新
         states: 3D Point Cloud [B, N, C]
@@ -74,7 +74,7 @@ class FlowPolicyGradient:
         # 1. 评估当前策略下该动作的 log_prob 和 熵 (Entropy)
         # 注意: 对于 Flow/Diffusion, 这里内部可能会使用 Hutchinson 迹估计(CNF) 
         # 或者沿着去噪轨迹计算 per-step log_prob 累加 (类似 DDPO)。
-        log_probs, entropy = self.policy.evaluate_actions(states, actions)
+        log_probs, entropy = self.policy.evaluate_actions(states, actions, noise=noise)
         
         # 2. 评估当前状态的 Value
         values = self.critic(states).squeeze(-1)

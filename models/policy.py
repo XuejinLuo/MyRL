@@ -200,44 +200,30 @@ class EmbodiedGenPolicy(nn.Module):
     # 与 algos/pg.py 完全对齐 (log_probs, entropy = self.policy.evaluate_actions(states, actions))
     # ========================================================================
     def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        【硬核提醒】计算 Flow/Diffusion 的精确 log_prob 需要解常微分方程(ODE)的迹，计算极慢。
-        在现代具身 RL 中 (如 DP3/RL-100)，PG 微调通常采用 "Denoising MSE 代理似然" 
-        或者直接通过 "Gaussian Proxy" 计算。
-        这里我们实现了一个基于 Denoising Error 的 Proxy Log-Prob，这不仅快，而且梯度稳定。
-        """
         B = obs.shape[0]
         device = obs.device
         cond = self._get_condition(obs, state)
         
-        # [Fix: PPO 稳定性危机] - PG 中的 evaluate_actions 多个 Epoch 会评测同样的 (s,a)。
-        # 如果使用随机 noise = torch.randn_like(actions)，每次算出的 log_prob 都会剧烈震荡，
-        # 导致 PPO 的 Ratio 疯狂触发错误 Clip。必须使用确定性（Deterministic）的 Proxy！
-        # 我们用全 0 Tensor 作为恒定的代理扰动起点。
-        deterministic_noise = torch.zeros_like(actions)
+        if noise is None:
+            noise = torch.randn_like(actions)
 
-        # 我们使用一个固定的居中时间步 (如 t=0.5) 评估一步去噪误差作为似然的代理
         if self.algo_type == "flow":
             t_fixed = torch.full((B,), 0.5, device=device)
-            # Flow 的 target 速度公式 [修复：传入确定性噪声]
-            xt = (1 - (1 - 1e-5) * t_fixed.view(B, 1, 1)) * deterministic_noise + t_fixed.view(B, 1, 1) * actions
-            target_v = actions - (1 - 1e-5) * deterministic_noise
+            # 👉 换成传入的 noise，恢复正常的分布方差
+            xt = (1 - (1 - 1e-5) * t_fixed.view(B, 1, 1)) * noise + t_fixed.view(B, 1, 1) * actions
+            target_v = actions - (1 - 1e-5) * noise
             pred_v = self.backbone(xt, t_fixed, cond)
             
-            # 使用 MSE 作为负对数似然的代理 (代理高斯分布)
             mse_error = torch.mean((pred_v - target_v) ** 2, dim=(-1, -2)) 
             log_prob = -mse_error 
-            
-            # 启发式 Entropy (防止方差坍缩)
-            entropy = torch.ones_like(log_prob) * 1.0 # 占位，或者返回 action_var
+            entropy = torch.ones_like(log_prob) * 1.0 
             
         else: # diffusion
             t_fixed = torch.full((B,), self.scheduler.num_train_timesteps // 2, device=device, dtype=torch.long)
-            # [修复：传入确定性噪声]
-            xt = self.scheduler.add_noise(actions, deterministic_noise, t_fixed)
+            xt = self.scheduler.add_noise(actions, noise, t_fixed)
             pred_noise = self.backbone(xt, t_fixed, cond)
             
-            mse_error = torch.mean((pred_noise - deterministic_noise) ** 2, dim=(-1, -2))
+            mse_error = torch.mean((pred_noise - noise) ** 2, dim=(-1, -2))
             log_prob = -mse_error
             entropy = torch.ones_like(log_prob) * 1.0
             
