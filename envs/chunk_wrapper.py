@@ -21,6 +21,8 @@ class ChunkActionWrapper(gym.Wrapper):
                            公式: weight = exp(-exp_weight * age)
         """
         super().__init__(env)
+        if not 1 <= exec_steps <= chunk_size:
+            raise ValueError("Require 1 <= exec_steps <= chunk_size")
         self.chunk_size = chunk_size
         self.exec_steps = exec_steps
         self.exp_weight = exp_weight
@@ -68,6 +70,8 @@ class ChunkActionWrapper(gym.Wrapper):
         
         # [Fix] 记录实际执行的步数，防止因为 done/truncated 提前结束导致 global_step 错误
         actual_steps = 0
+        success_any = False
+        executed_actions = []
 
         # 在环境中连续执行 exec_steps 步
         for i in range(self.exec_steps):
@@ -85,6 +89,8 @@ class ChunkActionWrapper(gym.Wrapper):
             # 丢给真实环境去执行
             obs, reward, done, truncated, info = self.env.step(action_to_execute)
             
+            success_any = success_any or bool(info.get("success", False))
+            executed_actions.append(np.array(action_to_execute, copy=True))
             total_reward += reward
             latest_obs = obs
             latest_info = info
@@ -103,6 +109,10 @@ class ChunkActionWrapper(gym.Wrapper):
             if t_g + self.chunk_size > self.global_step
         ]
         
+        latest_info = dict(latest_info)
+        latest_info["success_any"] = success_any
+        latest_info["actual_steps"] = actual_steps
+        latest_info["executed_actions"] = np.asarray(executed_actions)
         return latest_obs, total_reward, done, truncated, latest_info
 
     def _get_ensembled_action(self, target_t: int) -> np.ndarray:
