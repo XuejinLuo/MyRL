@@ -71,48 +71,37 @@ class FlowPolicyGradient:
         states: 3D Point Cloud [B, N, C]
         actions: Chunk Actions [B, Chunk_Size, Action_Dim]
         """
-        # 1. 评估当前策略下该动作的 log_prob 和 熵 (Entropy)
-        # 注意: 对于 Flow/Diffusion, 这里内部可能会使用 Hutchinson 迹估计(CNF) 
-        # 或者沿着去噪轨迹计算 per-step log_prob 累加 (类似 DDPO)。
-        log_probs, entropy = self.policy.evaluate_actions(states, actions, noise=noise)
-        
-        # 2. 评估当前状态的 Value
+        # 1. 评估当前状态的 Value (Critic)
         values = self.critic(states).squeeze(-1)
         
-        # 3. 计算 Actor Loss (PPO Clip机制)
-        log_ratio = log_probs - old_log_probs
-        log_ratio = torch.clamp(log_ratio, min=-20.0, max=5.0) 
-        ratio = torch.exp(log_ratio)
-
+        # 2. 获取策略网络的 Flow MSE Loss (每个样本的独立 Loss)
+        # 这里的 flow_mse 其实是我们要最小化的目标
+        flow_mse, _ = self.policy.evaluate_actions(states, actions, noise=noise)
+        
         with torch.no_grad():
-            # 1. 近似 KL 散度 (使用更稳健的近似法)
-            approx_kl = torch.mean((ratio - 1.0) - log_ratio).item()
-            # 2. 截断率
-            clip_fraction = torch.mean((torch.abs(ratio - 1.0) > self.clip_ratio).float()).item()
-            # 3. 解释方差 (Explained Variance)
             var_y = torch.var(returns)
             explained_var = 1.0 - torch.var(returns - values) / (var_y + 1e-8)
             explained_var = explained_var.item()
-        
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
-        
-        # 将 Actor 的 Loss 分开处理，如果是导致发散的负优势，限制其对 MSE 的无限推远
-        actor_loss_raw = -torch.min(surr1, surr2)
 
-        # 彻底丢弃负优势的样本，只保留好的行为进行梯度更新
-        mask = (advantages >= 0).float()
-        # 使用 sum 除以有效样本数，防止全负 batch 导致 0 除问题
-        actor_loss = (actor_loss_raw * mask).sum() / (mask.sum() + 1e-8)
+        mask = (advantages >= 0.0).float()
+        
+        # 兜底策略：如果这批数据全军覆没，保留 advantage 最大的那个，防止 loss 报 NaN
+        if mask.sum() == 0:
+            mask[torch.argmax(advantages)] = 1.0
+            
+        # 限制指数爆炸，降低 beta
+        beta = 1.0 
+        # 限制最大 Advantage 乘数不超过 e^2 ≈ 7.4
+        adv_weights = torch.exp(beta * torch.clamp(advantages, max=2.0))
+        
+        # 仅对被 mask 选中的正优势样本进行加权 MSE 更新
+        actor_loss = torch.sum(mask * adv_weights.detach() * flow_mse) / mask.sum()
         
         # 4. 计算 Critic Loss (MSE)
         critic_loss = F.mse_loss(values, returns)
         
-        # 5. 计算 Entropy Bonus (鼓励探索)
-        entropy_loss = entropy.mean()
-        
-        # 6. 总 Loss
-        total_loss = actor_loss + self.v_loss_coef * critic_loss - self.entropy_coef * entropy_loss
+        # 5. 总 Loss
+        total_loss = actor_loss + self.v_loss_coef * critic_loss
         
         # --- 梯度反向传播与更新 ---
         self.optimizer_policy.zero_grad()
@@ -120,7 +109,6 @@ class FlowPolicyGradient:
         
         total_loss.backward()
         
-        # 梯度裁剪防爆 (Flow 模型的梯度容易出现尖峰)
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         
@@ -130,10 +118,10 @@ class FlowPolicyGradient:
         return {
             "loss/actor": actor_loss.item(),
             "loss/critic": critic_loss.item(),
-            "loss/entropy": entropy_loss.item(),
-            "ppo/approx_kl": approx_kl,            # <-- 监控: 新旧策略偏差
-            "ppo/clip_frac": clip_fraction,        # <-- 监控: 截断比例
-            "ppo/explained_var": explained_var,    # <-- 监控: Critic 拟合度
+            "loss/entropy": 0.0,
+            "ppo/approx_kl": flow_mse.mean().item(), # 借用这个字段记录 Flow MSE 的均值
+            "ppo/clip_frac": 0.0,
+            "ppo/explained_var": explained_var,
         }
 
 

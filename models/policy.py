@@ -197,7 +197,6 @@ class EmbodiedGenPolicy(nn.Module):
 
     # ========================================================================
     # [核心接口 4] Policy Gradient (PPO) 辅助评估
-    # 与 algos/pg.py 完全对齐 (log_probs, entropy = self.policy.evaluate_actions(states, actions))
     # ========================================================================
     def evaluate_actions(
         self, 
@@ -207,7 +206,7 @@ class EmbodiedGenPolicy(nn.Module):
         noise: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        计算代理似然估计
+        在线强化微调的回归评估。返回每个样本的 Vector Field MSE
         """        
         B = obs.shape[0]
         device = obs.device
@@ -217,27 +216,27 @@ class EmbodiedGenPolicy(nn.Module):
             noise = torch.randn_like(actions)
 
         if self.algo_type == "flow":
-            t_fixed = torch.full((B,), 0.5, device=device)
-            # 👉 换成传入的 noise，恢复正常的分布方差
-            xt = (1 - (1 - 1e-5) * t_fixed.view(B, 1, 1)) * noise + t_fixed.view(B, 1, 1) * actions
-            target_v = actions - (1 - 1e-5) * noise
-            pred_v = self.backbone(xt, t_fixed, cond)
+            # 随机采样 t，保护整个向量场不被破坏
+            t = torch.rand((B,), device=device) * (1.0 - 2e-5) + 1e-5
+            t_expand = t.view(-1, 1, 1)
             
+            xt = (1 - (1 - 1e-5) * t_expand) * noise + t_expand * actions
+            target_v = actions - (1 - 1e-5) * noise
+            pred_v = self.backbone(xt, t, cond)
+            
+            # 保持 [B] 的维度，不求平均
             mse_error = torch.mean((pred_v - target_v) ** 2, dim=(-1, -2)) 
-            log_prob = -mse_error 
-            entropy = torch.ones_like(log_prob) * 1.0 
+            
+            return mse_error, torch.zeros_like(mse_error) # 返回 MSE 和 占位用的 Entropy
             
         else: # diffusion
-            t_fixed = torch.full((B,), self.scheduler.num_train_timesteps // 2, device=device, dtype=torch.long)
-            xt = self.scheduler.add_noise(actions, noise, t_fixed)
-            pred_noise = self.backbone(xt, t_fixed, cond)
+            # DDPM 同理，随机采样 t
+            t = torch.randint(0, self.scheduler.num_train_timesteps, (B,), device=device).long()
+            xt = self.scheduler.add_noise(actions, noise, t)
+            pred_noise = self.backbone(xt, t, cond)
             
             mse_error = torch.mean((pred_noise - noise) ** 2, dim=(-1, -2))
-            log_prob = -mse_error
-            entropy = torch.ones_like(log_prob) * 1.0
-            
-        return log_prob, entropy
-
+            return mse_error, torch.zeros_like(mse_error)
 
 
 # ==============================================================================

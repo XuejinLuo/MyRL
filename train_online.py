@@ -338,22 +338,6 @@ def main(cfg: DictConfig):
         dataset_size = flat_returns.size(0)
         mini_batch_size = cfg.get("batch_size", 32) 
 
-        fixed_noise = torch.randn_like(flat_actions)
-
-        old_log_probs_list = []
-        with torch.no_grad():
-            for i in range(0, dataset_size, mini_batch_size):
-                mb_pc = flat_pc[i : i + mini_batch_size]
-                mb_state = flat_state[i : i + mini_batch_size]
-                mb_actions = flat_actions[i : i + mini_batch_size]
-                mb_noise = fixed_noise[i : i + mini_batch_size]
-                
-                mb_obs_dict = {'pc': mb_pc, 'state': mb_state}
-                mb_old_log_prob, _ = actor.evaluate_actions(mb_obs_dict, mb_actions, noise=mb_noise)
-                old_log_probs_list.append(mb_old_log_prob)
-                
-        old_log_probs = torch.cat(old_log_probs_list, dim=0)
-
         # PPO 循环微调
         epoch_losses = {}
         total_updates = 0
@@ -369,18 +353,16 @@ def main(cfg: DictConfig):
                     'state': flat_state[mb_inds]
                 }
                 mb_actions = flat_actions[mb_inds]
-                mb_old_log_probs = old_log_probs[mb_inds]
                 mb_returns = flat_returns[mb_inds]
                 mb_adv = flat_adv[mb_inds]
-                mb_noise = fixed_noise[mb_inds]
                 
                 loss_dict = trainer.update_step(
                     states=mb_obs_dict, 
                     actions=mb_actions, 
-                    old_log_probs=mb_old_log_probs, 
+                    old_log_probs=None,      # AWR 不需要 old_log_probs，直接传 None
                     returns=mb_returns, 
                     advantages=mb_adv,
-                    noise=mb_noise
+                    noise=None               # 设为 None，强制让 evaluate_actions 内部随机采样全新的 noise
                 )
                 
                 for k, v in loss_dict.items():

@@ -5,7 +5,7 @@ TARGET_DIR = "."              # 你要扫描的代码库文件夹路径，"." �
 OUTPUT_FILE = "outputs/llm_prompt.txt" # 输出的文本文件名
 
 # 允许提取内容的文件后缀
-ALLOWED_EXTENSIONS = {'.py', '.yaml', '.yml'}
+ALLOWED_EXTENSIONS = {'.py', '.yaml', '.yml', '.md'}
 
 # 生成文件树和遍历时需要忽略的常见无关文件夹
 IGNORE_DIRS = {

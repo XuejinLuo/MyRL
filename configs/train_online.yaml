@@ -11,7 +11,7 @@ defaults:
 run_name: "pg_finetune_flow_${env.env_id}"  # 建议后缀加上任务名，方便在 wandb 中区分
 seed: 42
 device: "cuda"
-epochs: 30
+epochs: 50
 save_dir: "./outputs/online"
 save_epoch: 10          # 每隔 10 个 Epoch 保存一次权重并录制验证视频
 
@@ -28,9 +28,9 @@ algo:
   critic_lr: 3e-4        # Critic 价值网络是全新初始化的，需要较大的学习率快速收敛
   
   # 强化学习微调超参
-  entropy_coef: 0.01     # 熵系数：如果发现机械臂在环境中很快陷入死锁不探索，可微微调大至 0.02
+  entropy_coef: 0.0    # 熵系数：如果发现机械臂在环境中很快陷入死锁不探索，可微微调大至 0.02
   steps_per_epoch: 600    # 每次 PPO 网络更新前，在环境中 Rollout 收集的步数
-  update_epochs: 6       # 收集完数据后，PPO 网络内部循环微调的次数
+  update_epochs: 2       # 收集完数据后，PPO 网络内部循环微调的次数
 
 wandb:
   enable: true
