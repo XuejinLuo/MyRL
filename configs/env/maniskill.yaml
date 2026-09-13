@@ -9,6 +9,7 @@ num_points: 1024
 use_color: true
 exec_steps: 2
 exp_weight: 0.01
+max_episode_steps: 300
 
 # 工作空间裁剪范围 (桌面操作)
 workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]

@@ -1,105 +1,12 @@
 # algos/idql.py
+"""IDQL 更新逻辑；策略和 Q/V 网络由训练入口传入。"""
+
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import copy
 
-# ============================================================================
-# 1. Mock 模块 (在你的真实 Infra 中，这些将被 pointnext.py 和 policy.py 替换)
-# ============================================================================
-
-class MockPointEncoder(nn.Module):
-    """ 简易的点云编码器 (替代 PointNeXt/PointNet++) """
-    def __init__(self, in_channels=3, feature_dim=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_channels, 64),
-            nn.ReLU(),
-            nn.Linear(64, feature_dim)
-        )
-    def forward(self, pc):
-        # pc shape: [B, N, C]
-        features = self.net(pc)           # [B, N, feature_dim]
-        global_feature = features.max(dim=1)[0] # Max Pooling -> [B, feature_dim]
-        return global_feature
-
-class MockFlowDiffusionPolicy(nn.Module):
-    """ 简易的 Flow/Diffusion 策略 (用于占位) """
-    def __init__(self, pc_feature_dim=256, chunk_size=16, action_dim=7):
-        super().__init__()
-        self.encoder = MockPointEncoder(3, pc_feature_dim)
-        # 假设这是一个条件生成模型，这里只 Mock 它的 Loss 计算过程
-        self.mock_net = nn.Sequential(
-            nn.Linear(pc_feature_dim + chunk_size * action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-    
-    def compute_loss(self, states, actions):
-        """ Flow/Diffusion 的前向 Loss 计算 (如 Flow Matching Loss 或 DDPM Denoise Loss) """
-        state_feat = self.encoder(states)       # [B, F]
-        action_flat = actions.view(actions.size(0), -1) # [B, Chunk * A_dim]
-        x = torch.cat([state_feat, action_flat], dim=-1)
-        # Mock loss: 让网络输出逼近 0
-        pred_noise = self.mock_net(x)
-        loss = F.mse_loss(pred_noise, torch.zeros_like(pred_noise))
-        return loss
-
-# ============================================================================
-# 2. IDQL 核心网络组件 (Critic & Value)
-# ============================================================================
-
-class ValueNetwork(nn.Module):
-    def __init__(self, pc_dim=3, feature_dim=256):
-        super().__init__()
-        self.encoder = MockPointEncoder(pc_dim, feature_dim)
-        self.v_net = nn.Sequential(
-            nn.Linear(feature_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, state):
-        feat = self.encoder(state)
-        return self.v_net(feat)
-
-class TwinQNetwork(nn.Module):
-    def __init__(self, pc_dim=3, chunk_size=16, action_dim=7, feature_dim=256):
-        super().__init__()
-        self.encoder = MockPointEncoder(pc_dim, feature_dim)
-        
-        # Q1 Network
-        self.q1_net = nn.Sequential(
-            nn.Linear(feature_dim + chunk_size * action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-        
-        # Q2 Network
-        self.q2_net = nn.Sequential(
-            nn.Linear(feature_dim + chunk_size * action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, state, action_chunk):
-        feat = self.encoder(state)
-        action_flat = action_chunk.view(action_chunk.size(0), -1)
-        x = torch.cat([feat, action_flat], dim=-1)
-        
-        q1 = self.q1_net(x)
-        q2 = self.q2_net(x)
-        return q1, q2
-
-# ============================================================================
-# 3. IDQL 算法核心类
-# ============================================================================
 
 class IDQL:
     """ 
@@ -216,57 +123,3 @@ class IDQL:
             "accept_ratio": keep_mask.float().mean().item(),
             "adv_mean": adv.mean().item()
         }
-
-# ============================================================================
-# 4. 测试与验证 (直接运行本文件)
-# ============================================================================
-if __name__ == "__main__":
-    print("🚀 启动 IDQL (Point Cloud + Action Chunk) 架构验证...")
-    
-    # --- 参数设定 ---
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    BATCH_SIZE = 32
-    NUM_POINTS = 1024
-    PC_DIM = 3            # (X, Y, Z)
-    CHUNK_SIZE = 16       # Action Chunk 长度 (Temporal Window)
-    ACTION_DIM = 7        # 机器人动作维度 (如 6 DoF + 1 Gripper)
-    FEATURE_DIM = 128     # 点云提取后的特征维度
-    
-    # --- 初始化网络组件 ---
-    actor = MockFlowDiffusionPolicy(FEATURE_DIM, CHUNK_SIZE, ACTION_DIM)
-    v_net = ValueNetwork(PC_DIM, FEATURE_DIM)
-    q_net = TwinQNetwork(PC_DIM, CHUNK_SIZE, ACTION_DIM, FEATURE_DIM)
-    
-    # --- 初始化 IDQL Agent ---
-    agent = IDQL(
-        actor=actor,
-        q_network=q_net,
-        v_network=v_net,
-        device=DEVICE
-    )
-    
-    # --- 生成 Dummy 数据 ---
-    print("\n📦 生成 Batch 数据...")
-    states = torch.randn(BATCH_SIZE, NUM_POINTS, PC_DIM).to(DEVICE)
-    next_states = torch.randn(BATCH_SIZE, NUM_POINTS, PC_DIM).to(DEVICE)
-    actions = torch.randn(BATCH_SIZE, CHUNK_SIZE, ACTION_DIM).to(DEVICE)
-    rewards = torch.rand(BATCH_SIZE, 1).to(DEVICE)
-    dones = torch.zeros(BATCH_SIZE, 1).to(DEVICE)
-    
-    print(f"  > States Shape: {states.shape}")
-    print(f"  > Actions Shape: {actions.shape}")
-    
-    # --- 运行一次离线 Q/V 网络更新 (Critic Step) ---
-    print("\n🔄 [Step 1] 测试 Critic & Value (IQL Expectile Regression) 更新...")
-    critic_info = agent.update_critic(states, actions, rewards, next_states, dones)
-    print(f"  ✅ Q Loss: {critic_info['q_loss']:.4f}")
-    print(f"  ✅ V Loss: {critic_info['v_loss']:.4f}")
-    
-    # --- 运行一次策略提取更新 (Actor Step with Reject Sampling) ---
-    print("\n🔄 [Step 2] 测试 Actor 拒绝采样 (Reject Sampling) 与 Policy 训练...")
-    actor_info = agent.update_actor(states, actions)
-    print(f"  ✅ Actor Loss: {actor_info['actor_loss']:.4f}")
-    print(f"  ✅ 样本保留率 (Accept Ratio): {actor_info['accept_ratio']*100:.1f}%")
-    print(f"  ✅ 平均 Advantage: {actor_info['adv_mean']:.4f}")
-    
-    print("\n🎉 架构测试通过！代码已修复数值稳定性，可直接用于精简版 Infra！")

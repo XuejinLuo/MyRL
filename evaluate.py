@@ -1,8 +1,10 @@
 # evaluate.py
 
 import os
+import csv
 import time # 用于测试高频推理延迟
 import torch
+import random
 import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -20,68 +22,15 @@ from envs.maniskill_bridge import ManiSkillToRL100Wrapper
 from utils.normalizer import MinMaxNormalizer
 from utils.eval_utils import RenderToNumpyWrapper 
 
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 # =========================================================================
 # 核心评估逻辑
 # =========================================================================
-def make_env_dummy(cfg: DictConfig):
-    """ 创建并包装环境 """
-    # 1. 初始化你的真实环境 (这里你需要根据真实情况替换)
-    # env = gym.make(cfg.env.env_id) 
-    
-    # [Mock] 为了防止报错，如果你还没有真实环境，用 Dummy 替代
-    class DummyEmbodiedEnv(gym.Env):
-        def __init__(self):
-            super().__init__()
-            self.observation_space = gym.spaces.Dict({
-                'xyz': gym.spaces.Box(-10, 10, shape=(2000, 3), dtype=np.float32),
-                'rgb': gym.spaces.Box(0, 1, shape=(2000, 3), dtype=np.float32),
-                'state': gym.spaces.Box(-1, 1, shape=(cfg.model.state_dim,), dtype=np.float32)
-            })
-            self.action_space = gym.spaces.Box(-1, 1, shape=(cfg.model.action_dim,), dtype=np.float32)
-            self.step_count = 0
-            # 模拟渲染接口，供 RecordVideo 调用
-            self.render_mode = "rgb_array" 
-            
-        def reset(self, seed=None, options=None):
-            self.step_count = 0
-            return self.observation_space.sample(), {}
-            
-        def step(self, action):
-            self.step_count += 1
-            done = self.step_count >= 100
-            reward = 1.0 if done else 0.0
-            return self.observation_space.sample(), reward, done, False, {"success": done}
-            
-        # 假渲染
-        def render(self):
-            return np.zeros((240, 320, 3), dtype=np.uint8)
-
-    env = DummyEmbodiedEnv()
-
-    # 包装 RecordVideo (按需开启，这里默认每 5 个 episode 录制一次)
-    if cfg.eval.get("record_video", False):
-        video_dir = os.path.join(cfg.eval.get("log_dir", "./logs"), "videos")
-        env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda x: x % 5 == 0)
-
-    # 2. 包装 PointCloud 处理器
-    bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
-    ws_bounds = np.array(bounds)
-    env = PointCloudObservationWrapper(
-        env=env,
-        num_points=cfg.env.num_points,
-        workspace_bounds=ws_bounds,
-        use_color=cfg.env.use_color
-    )
-
-    # 3. 包装 Action Chunk 处理器 (自动处理 Temporal Ensembling)
-    env = ChunkActionWrapper(
-        env=env,
-        chunk_size=cfg.model.chunk_size,
-        exec_steps=cfg.env.exec_steps,
-        exp_weight=cfg.env.exp_weight
-    )
-    return env
-
 def make_env_ManiSkill(cfg):
     """ 创建并包装 ManiSkill 真实仿真环境 """
 
@@ -96,7 +45,7 @@ def make_env_ManiSkill(cfg):
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
-        max_episode_steps=400
+        max_episode_steps=int(cfg.env.get("max_episode_steps", 300))
     )
 
     if cfg.eval.get("record_video", False):
@@ -111,8 +60,9 @@ def make_env_ManiSkill(cfg):
     env = ManiSkillToRL100Wrapper(env)
     
     # 3. 接入你原来写好的 PointCloud Wrapper
-    bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
-    ws_bounds = np.array(bounds)
+    ws_bounds = np.asarray(
+        cfg.env.workspace_bounds, dtype=np.float32
+    )
     
     env = PointCloudObservationWrapper(
         env=env,
@@ -142,6 +92,11 @@ def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
     base_log_dir = cfg.eval.get("log_dir", "./outputs/eval")
     cfg.eval.log_dir = os.path.join(base_log_dir, f"run_{timestamp}")
+    os.makedirs(cfg.eval.log_dir, exist_ok=True)
+    OmegaConf.save(
+        cfg,
+        os.path.join(cfg.eval.log_dir, "eval_config.yaml")
+    )
     OmegaConf.set_struct(cfg, True)
 
     device = torch.device(cfg.eval.device)
@@ -172,43 +127,71 @@ def main(cfg: DictConfig):
     ).to(device)
 
     # 3. 加载 Checkpoint
-    if os.path.exists(cfg.eval.ckpt_path):
-        state_dict = torch.load(cfg.eval.ckpt_path, map_location=device)
-        # 兼容性处理：如果保存的是包含 model / ema_model 的大字典
-        if 'ema_model_state_dict' in state_dict:
-            policy.load_state_dict(state_dict['ema_model_state_dict'])
-            print("📥 成功加载 EMA 权重!")
-        elif 'model_state_dict' in state_dict:
-            policy.load_state_dict(state_dict['model_state_dict'])
-            print("📥 成功加载 Model 权重!")
-        else:
-            policy.load_state_dict(state_dict)
-            print("📥 成功加载纯 State Dict 权重!")
-    else:
-        print(f"⚠️ 警告: 找不到权重文件 {cfg.eval.ckpt_path}，将使用随机初始化进行测试!")
+    ckpt_path = hydra.utils.to_absolute_path(cfg.eval.ckpt_path)
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint 不存在: {ckpt_path}")
 
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    weight_key = cfg.eval.get("weight_key", "auto")
+
+    if weight_key == "auto":
+        available = [
+            key for key in ("ema_model_state_dict", "model_state_dict")
+            if key in checkpoint
+        ]
+        if len(available) > 1:
+            raise ValueError(
+                f"Checkpoint 同时包含 {available}，"
+                "请通过 eval.weight_key 显式选择评估权重。"
+            )
+        selected_key = available[0] if available else "raw"
+    else:
+        selected_key = weight_key
+
+    if selected_key == "raw":
+        model_state = checkpoint
+    else:
+        if selected_key not in checkpoint:
+            raise KeyError(
+                f"找不到权重键 {selected_key}；"
+                f"Checkpoint 顶层键: {list(checkpoint.keys())}"
+            )
+        model_state = checkpoint[selected_key]
+
+    policy.load_state_dict(model_state, strict=True)
     policy.eval()
 
+    print(f"Checkpoint : {ckpt_path}")
+    print(f"Weight key : {selected_key}")
+
     # 4. 加载 Normalizer (假设你的 stats 与权重存在一起，或者有单独的文件)
-    stats_path = os.path.join(os.path.dirname(cfg.eval.ckpt_path), "dataset_stats.json")
+    stats_path = os.path.join(
+    os.path.dirname(ckpt_path), "dataset_stats.json"
+    )
+    if not os.path.isfile(stats_path):
+        raise FileNotFoundError(f"归一化文件不存在: {stats_path}")
+
     normalizer = MinMaxNormalizer()
     normalizer.load(stats_path)
-    print("✅ 成功加载环境归一化参数！")
-
+    print(f"Normalizer : {stats_path}")
 
     # 5. 评估循环
     all_rewards = []
     all_success = []
+    episode_rows = []
     latencies = [] # 用于记录推理耗时
-    bounds = cfg.env.get("workspace_bounds", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
-    ws_bounds = np.array(bounds)
+    ws_bounds = np.asarray(
+        cfg.env.workspace_bounds, dtype=np.float32
+    )
 
     print(f"\n🏃 开始进行 {cfg.eval.num_episodes} 个 Episode 的测试...")
     saved_first_pc = False # 用于保存第一个点云
     for ep in tqdm(range(cfg.eval.num_episodes), desc="Evaluating"):
-        # 传入固定的 base_seed 以确保测试环境的一致性和可复现性
-        base_seed = cfg.eval.get("seed", 42)
-        obs, info = env.reset(seed=base_seed + ep)
+        base_seed = int(cfg.eval.get("seed", 42))
+        episode_seed = base_seed + ep
+        seed_everything(episode_seed)
+        obs, info = env.reset(seed=episode_seed)
+        chunk_decisions = 0
 
         if not saved_first_pc:
             pc_data = obs['point_cloud'] 
@@ -255,18 +238,37 @@ def main(cfg: DictConfig):
             # (ChunkActionWrapper 内部会自动做滑动窗口集成并步进 exec_steps 步)
             obs, reward, done, truncated, info = env.step(real_action_chunk)
             ep_reward += reward
+            chunk_decisions += 1
             
             # 判断是否成功 (根据具体环境调整，比如 info['success'])
-            if info.get('success', False):
-                success = True
+            success = success or bool(
+                info.get("success_any", info.get("success", False))
+            )
 
         all_rewards.append(ep_reward)
         all_success.append(success)
-        # print(f"Episode {ep} | Reward: {ep_reward:.2f} | Success: {success}")
+        episode_rows.append({
+            "checkpoint": ckpt_path,
+            "weight_key": selected_key,
+            "episode": ep,
+            "seed": episode_seed,
+            "success": int(success),
+            "episode_return": float(ep_reward),
+            "chunk_decisions": chunk_decisions,
+        })
+
+        csv_path = os.path.join(cfg.eval.log_dir, "episodes.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=list(episode_rows[0].keys())
+            )
+            writer.writeheader()
+            writer.writerows(episode_rows)
 
     # 6. 统计结果
     mean_reward = np.mean(all_rewards)
     success_rate = np.mean(all_success) * 100.0
+    successful_eps = [i for i, is_success in enumerate(all_success) if is_success]
     # 推理延迟统计 (去除前 5 个 warmup 样本以保证准确)
     valid_latencies = latencies[5:] if len(latencies) > 5 else latencies
     mean_latency = np.mean(valid_latencies) if valid_latencies else 0.0
@@ -277,6 +279,10 @@ def main(cfg: DictConfig):
     print(f"Total Episodes    : {cfg.eval.num_episodes}")
     print(f"Mean Reward       : {mean_reward:.2f} ± {np.std(all_rewards):.2f}")
     print(f"Success Rate      : {success_rate:.1f} %")
+    if successful_eps:
+        print(f"Successful Eps    : {successful_eps}")
+    else:
+        print(f"Successful Eps    : None (全军覆没 😭)")
     print(f"Inference Latency : {mean_latency:.2f} ms/step (≈ {1000/mean_latency if mean_latency > 0 else 0:.1f} FPS)")
     print("=" * 40)
     env.close()
