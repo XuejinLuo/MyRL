@@ -118,6 +118,14 @@ def main(cfg: DictConfig):
                 with torch.no_grad():
                     value = critic(features).item()
                     action = actor.sample(features, cfg.model.num_inference_steps)[0].cpu().numpy()
+
+                # 注入探索扰动，打破策略的确定性
+                noise_scale = cfg.algo.get("explore_noise", 0.02)  
+                if noise_scale > 0:
+                    exploration_noise = np.random.normal(scale=noise_scale, size=action.shape)
+                    # 因为 action 处于 [-1, 1] 的归一化空间，加上噪声后需要安全裁剪
+                    action = np.clip(action + exploration_noise, -1.0, 1.0) 
+
                 logger.log_io(epoch, step, {'features': features}, action)
                 nxt, reward, terminated, truncated, info = env.step(normalizer.unnormalize(action, 'action'))
                 terminated, truncated = bool(terminated), bool(truncated)

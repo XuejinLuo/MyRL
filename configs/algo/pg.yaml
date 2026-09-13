@@ -4,13 +4,14 @@ steps_per_epoch: 1024  # chunk decisions, not primitive environment steps
 update_epochs: 1      # actor passes per rollout after critic warmup
 critic_update_epochs: 4
 critic_warmup_epochs: 5
-actor_lr: 3e-7
+actor_lr: 1e-6
 critic_lr: 3e-4
 gamma: 0.99           # discount per chunk decision
 gae_lambda: 0.95
 v_loss_coef: 0.5
 max_grad_norm: 0.5
-anchor_coef: 1.0      # teacher field penalty, not a hard trust region
+anchor_coef: 0.1
 adv_temperature: 1.0
 max_weight: 5.0
 pretrained_ckpt: "./checkpoints/idql_policy_best.pth"
+explore_noise: 0.02
