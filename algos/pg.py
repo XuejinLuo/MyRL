@@ -97,46 +97,64 @@ class FlowPPO:
 
     def update(self, batch, advantages, returns, batch_size=128, epochs=10,
                actor_enabled=True, verify=True):
+        """Accumulate equally weighted transition gradients, then step once.
+
+        All generation steps see the same parameters. A rejected minibatch
+        discards its pending gradients; earlier accepted updates are not rolled back.
+        """
+        num_steps = self.policy.sampler.num_steps
         metrics = {'ppo/actor_updates': 0, 'ppo/early_stop': 0,
-                   'ppo/ratio_guard_stop': 0,
+                   'ppo/ratio_guard_stop': 0, 'ppo/stop_step': -1,
+                   'ppo/stop_kl': 0., 'ppo/max_abs_log_ratio': 0.,
+                   'ppo/update_version': 2,
                    'ppo/replay_logprob_error': self.verify_rollout(batch, batch_size) if verify else 0.}
         advantages = advantages.detach()
         advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-5)
-        records = []
-        value_losses = []
+        records, value_losses = [], []
+        step_kls = [[] for _ in range(num_steps)]
         stop_actor = not actor_enabled
         for _ in range(epochs):
             for idx in torch.randperm(len(returns), device=returns.device).split(batch_size):
-                # Warmup fits V without clipping it to random initial predictions.
                 old_values = batch['values'][idx] if actor_enabled else None
                 value_losses.append(self.update_critic(batch['features'][idx], returns[idx], old_values))
                 if stop_actor:
                     continue
-                for step in range(self.policy.sampler.num_steps):
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                for step in range(num_steps):
                     new = sum_event_logprob(self.policy.evaluate_transition(batch['features'][idx],
                         batch['chains'][idx], step), self.prefix_steps)
                     old = sum_event_logprob(batch['logprobs'][idx, step], self.prefix_steps).detach()
+                    drift = (new - old).detach().abs().max().item()
+                    metrics['ppo/max_abs_log_ratio'] = max(metrics['ppo/max_abs_log_ratio'], drift)
                     try:
                         loss, kl, cf, ratio = clipped_objective(new, old, advantages[idx], self.clip_ratio)
                     except PPORatioDiverged:
-                        # Stop all remaining actor steps for this rollout.
-                        # NaN/Inf errors remain fatal and are not swallowed.
-                        self.actor_optimizer.zero_grad(set_to_none=True)
                         stop_actor = True
                         metrics['ppo/early_stop'] = 1
                         metrics['ppo/ratio_guard_stop'] = 1
+                        metrics['ppo/stop_step'] = step
                         break
-                    records.append((loss.item(), kl.item(), cf.item(), ratio.mean().item()))
-                    if self.target_kl is not None and kl.item() > 1.5 * self.target_kl:
+                    kl_value = kl.item()
+                    step_kls[step].append(kl_value)
+                    records.append((loss.item(), kl_value, cf.item(), ratio.mean().item()))
+                    if self.target_kl is not None and kl_value > 1.5 * self.target_kl:
                         stop_actor = True
                         metrics['ppo/early_stop'] = 1
+                        metrics['ppo/stop_step'] = step
+                        metrics['ppo/stop_kl'] = kl_value
                         break
+                    # Backward releases each graph; parameters and Adam state
+                    # stay unchanged until ALL transition checks have passed.
+                    (loss / num_steps).backward()
+                if stop_actor:
                     self.actor_optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.actor_params, self.max_grad_norm, error_if_nonfinite=True)
-                    self.actor_optimizer.step()
-                    metrics['ppo/actor_updates'] += 1
+                    continue
+                nn.utils.clip_grad_norm_(self.actor_params, self.max_grad_norm, error_if_nonfinite=True)
+                self.actor_optimizer.step()
+                metrics['ppo/actor_updates'] += 1
         metrics['loss/critic'] = sum(value_losses) / len(value_losses)
         for j, key in enumerate(('loss/actor', 'ppo/approx_kl', 'ppo/clip_fraction', 'ppo/ratio_mean')):
             metrics[key] = sum(r[j] for r in records) / len(records) if records else 0.
+        for step, values in enumerate(step_kls):
+            metrics[f'ppo/kl_step_{step}'] = sum(values) / len(values) if values else None
         return metrics
