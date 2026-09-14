@@ -1,5 +1,6 @@
 import gymnasium as gym
 import mani_skill.envs
+from mani_skill.utils.wrappers.gymnasium import CPUGymWrapper
 import numpy as np
 from envs.maniskill_bridge import ManiSkillToRL100Wrapper
 from envs.pointcloud_wrapper import PointCloudObservationWrapper
@@ -16,6 +17,8 @@ def make_env_ManiSkill(cfg):
     # 1. 实例化 ManiSkill 环境 (以最经典的抓取方块任务为例)
     env = gym.make(
         env_id,
+        num_envs=1,
+        sim_backend="physx_cpu",
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
@@ -23,6 +26,7 @@ def make_env_ManiSkill(cfg):
     )
     
     # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
+    env = CPUGymWrapper(env)
     env = ManiSkillToRL100Wrapper(env)
     
     # 3. 接入你原来写好的 PointCloud Wrapper
@@ -45,4 +49,5 @@ def make_env_ManiSkill(cfg):
     )
     
     return env
+
 

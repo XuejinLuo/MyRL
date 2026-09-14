@@ -72,6 +72,7 @@ class ChunkActionWrapper(gym.Wrapper):
         actual_steps = 0
         success_any = False
         executed_actions = []
+        primitive_rewards = []
 
         # 在环境中连续执行 exec_steps 步
         for i in range(self.exec_steps):
@@ -91,7 +92,8 @@ class ChunkActionWrapper(gym.Wrapper):
             
             success_any = success_any or bool(info.get("success", False))
             executed_actions.append(np.array(action_to_execute, copy=True))
-            total_reward += reward
+            primitive_rewards.append(float(reward))
+            total_reward += float(reward)
             latest_obs = obs
             latest_info = info
             actual_steps += 1
@@ -113,6 +115,7 @@ class ChunkActionWrapper(gym.Wrapper):
         latest_info["success_any"] = success_any
         latest_info["actual_steps"] = actual_steps
         latest_info["executed_actions"] = np.asarray(executed_actions)
+        latest_info["primitive_rewards"] = np.asarray(primitive_rewards, dtype=np.float64)
         return latest_obs, total_reward, done, truncated, latest_info
 
     def _get_ensembled_action(self, target_t: int) -> np.ndarray:
@@ -190,3 +193,4 @@ if __name__ == '__main__':
             break
             
     print("\n>>> ChunkActionWrapper 测试通过！该逻辑可以直接用于你的 3D Infra 项目中。")
+

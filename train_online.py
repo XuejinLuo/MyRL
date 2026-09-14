@@ -1,7 +1,4 @@
-"""Conservative online Flow regression with paired baseline evaluation.
-
-This is AWR-style weighted Flow Matching, NOT PPO or exact maximum likelihood.
-"""
+"""ManiSkill Flow fine-tuning using RL-100-style generation-chain PPO."""
 import json
 import os
 from datetime import datetime
@@ -11,142 +8,203 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 from models.policy import EmbodiedGenPolicy
-from models.online_policy import FlowRegressionPolicy
 from models.critics.q_v_network import VNetwork
-from algos.pg import FlowPolicyGradient
+from algos.pg import FlowPPO, compute_gae
 from utils.normalizer import MinMaxNormalizer
-from utils.debug_logger import DebugLogger
-from utils.online_env import make_env_ManiSkill
 from utils.online_eval import evaluate_policy, seed_all
+from utils.online_checkpoint import FORMAT, policy_weights, make_actor, payload
 
 
-@hydra.main(version_base=None, config_path='configs', config_name='train_online')
-def main(cfg: DictConfig):
-    if min(cfg.algo.steps_per_epoch, cfg.algo.update_epochs, cfg.algo.critic_update_epochs,
-           cfg.batch_size, cfg.eval.every, cfg.save_epoch, cfg.epochs) < 1:
-        raise ValueError('Rollout, epoch, minibatch and evaluation counts must be positive')
+def validate(cfg):
+    for value in (cfg.algo.steps_per_epoch, cfg.algo.update_epochs, cfg.batch_size,
+                  cfg.eval.every, cfg.save_epoch, cfg.epochs, cfg.model.num_inference_steps):
+        if value < 1:
+            raise ValueError('All rollout, update and evaluation counts must be positive')
+    if cfg.model.algo_type != 'flow':
+        raise ValueError('This migration implements Flow PPO; select model=flow_3d')
+    if not 1 <= cfg.env.exec_steps <= cfg.model.chunk_size:
+        raise ValueError('Require 1 <= exec_steps <= chunk_size')
+    if cfg.algo.ratio_scope not in ('full', 'prefix'):
+        raise ValueError('ratio_scope must be full or prefix')
+    if not 0 < cfg.algo.gamma <= 1 or not 0 <= cfg.algo.gae_lambda <= 1:
+        raise ValueError('Invalid gamma/lambda')
+    if cfg.algo.actor_lr <= 0 or cfg.algo.critic_lr <= 0 or not 0 < cfg.algo.clip_ratio < 1:
+        raise ValueError('Invalid PPO learning rate/clip ratio')
+    if cfg.algo.max_grad_norm <= 0 or cfg.algo.critic_warmup_epochs < 0:
+        raise ValueError('Invalid gradient clipping/warmup')
+    if cfg.algo.value_clip is not None and cfg.algo.value_clip <= 0:
+        raise ValueError('value_clip must be positive or null')
+    if cfg.algo.target_kl is not None and cfg.algo.target_kl <= 0:
+        raise ValueError('target_kl must be positive or null')
+    if cfg.algo.reward_scale <= 0:
+        raise ValueError('reward_scale must be positive')
+
+
+def build_base(cfg, device):
+    return EmbodiedGenPolicy(**{k: cfg.model[k] for k in (
+        'in_channels', 'action_dim', 'chunk_size', 'use_state', 'state_dim',
+        'encoder_type', 'backbone_type', 'cond_dim', 'algo_type')}).to(device)
+
+
+def run(cfg, env_factory=None):
+    validate(cfg)
+    if env_factory is None:
+        from utils.online_env import make_env_ManiSkill
+        env_factory = lambda: make_env_ManiSkill(cfg)
     seed_all(cfg.seed)
     device = torch.device(cfg.device)
-    ckpt = os.path.abspath(cfg.algo.pretrained_ckpt)
-    if not os.path.isfile(ckpt):
-        raise FileNotFoundError(f'Pretrained checkpoint required: {ckpt}')
-    stats_path = os.path.join(os.path.dirname(ckpt), 'dataset_stats.json')
+    source = cfg.resume or cfg.algo.pretrained_ckpt
+    if not source:
+        raise ValueError('Set algo.pretrained_ckpt=/absolute/path/to/offline.pth')
+    source = hydra.utils.to_absolute_path(source)
+    checkpoint = torch.load(source, map_location=device, weights_only=True)
+    if cfg.resume and checkpoint.get('format') != FORMAT:
+        raise ValueError('resume requires a Flow PPO training checkpoint')
+    if checkpoint.get('format') == FORMAT:
+        saved = checkpoint['config']
+        for section, keys in {'model': list(cfg.model), 'env': list(cfg.env),
+                              'algo': ['noise_level', 'min_std', 'gamma', 'gae_lambda',
+                                       'ratio_scope', 'reward_scale']}.items():
+            for key in keys:
+                current = OmegaConf.to_container(cfg[section], resolve=True).get(key)
+                if saved[section].get(key) != current:
+                    raise ValueError(f'Checkpoint mismatch: {section}.{key}')
+        if saved['eval']['sampler'] != cfg.eval.sampler:
+            raise ValueError('Checkpoint eval sampler mismatch')
     normalizer = MinMaxNormalizer()
-    normalizer.load(stats_path)  # fail early instead of silently training unnormalized
+    if 'normalizer' in checkpoint:
+        normalizer.stats = checkpoint['normalizer']
+    else:
+        stats_path = cfg.algo.stats_path or os.path.join(os.path.dirname(source), 'dataset_stats.json')
+        normalizer.load(hydra.utils.to_absolute_path(stats_path))
     for key, dim in [('action', cfg.model.action_dim), ('state', cfg.model.state_dim)]:
         stats = normalizer.stats.get(key, {})
         lo, hi = np.asarray(stats.get('min', [])), np.asarray(stats.get('max', []))
         if lo.shape != (dim,) or hi.shape != (dim,) or not np.isfinite([lo, hi]).all() or (hi < lo).any():
-            raise ValueError(f'Invalid {key} normalization statistics for dimension {dim}')
-
-    run_name = f'{cfg.run_name}_{datetime.now():%Y%m%d_%H%M%S}'
-    save_dir = os.path.join(cfg.save_dir, run_name)
-    ckpt_dir = os.path.join(save_dir, 'checkpoints')
-    os.makedirs(ckpt_dir, exist_ok=True)
-    OmegaConf.save(cfg, os.path.join(save_dir, 'config.yaml'), resolve=True)
-    normalizer.save(os.path.join(ckpt_dir, 'dataset_stats.json'))
-    logger = DebugLogger(save_dir)
-    wandb_run = None
-    if cfg.wandb.enable:
-        import wandb
-        wandb_run = wandb.init(project=cfg.wandb.project, name=run_name,
-                              config=OmegaConf.to_container(cfg, resolve=True))
-
-    base_policy = EmbodiedGenPolicy(
-        in_channels=cfg.model.in_channels, action_dim=cfg.model.action_dim,
-        chunk_size=cfg.model.chunk_size, use_state=cfg.model.use_state,
-        state_dim=cfg.model.state_dim, encoder_type=cfg.model.encoder_type,
-        backbone_type=cfg.model.backbone_type, cond_dim=cfg.model.cond_dim,
-        algo_type=cfg.model.algo_type).to(device)
-    state = torch.load(ckpt, map_location=device, weights_only=True)
-    base_policy.load_state_dict(state.get('ema_model_state_dict', state.get('model_state_dict', state)))
-    actor = FlowRegressionPolicy(base_policy).to(device)
-    # Freeze pretrained encoder and reuse its exact cached features for both heads.
+            raise ValueError(f'Invalid {key} normalization statistics; expected dimension {dim}')
+    base = build_base(cfg, device)
+    weight_key = "model_state_dict" if checkpoint.get("format") == FORMAT else cfg.algo.get("pretrained_weight_key", "auto")
+    base.load_state_dict(policy_weights(checkpoint, weight_key), strict=True)
+    actor = make_actor(base, cfg)
     critic = VNetwork(state_dim=cfg.model.cond_dim).to(device)
-    trainer = FlowPolicyGradient(
-        actor, critic, actor_lr=cfg.algo.actor_lr, critic_lr=cfg.algo.critic_lr,
-        gamma=cfg.algo.gamma, gae_lambda=cfg.algo.gae_lambda,
-        v_loss_coef=cfg.algo.v_loss_coef, max_grad_norm=cfg.algo.max_grad_norm,
-        device=device, anchor_coef=cfg.algo.anchor_coef,
-        adv_temperature=cfg.algo.adv_temperature, max_weight=cfg.algo.max_weight)
+    trainer = FlowPPO(actor, critic, actor_lr=cfg.algo.actor_lr,
+        critic_lr=cfg.algo.critic_lr, clip_ratio=cfg.algo.clip_ratio,
+        value_clip=cfg.algo.value_clip, max_grad_norm=cfg.algo.max_grad_norm,
+        target_kl=cfg.algo.target_kl,
+        prefix_steps=cfg.env.exec_steps if cfg.algo.ratio_scope == 'prefix' else None)
+    start_epoch, total_steps = 0, 0
+    if cfg.resume:
+        critic.load_state_dict(checkpoint['critic'])
+        trainer.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        trainer.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        # Resume moments, but honor the explicitly configured learning rates.
+        for group in trainer.actor_optimizer.param_groups:
+            group['lr'] = cfg.algo.actor_lr
+        for group in trainer.critic_optimizer.param_groups:
+            group['lr'] = cfg.algo.critic_lr
+        start_epoch, total_steps = checkpoint['epoch'], checkpoint['total_env_steps']
+        if cfg.epochs <= start_epoch and not cfg.eval_only:
+            raise ValueError('epochs must exceed the resumed epoch')
     bounds = np.asarray(cfg.env.workspace_bounds)
 
     def encode(obs):
-        pc = normalizer.center_point_cloud(obs['point_cloud'], bounds)
-        state = normalizer.normalize(obs['state'], 'state')
-        return actor.encode(torch.as_tensor(pc, dtype=torch.float32, device=device)[None],
-                            torch.as_tensor(state, dtype=torch.float32, device=device)[None])
+        pc = np.asarray(obs['point_cloud'], dtype=np.float32)
+        state = np.asarray(obs['state'], dtype=np.float32)
+        if pc.shape != (cfg.env.num_points, cfg.model.in_channels) or state.shape != (cfg.model.state_dim,):
+            raise ValueError(f'Observation shape mismatch: pc={pc.shape}, state={state.shape}')
+        if not np.isfinite(pc).all() or not np.isfinite(state).all():
+            raise ValueError('Nonfinite observation')
+        pc = normalizer.center_point_cloud(pc, bounds)
+        state = normalizer.normalize(state, 'state')
+        return actor.encode(torch.as_tensor(pc, device=device)[None],
+                            torch.as_tensor(state, device=device)[None])
 
-    def evaluate():
-        return evaluate_policy(lambda: make_env_ManiSkill(cfg), actor, encode,
-                               normalizer, list(cfg.eval.seeds), cfg.model.num_inference_steps)
+    def evaluate(mode):
+        previous = actor.eval_mode
+        actor.eval_mode = mode
+        try:
+            return evaluate_policy(env_factory, actor, encode, normalizer,
+                                   list(cfg.eval.seeds), cfg.model.num_inference_steps)
+        finally:
+            actor.eval_mode = previous
+
+    if cfg.eval_only:
+        results = {mode: evaluate(mode) for mode in ('cps', 'ode')}
+        print(json.dumps(results, indent=2), flush=True)
+        return results
+    run_dir = os.path.join(hydra.utils.to_absolute_path(cfg.save_dir),
+                           f'{cfg.run_name}_{datetime.now():%Y%m%d_%H%M%S_%f}')
+    ckpt_dir = os.path.join(run_dir, 'checkpoints')
+    os.makedirs(ckpt_dir)
+    normalizer.save(os.path.join(ckpt_dir, 'dataset_stats.json'))
+    OmegaConf.save(cfg, os.path.join(run_dir, 'config.yaml'), resolve=True)
+    wandb_run = None
+    if cfg.wandb.enable:
+        import wandb
+        wandb_run = wandb.init(project=cfg.wandb.project, name=os.path.basename(run_dir),
+                               config=OmegaConf.to_container(cfg, resolve=True))
 
     def log(epoch, metrics):
-        logger.log_metrics(epoch, metrics)
-        if wandb_run is not None:
+        # JSON null for unavailable episode rate rather than invalid NaN JSON.
+        with open(os.path.join(run_dir, 'metrics.jsonl'), 'a') as f:
+            f.write(json.dumps({'epoch': epoch, **metrics}, allow_nan=False) + '\n')
+        if wandb_run:
             wandb_run.log(metrics, step=epoch)
+        print(json.dumps({'epoch': epoch, **metrics}, ensure_ascii=False), flush=True)
 
-    best_score = None
-    def save_best(epoch, metrics):
-        nonlocal best_score
-        score = (metrics['Eval/Success_Rate'], metrics['Eval/Mean_Reward'])
+    best_score, best_metrics, env = None, None, None
+    def save_best(epoch, result):
+        nonlocal best_score, best_metrics
+        score = (result['Eval/Success_Rate'], result['Eval/Mean_Reward'])
         if best_score is None or score > best_score:
-            best_score = score
-            # Raw policy state is directly compatible with evaluate.py.
-            torch.save(base_policy.state_dict(), os.path.join(ckpt_dir, 'online_best.pth'))
-            with open(os.path.join(ckpt_dir, 'best_metrics.json'), 'w') as f:
-                json.dump({'epoch': epoch, **metrics}, f, indent=2)
+            best_score, best_metrics = score, result
+            torch.save(payload(base, cfg, normalizer, epoch, result), os.path.join(ckpt_dir, 'online_best.pth'))
 
-    env = None
     try:
-        baseline = evaluate()
-        log(0, baseline)
-        save_best(0, baseline)  # preserve offline baseline if all updates get worse
-        torch.save(base_policy.state_dict(), os.path.join(ckpt_dir, 'offline_baseline.pth'))
-        print(f'Offline baseline: {baseline}', flush=True)
-        env = make_env_ManiSkill(cfg)
-        obs, _ = env.reset(seed=cfg.seed)
+        baseline = evaluate(cfg.eval.sampler)
+        ode_baseline = evaluate('ode') if cfg.eval.sampler != 'ode' else baseline
+        log(start_epoch, {**baseline, **{'BaselineODE/' + k.split('/')[-1]: v for k, v in ode_baseline.items()}})
+        save_best(start_epoch, baseline)
+        torch.save(payload(base, cfg, normalizer, start_epoch, baseline), os.path.join(ckpt_dir, 'initial_policy.pth'))
+        env = env_factory()
+        # Resume resets the simulator at an epoch boundary, not an exact trajectory continuation.
+        obs, _ = env.reset(seed=cfg.seed + start_epoch)
         features = encode(obs)
-        episode_success = False  # persists across rollout/epoch boundaries
-        for epoch in range(1, cfg.epochs + 1):
+        episode_success = False
+        for epoch in range(start_epoch + 1, cfg.epochs + 1):
+            data = {key: [] for key in ('features', 'chains', 'logprobs', 'rewards', 'values',
+                'next_values', 'terminated', 'dones', 'lengths')}
+            reward_sum, successes, episodes, env_steps, clipped_count, action_count = 0., 0, 0, 0, 0, 0
             actor.eval()
             critic.eval()
-            data = {key: [] for key in ('features', 'actions', 'rewards', 'values',
-                                       'next_values', 'dones', 'terminated', 'lengths')}
-            epoch_reward, successes, episodes, env_steps = 0., 0, 0, 0
-            for step in tqdm(range(cfg.algo.steps_per_epoch), desc=f'Epoch {epoch} rollout'):
+            for _ in tqdm(range(cfg.algo.steps_per_epoch), desc=f'Epoch {epoch} rollout', disable=cfg.quiet):
                 with torch.no_grad():
+                    action, chain, logprob = actor.collect(features)
                     value = critic(features).item()
-                    action = actor.sample(features, cfg.model.num_inference_steps)[0].cpu().numpy()
-
-                # 注入探索扰动，打破策略的确定性
-                noise_scale = cfg.algo.get("explore_noise", 0.02)  
-                if noise_scale > 0:
-                    exploration_noise = np.random.normal(scale=noise_scale, size=action.shape)
-                    # 因为 action 处于 [-1, 1] 的归一化空间，加上噪声后需要安全裁剪
-                    action = np.clip(action + exploration_noise, -1.0, 1.0) 
-
-                logger.log_io(epoch, step, {'features': features}, action)
-                nxt, reward, terminated, truncated, info = env.step(normalizer.unnormalize(action, 'action'))
+                raw = action[0].cpu().numpy()
+                if not np.isfinite(raw).all():
+                    raise FloatingPointError('Nonfinite generated action')
+                # Clipping is a fixed environment transform. NEVER overwrite latent
+                # chain/logprobs with clipped or physically executed actions.
+                nxt, reward, terminated, truncated, info = env.step(normalizer.unnormalize(raw, 'action'))
                 terminated, truncated = bool(terminated), bool(truncated)
                 done = terminated or truncated
-                next_features = encode(nxt)  # final observation, BEFORE reset
+                length = int(info['actual_steps'])
+                rewards = np.asarray(info['primitive_rewards'], dtype=np.float64)
+                if rewards.shape != (length,) or not 1 <= length <= cfg.env.exec_steps:
+                    raise ValueError('Invalid primitive reward/length metadata from ChunkActionWrapper')
+                discounted_reward = float(np.dot(cfg.algo.gamma ** np.arange(length), rewards)) * cfg.algo.reward_scale
+                next_features = encode(nxt)  # BEFORE reset: time-limit bootstrap uses final observation
                 with torch.no_grad():
                     next_value = 0. if terminated else critic(next_features).item()
-                length = int(info['actual_steps'])
-                # Correct the executed prefix target to include both normalization
-                # clipping and the physical Box bounds applied by the wrapper.
-                target = action.copy()
-                lo = np.asarray(normalizer.stats['action']['min'])
-                hi = np.asarray(normalizer.stats['action']['max'])
-                executed = np.asarray(info['executed_actions']).reshape(length, cfg.model.action_dim)
-                target[:length] = 2 * (executed - lo) / (hi - lo + normalizer.eps) - 1
-                row = dict(features=features[0].cpu().clone(), actions=target,
-                           rewards=float(reward), values=value, next_values=next_value,
-                           dones=float(done), terminated=float(terminated), lengths=length)
+                row = dict(features=features[0].cpu(), chains=chain[0].cpu(), logprobs=logprob[0].cpu(),
+                    rewards=discounted_reward, values=value, next_values=next_value,
+                    terminated=float(terminated), dones=float(done), lengths=length)
                 for key, val in row.items():
                     data[key].append(val)
-                epoch_reward += float(reward)
+                clipped_count += int((np.abs(raw[:length]) > 1.1).sum())
+                action_count += raw[:length].size
+                reward_sum += float(reward)
                 env_steps += length
                 episode_success |= bool(info.get('success_any', info.get('success', False)))
                 if done:
@@ -157,55 +215,47 @@ def main(cfg: DictConfig):
                     features = encode(obs)
                 else:
                     features = next_features
-            batch = {k: (torch.stack(v).to(device) if k == 'features' else
-                         torch.as_tensor(np.asarray(v), dtype=torch.float32, device=device))
-                     for k, v in data.items()}
-            batch['lengths'] = batch['lengths'].long()
-            adv, returns = trainer.compute_gae(batch['rewards'], batch['values'], batch['dones'],
-                                              batch['next_values'], batch['terminated'])
-            weights = trainer.advantage_weights(adv)  # preserve uncentered sign
-            critic_losses, actor_losses = [], []
-            size = len(returns)
-            for _ in range(cfg.algo.critic_update_epochs):
-                for idx in torch.randperm(size, device=device).split(cfg.batch_size):
-                    critic_losses.append(trainer.update_critic(batch['features'][idx], returns[idx])['loss/critic'])
-            if epoch > cfg.algo.critic_warmup_epochs:
-                for _ in range(cfg.algo.update_epochs):
-                    for idx in torch.randperm(size, device=device).split(cfg.batch_size):
-                        actor_losses.append(trainer.update_actor(batch['features'][idx], batch['actions'][idx],
-                                                                  weights[idx], batch['lengths'][idx]))
+            batch = {key: (torch.stack(vals).to(device) if torch.is_tensor(vals[0]) else
+                torch.as_tensor(vals, dtype=torch.float32, device=device)) for key, vals in data.items()}
+            if not all(torch.isfinite(v).all() for v in batch.values()):
+                raise FloatingPointError('Nonfinite rollout')
+            adv, returns = compute_gae(batch['rewards'], batch['values'], batch['next_values'],
+                batch['terminated'], batch['dones'], batch['lengths'], cfg.algo.gamma, cfg.algo.gae_lambda)
+            metrics = trainer.update(batch, adv, returns, cfg.batch_size, cfg.algo.update_epochs,
+                actor_enabled=epoch > cfg.algo.critic_warmup_epochs, verify=cfg.algo.verify_logprobs)
+            total_steps += env_steps
             with torch.no_grad():
                 predicted = critic(batch['features']).squeeze(-1)
-                var = returns.var(unbiased=False)
-                ev = 1 - (returns - predicted).var(unbiased=False) / (var + 1e-8)
-            metrics = {'Env/Reward': epoch_reward, 'Env/Success_Count': successes,
-                       'Env/Episodes_Done': episodes, 'Env/Steps': env_steps,
-                       'Env/Success_Rate': successes / episodes if episodes else float('nan'),
-                       'Value/Mean_V_Pred': batch['values'].mean().item(),
-                       'Value/Mean_Return': returns.mean().item(), 'value/explained_var': ev.item(),
-                       'loss/critic': float(np.mean(critic_losses)),
-                       'awr/positive_fraction': (weights > 0).float().mean().item(),
-                       'awr/actor_updates': sum(x['awr/actor_updates'] for x in actor_losses),
-                       'awr/critic_warmup': float(epoch <= cfg.algo.critic_warmup_epochs)}
-            for key in ('loss/actor', 'awr/flow_mse', 'awr/anchor_mse'):
-                active = [x[key] for x in actor_losses if x['awr/actor_updates']]
-                metrics[key] = float(np.mean(active)) if active else 0.
+                ev = 1 - (returns - predicted).var(unbiased=False) / returns.var(unbiased=False).clamp_min(1e-8)
+            metrics.update({'Env/Reward': reward_sum, 'Env/Episodes': episodes, 'Env/Success_Count': successes,
+                'Env/Success_Rate': successes / episodes if episodes else None,
+                'Env/Steps': env_steps, 'Env/Total_Steps': total_steps,
+                'Action/Normalization_Clip_Fraction': clipped_count / max(action_count, 1),
+                'Value/Explained_Variance': ev.item(), 'Value/Return_Mean': returns.mean().item(),
+                'Adv/Mean': adv.mean().item(), 'Adv/Std': adv.std(unbiased=False).item(),
+                'Adv/Negative_Fraction': (adv < 0).float().mean().item()})
             if epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
-                result = evaluate()
+                result = evaluate(cfg.eval.sampler)
                 metrics.update(result)
                 metrics['Eval/Delta_Success'] = result['Eval/Success_Rate'] - baseline['Eval/Success_Rate']
                 save_best(epoch, result)
-                print(f'Epoch {epoch} evaluation: {result}', flush=True)
             log(epoch, metrics)
-            print(f"Epoch {epoch:03d} reward={epoch_reward:.1f} success={successes}/{episodes} "
-                  f"actor_updates={metrics['awr/actor_updates']} flow_mse={metrics['awr/flow_mse']:.5f}")
             if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
-                torch.save(base_policy.state_dict(), os.path.join(ckpt_dir, f'online_ep{epoch}.pth'))
+                state = payload(base, cfg, normalizer, epoch, metrics)
+                state.update({'critic': critic.state_dict(), 'actor_optimizer': trainer.actor_optimizer.state_dict(),
+                    'critic_optimizer': trainer.critic_optimizer.state_dict(), 'total_env_steps': total_steps})
+                torch.save(state, os.path.join(ckpt_dir, f'online_ep{epoch}.pth'))
+        return {'run_dir': run_dir, 'best_metrics': best_metrics, 'total_env_steps': total_steps}
     finally:
         if env is not None:
             env.close()
-        if wandb_run is not None:
+        if wandb_run:
             wandb_run.finish()
+
+
+@hydra.main(version_base=None, config_path='configs', config_name='train_online')
+def main(cfg: DictConfig):
+    run(cfg)
 
 
 if __name__ == '__main__':

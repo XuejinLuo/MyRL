@@ -1,17 +1,23 @@
-# configs/algo/pg.yaml
-# AWR-style Flow regression; historical filename retained. Not PPO.
-steps_per_epoch: 1024  # chunk decisions, not primitive environment steps
-update_epochs: 1      # actor passes per rollout after critic warmup
-critic_update_epochs: 4
-critic_warmup_epochs: 5
-actor_lr: 1e-6
-critic_lr: 3e-4
-gamma: 0.99           # discount per chunk decision
-gae_lambda: 0.95
-v_loss_coef: 0.5
+# Conservative starting configuration for this Flow PPO adaptation.
+steps_per_epoch: 2048  # chunk decisions; actual primitive steps logged separately
+update_epochs: 1
+critic_warmup_epochs: 5  # adaptation: old actor-only checkpoint has no compatible V
+actor_lr: 3.0e-7
+critic_lr: 3.0e-4
+clip_ratio: 0.2
+value_clip: 0.2
 max_grad_norm: 0.5
-anchor_coef: 0.1
-adv_temperature: 1.0
-max_weight: 5.0
-pretrained_ckpt: "./checkpoints/idql_policy_best.pth"
-explore_noise: 0.02
+target_kl: 0.01
+# Per-primitive-step gamma; per-decision lambda. Rewards discounted inside chunk.
+gamma: 0.99
+gae_lambda: 0.95
+reward_scale: 1.0
+noise_level: 0.7
+min_std: 0.0067
+# Full latent event is valid for coupled Transformer chunk coordinates.
+# prefix reproduces upstream executed-prefix surrogate; it is an approximation.
+ratio_scope: full
+verify_logprobs: true
+pretrained_ckpt: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_PullCubeTool_20260908_105144/checkpoints/idql_policy_ep60.pth"
+stats_path: null
+pretrained_weight_key: auto  # auto prefers EMA for offline checkpoints

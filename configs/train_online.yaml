@@ -3,23 +3,20 @@ defaults:
   - algo: pg
   - env: maniskill
   - _self_
-
-run_name: "awr_flow_${env.env_id}"
+run_name: "rl100_flow_ppo_${env.env_id}"
 seed: 42
-device: "cuda"
-epochs: 50
-batch_size: 32
-save_dir: "./outputs/online"
-save_epoch: 10
-
-algo:
-  pretrained_ckpt: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_PullCubeTool_20260908_105144/checkpoints/idql_policy_ep60.pth"
-
+device: cuda
+epochs: 100
+batch_size: 128
+save_dir: ./outputs/online
+save_epoch: 5
+resume: null
+eval_only: false
+quiet: false
 eval:
   every: 5
-  # Same seed set for offline baseline and every online evaluation.
+  sampler: cps
   seeds: [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009]
-
 wandb:
-  enable: true
-  project: "RL-100-Infra"
+  enable: false
+  project: RL-100-Infra

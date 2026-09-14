@@ -5,3 +5,5 @@ checkpoints/
 *.pyc
 *.mp4
 *.pth
+*.log
+*.sh

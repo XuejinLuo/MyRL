@@ -131,7 +131,10 @@ def main(cfg: DictConfig):
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint 不存在: {ckpt_path}")
 
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+    if checkpoint.get("format") == "myrl_flow_ppo_v1":
+        raise ValueError("Flow PPO checkpoint: use python evaluate_online.py --checkpoint PATH; "
+                         "evaluate.py uses the legacy ODE sampler")
     weight_key = cfg.eval.get("weight_key", "auto")
 
     if weight_key == "auto":

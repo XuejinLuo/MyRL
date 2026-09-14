@@ -3,7 +3,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_cluster import fps
+try:
+    from torch_cluster import fps
+except ImportError:
+    fps = None  # Deterministic pure Torch fallback for CPU/tests.
 import time
 
 # =====================================================================
@@ -36,15 +39,27 @@ def index_points(points, idx):
     return new_points
 
 def farthest_point_sample(xyz, npoint):
-    # xyz: [B, N, 3]
     B, N, _ = xyz.shape
-    batch = torch.arange(B, device=xyz.device).view(-1, 1).repeat(1, N).view(-1)
-    flat_xyz = xyz.view(-1, 3)
-    
-    # torch_cluster 的 FPS 是 C++ 高度优化的，无 python for 循环
-    idx = fps(flat_xyz, batch, ratio=npoint/N, random_start=False)
-    
-    return idx.view(B, npoint) % N
+    if not 1 <= npoint <= N:
+        raise ValueError('FPS requires 1 <= npoint <= number of input points')
+    if fps is not None:
+        batch = torch.arange(B, device=xyz.device).repeat_interleave(N)
+        idx = fps(xyz.reshape(-1, 3), batch, ratio=npoint/N, random_start=False)
+        if idx.numel() == B * npoint:
+            return idx.reshape(B, npoint) % N
+    # Same fixed first point; CPU fallback trades speed for portability.
+    with torch.no_grad():
+        centroids = torch.empty(B, npoint, dtype=torch.long, device=xyz.device)
+        distances = torch.full((B, N), float('inf'), device=xyz.device)
+        farthest = torch.zeros(B, dtype=torch.long, device=xyz.device)
+        rows = torch.arange(B, device=xyz.device)
+        for i in range(npoint):
+            centroids[:, i] = farthest
+            center = xyz[rows, farthest][:, None]
+            distances = torch.minimum(distances, (xyz.float() - center.float()).square().sum(-1))
+            farthest = distances.argmax(-1)
+        return centroids
+
 def query_ball_point(radius, nsample, xyz, new_xyz):
     """球查询；邻域为空时使用最近点兜底。"""
     B, N, _ = xyz.shape
