@@ -3,7 +3,7 @@ import random
 from contextlib import contextmanager
 import numpy as np
 import torch
-
+from tqdm import tqdm
 
 def seed_all(seed):
     random.seed(seed)
@@ -39,11 +39,19 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps):
     rewards, successes = [], []
     env = None
     with preserve_rng():
+        pbar = tqdm(
+            total=len(seeds),
+            desc=f"Eval {getattr(actor, 'eval_mode', 'unknown').upper()}",
+            unit="ep",
+            dynamic_ncols=True,
+            mininterval=0.5,
+        )
         try:
             seed_all(int(seeds[0]))
             env = make_env()
             actor.eval()
             for seed in seeds:
+                pbar.set_postfix(seed=int(seed), refresh=False)
                 seed_all(int(seed))
                 obs, _ = env.reset(seed=int(seed))
                 done, truncated, success, reward_sum = False, False, False, 0.
@@ -56,7 +64,15 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps):
                     reward_sum += float(reward)
                 rewards.append(reward_sum)
                 successes.append(float(success))
+                pbar.set_postfix(
+                    seed=int(seed),
+                    success_rate=f"{np.mean(successes):.1%}",
+                    mean_reward=f"{np.mean(rewards):.1f}",
+                    refresh=False,
+                )
+                pbar.update(1)
         finally:
+            pbar.close()
             if env is not None:
                 env.close()
             for module, mode in module_modes:
