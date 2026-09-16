@@ -20,3 +20,8 @@ eval:
 wandb:
   enable: false
   project: RL-100-Infra
+
+output: null
+video:
+  every: 10
+  episodes: 2

@@ -96,7 +96,8 @@ def test_ppo_changes_actor_and_freezes_encoder():
     before = pi.policy.backbone.w.detach().clone()
     encoder = copy.deepcopy(pi.policy.encoder.state_dict())
     metrics = ppo.update(batch, chain[:, -1].mean((1, 2)), torch.randn(16), batch_size=8, epochs=2)
-    assert metrics['ppo/actor_updates'] == 12
+    # PPO v2 accumulates generation-step gradients before one minibatch update.
+    assert metrics['ppo/actor_updates'] == 4
     assert pi.policy.backbone.w != before
     assert all(p.grad is None for p in pi.policy.encoder.parameters())
     for k, v in encoder.items():
@@ -187,7 +188,7 @@ def test_real_backbone_encoder_forward_and_ppo_step():
     ppo = FlowPPO(pi, critic, target_kl=None)
     batch = dict(features=features, chains=chain, logprobs=old, values=torch.zeros(2))
     result = ppo.update(batch, torch.tensor([-1., 1.]), torch.tensor([1., 2.]), batch_size=2, epochs=1)
-    assert result['ppo/actor_updates'] == 2
+    assert result['ppo/actor_updates'] == 1
 
 
 def test_offline_ema_and_online_weight_selection():

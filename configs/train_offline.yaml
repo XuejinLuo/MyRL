@@ -8,7 +8,7 @@ defaults:
   - _self_                 # _self_ 保证下方定义的全局变量优先级最高，可覆盖子配置
 
 # 全局工程设置
-run_name: "idql_flow_chunk16_{env.env_id}"
+run_name: "idql_flow_chunk16_${env.env_id}"
 project: "my_rl100_infra"
 seed: 42
 device: "cuda"
@@ -21,3 +21,15 @@ wandb:
   enable: true
   project: "RL-100-Infra"
   entity: null
+output: null
+num_workers: 4
+debug_actions: false
+noise_level: 0.7
+min_std: 0.0067
+eval:
+  every: 10
+  sampler: cps
+  seeds: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009]
+video:
+  every: 50
+  episodes: 2

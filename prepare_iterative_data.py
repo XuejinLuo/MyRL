@@ -12,6 +12,7 @@ def main():
     p.add_argument('--h5', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--stats', required=True)
+    p.add_argument('--max-episodes', type=int, default=None)
     p.add_argument('overrides', nargs='*')
     args = p.parse_args()
     with initialize_config_dir(version_base=None, config_dir=str(Path(__file__).parent.resolve()/'configs')):
@@ -21,7 +22,7 @@ def main():
     np.random.seed(cfg.seed)
     # Validate labels BEFORE invoking the historical demonstration loader.
     with h5py.File(args.h5, 'r') as f:
-        for key in f:
+        for key in list(f)[:args.max_episodes]:
             g = f[key]
             if 'success' not in g or 'terminated' not in g or 'truncated' not in g:
                 raise ValueError(f'{key}: requires success/terminated/truncated; do not infer success from episode end')
@@ -29,7 +30,7 @@ def main():
                 raise ValueError(f'{key}: tcp_pose missing')
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    raw = load_maniskill_h5(args.h5, workspace_bounds=cfg.env.workspace_bounds, n_points=cfg.env.num_points)
+    raw = load_maniskill_h5(args.h5, max_episodes=args.max_episodes, workspace_bounds=cfg.env.workspace_bounds, n_points=cfg.env.num_points)
     items = []
     with h5py.File(args.h5, 'r') as f:
         for index, (key, ep) in enumerate(zip(f.keys(), raw)):

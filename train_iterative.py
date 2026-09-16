@@ -1,5 +1,6 @@
 """Collect -> append immutable sources -> offline IDQL -> validation selection."""
 import json
+import shutil
 from pathlib import Path
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from utils.online_eval import evaluate_policy, seed_all
 from data.iterative_store import (SCHEMA, digest, load_sources, load_episode,
                                   save_episode, write_json)
 from workflows.offline_round import train_round
+from utils.experiment import evaluate_base
 
 
 def validate(cfg):
@@ -60,6 +62,7 @@ def main(cfg):
     else:
         output.mkdir(parents=True)
         write_json(output/'config.json', frozen)
+        OmegaConf.save(cfg, output/'config.yaml', resolve=True)
         state = dict(next_round=0, checkpoint=str(source), checkpoint_sha256=digest(source),
                      manifest=str(manifest), manifest_sha256=digest(manifest), stats_sha256=digest(stats))
         write_json(output/'state.json', state)
@@ -98,10 +101,8 @@ def main(cfg):
 
     from utils.online_env import make_env_ManiSkill
     from workflows.collection import PrimitiveRecorder
-    def evaluate(seeds=None):
-        actor.eval_mode = cfg.eval.sampler
-        return evaluate_policy(lambda: make_env_ManiSkill(cfg), actor, encode,
-            normalizer, list(cfg.eval.seeds if seeds is None else seeds), cfg.model.num_inference_steps)
+    def evaluate(seeds=None, epoch=0):
+        return evaluate_base(cfg, base, normalizer, rd, epoch, seeds=seeds)
 
     def save(path, epoch, metrics):
         torch.save(dict(model_state_dict=base.state_dict(), normalizer=normalizer.stats,
@@ -115,6 +116,7 @@ def main(cfg):
             raise ValueError('Dataset environment/preprocessing differs from current config')
         rd = output/f'round_{round_index:03d}'
         rd.mkdir(exist_ok=True)
+        (rd/'checkpoints').mkdir(exist_ok=True)
         # Restart an interrupted round from its incumbent; finished episodes are reused.
         # Config and incumbent hashes above prevent mixing incompatible runs.
         baseline = evaluate()
@@ -183,11 +185,20 @@ def main(cfg):
         write_json(output/'state.json', state)
     load(state['checkpoint'])
     final = output/'selected_policy.pth'
-    save(final, -1, {})
+    selected_cp = torch.load(state['checkpoint'], map_location='cpu', weights_only=True)
+    save(final, selected_cp.get('epoch', -1), selected_cp.get('metrics', {}))
+    write_json(output/'selection.json', dict(source=state['checkpoint'],
+        source_sha256=state['checkpoint_sha256'], checkpoint=str(output/'checkpoints'/'best.pth'),
+        weight_key='model_state_dict', metrics=selected_cp.get('metrics', {})))
     normalizer.save(str(output/'dataset_stats.json'))
     # Test is evaluated only after all selection; never feeds back into the loop.
+    (output/'checkpoints').mkdir(exist_ok=True)
+    shutil.copyfile(final, output/'checkpoints'/'best.pth')
+    normalizer.save(str(output/'checkpoints'/'dataset_stats.json'))
     if cfg.final_test:
-        write_json(output/'test.json', evaluate(cfg.test_seeds))
+        result = evaluate_base(cfg, base, normalizer, output, cfg.epochs,
+                               tag='test', seeds=cfg.test_seeds)
+        write_json(output/'test.json', result)
     print(f'Selected policy: {final}', flush=True)
 
 

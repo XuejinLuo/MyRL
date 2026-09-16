@@ -6,7 +6,7 @@ from envs.maniskill_bridge import ManiSkillToRL100Wrapper
 from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 
-def make_env_ManiSkill(cfg, primitive_wrapper=None):
+def make_env_ManiSkill(cfg, primitive_wrapper=None, video=None):
     """ 创建并包装 ManiSkill 真实仿真环境 """
 
     env_id = cfg.env.get("env_id", "PushCube-v1")
@@ -40,6 +40,10 @@ def make_env_ManiSkill(cfg, primitive_wrapper=None):
         use_color=cfg.env.use_color
     )
     
+    if video is not None:
+        from utils.eval_video import EvalVideo
+        env = EvalVideo(env, **video)
+
     if primitive_wrapper is not None:
         env = primitive_wrapper(env)
 

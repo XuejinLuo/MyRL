@@ -8,6 +8,7 @@ from algos.embodied_idql import (CriticFeatureExtractor, IDQL_VNet_Wrapper,
     IDQL_QNet_Wrapper, Policy_IDQL_Wrapper, EmbodiedIDQL)
 from data.iterative_dataset import IterativeDataset
 from data.iterative_store import write_json
+from utils.experiment import log_metrics
 
 
 class PrefixQ(IDQL_QNet_Wrapper):
@@ -81,13 +82,15 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
         if epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
             raw = copy.deepcopy(base.state_dict())
             base.load_state_dict(ema.state_dict())
-            result = evaluate()
+            result = evaluate(epoch=epoch)
             row.update(result)
-            candidate = directory/f'offline_ep{epoch}.pth'
+            candidate = directory/'checkpoints'/f'offline_ep{epoch}.pth'
             save(candidate, epoch, result)
             if result['Eval/Success_Rate'] > best_rate:
                 best_rate, selected = result['Eval/Success_Rate'], str(candidate)
             base.load_state_dict(raw)
-        write_json(directory/f'metrics_ep{epoch}.json', row)
+        log_metrics(directory, epoch, {k: v for k, v in row.items() if k != 'epoch'}, stage='iterative')
+        log_metrics(directory.parent, epoch, {k: v for k, v in row.items() if k != 'epoch'},
+                    stage='iterative', round=directory.name)
         print(row, flush=True)
     return selected

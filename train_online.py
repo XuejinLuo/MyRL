@@ -1,6 +1,7 @@
 """ManiSkill Flow fine-tuning using RL-100-style generation-chain PPO."""
 import json
 import os
+import shutil
 from datetime import datetime
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ from models.policy import EmbodiedGenPolicy
 from models.critics.q_v_network import VNetwork
 from algos.pg import FlowPPO, compute_gae
 from utils.normalizer import MinMaxNormalizer
+from utils.experiment import evaluation_paths, write_json
 from utils.online_eval import evaluate_policy, seed_all
 from utils.online_checkpoint import FORMAT, policy_weights, make_actor, payload
 
@@ -48,6 +50,7 @@ def build_base(cfg, device):
 
 def run(cfg, env_factory=None):
     validate(cfg)
+    custom_env_factory = env_factory is not None
     if env_factory is None:
         from utils.online_env import make_env_ManiSkill
         env_factory = lambda: make_env_ManiSkill(cfg)
@@ -60,6 +63,10 @@ def run(cfg, env_factory=None):
     checkpoint = torch.load(source, map_location=device, weights_only=True)
     if cfg.resume and checkpoint.get('format') != FORMAT:
         raise ValueError('resume requires a Flow PPO training checkpoint')
+    if 'config' in checkpoint:
+        for section in ('model', 'env'):
+            if checkpoint['config'][section] != OmegaConf.to_container(cfg[section], resolve=True):
+                raise ValueError(f'Pretrained checkpoint {section} configuration differs')
     if checkpoint.get('format') == FORMAT:
         saved = checkpoint['config']
         for section, keys in {'model': list(cfg.model), 'env': list(cfg.env),
@@ -119,21 +126,27 @@ def run(cfg, env_factory=None):
         return actor.encode(torch.as_tensor(pc, device=device)[None],
                             torch.as_tensor(state, device=device)[None])
 
-    def evaluate(mode):
+    def evaluate(mode, epoch=0):
         previous = actor.eval_mode
         actor.eval_mode = mode
         try:
-            return evaluate_policy(env_factory, actor, encode, normalizer,
-                                   list(cfg.eval.seeds), cfg.model.num_inference_steps)
+            destination, video = evaluation_paths(cfg, run_dir, epoch, sampler=mode)
+            factory = env_factory if custom_env_factory else lambda: make_env_ManiSkill(cfg, video=video)
+            return evaluate_policy(factory, actor, encode, normalizer,
+                list(cfg.eval.seeds), cfg.model.num_inference_steps, output_dir=destination,
+                metadata=dict(stage='online', split='validation', epoch=epoch, sampler=mode,
+                              env=OmegaConf.to_container(cfg.env, resolve=True)))
         finally:
             actor.eval_mode = previous
 
+    run_dir = hydra.utils.to_absolute_path(cfg.get('output') or os.path.join(
+        cfg.save_dir, f'{cfg.run_name}_{datetime.now():%Y%m%d_%H%M%S_%f}'))
+    if os.path.exists(run_dir):
+        raise FileExistsError(f'Output already exists: {run_dir}')
     if cfg.eval_only:
         results = {mode: evaluate(mode) for mode in ('cps', 'ode')}
         print(json.dumps(results, indent=2), flush=True)
         return results
-    run_dir = os.path.join(hydra.utils.to_absolute_path(cfg.save_dir),
-                           f'{cfg.run_name}_{datetime.now():%Y%m%d_%H%M%S_%f}')
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
     os.makedirs(ckpt_dir)
     normalizer.save(os.path.join(ckpt_dir, 'dataset_stats.json'))
@@ -147,7 +160,7 @@ def run(cfg, env_factory=None):
     def log(epoch, metrics):
         # JSON null for unavailable episode rate rather than invalid NaN JSON.
         with open(os.path.join(run_dir, 'metrics.jsonl'), 'a') as f:
-            f.write(json.dumps({'epoch': epoch, **metrics}, allow_nan=False) + '\n')
+            f.write(json.dumps({'stage': 'online', 'epoch': epoch, **metrics}, allow_nan=False) + '\n')
         if wandb_run:
             wandb_run.log(metrics, step=epoch)
         print(json.dumps({'epoch': epoch, **metrics}, ensure_ascii=False), flush=True)
@@ -159,10 +172,13 @@ def run(cfg, env_factory=None):
         if best_score is None or score > best_score:
             best_score, best_metrics = score, result
             torch.save(payload(base, cfg, normalizer, epoch, result), os.path.join(ckpt_dir, 'online_best.pth'))
+            shutil.copyfile(os.path.join(ckpt_dir, 'online_best.pth'), os.path.join(ckpt_dir, 'best.pth'))
+            write_json(os.path.join(run_dir, 'selection.json'), dict(epoch=epoch, metrics=result,
+                       checkpoint=os.path.join(ckpt_dir, 'best.pth'), weight_key='model_state_dict'))
 
     try:
-        baseline = evaluate(cfg.eval.sampler)
-        ode_baseline = evaluate('ode') if cfg.eval.sampler != 'ode' else baseline
+        baseline = evaluate(cfg.eval.sampler, start_epoch)
+        ode_baseline = evaluate('ode', start_epoch) if cfg.eval.sampler != 'ode' else baseline
         log(start_epoch, {**baseline, **{'BaselineODE/' + k.split('/')[-1]: v for k, v in ode_baseline.items()}})
         save_best(start_epoch, baseline)
         torch.save(payload(base, cfg, normalizer, start_epoch, baseline), os.path.join(ckpt_dir, 'initial_policy.pth'))
@@ -235,7 +251,7 @@ def run(cfg, env_factory=None):
                 'Adv/Mean': adv.mean().item(), 'Adv/Std': adv.std(unbiased=False).item(),
                 'Adv/Negative_Fraction': (adv < 0).float().mean().item()})
             if epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
-                result = evaluate(cfg.eval.sampler)
+                result = evaluate(cfg.eval.sampler, epoch)
                 metrics.update(result)
                 metrics['Eval/Delta_Success'] = result['Eval/Success_Rate'] - baseline['Eval/Success_Rate']
                 save_best(epoch, result)
@@ -245,6 +261,7 @@ def run(cfg, env_factory=None):
                 state.update({'critic': critic.state_dict(), 'actor_optimizer': trainer.actor_optimizer.state_dict(),
                     'critic_optimizer': trainer.critic_optimizer.state_dict(), 'total_env_steps': total_steps})
                 torch.save(state, os.path.join(ckpt_dir, f'online_ep{epoch}.pth'))
+                torch.save(state, os.path.join(ckpt_dir, 'last.pth'))
         return {'run_dir': run_dir, 'best_metrics': best_metrics, 'total_env_steps': total_steps}
     finally:
         if env is not None:

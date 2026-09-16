@@ -1,6 +1,7 @@
 # train_offline.py
 
 import os
+from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,7 +11,6 @@ from datetime import datetime
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import wandb
 
 # =========================================================================
 # 导入你提供的核心模块
@@ -20,7 +20,8 @@ from models.policy import EmbodiedGenPolicy
 from models.encoders.pointnext import PointNeXtEncoder
 from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.idql import IDQL
-from utils.eval_utils import evaluate_and_record_video
+from utils.experiment import evaluate_base, log_metrics, write_json
+from utils.online_eval import seed_all, preserve_rng
 from utils.debug_logger import DebugLogger
 from utils.normalizer import MinMaxNormalizer
 
@@ -95,17 +96,21 @@ def verify_overfitting_actions(cfg, policy, batch, normalizer, epoch, device):
 # =========================================================================
 @hydra.main(version_base=None, config_path="configs", config_name="train_offline")
 def main(cfg: DictConfig):
+    seed_all(cfg.seed)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{cfg.run_name}_{timestamp}"
     # 临时解除 Hydra 配置的只读限制，覆写内部路径
     OmegaConf.set_struct(cfg, False)
     cfg.run_name = run_name
-    cfg.save_dir = os.path.join(cfg.save_dir, run_name)
+    cfg.save_dir = hydra.utils.to_absolute_path(cfg.get("output") or os.path.join(cfg.save_dir, run_name))
+    if Path(cfg.save_dir).exists():
+        raise FileExistsError(f"Output already exists: {cfg.save_dir}")
     OmegaConf.set_struct(cfg, True)
     debug_logger = DebugLogger(cfg.save_dir)
 
     # 1. 初始化实验记录 (Wandb 会自动使用新的带时间戳的 cfg.run_name)
     if cfg.wandb.enable:
+        import wandb
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
@@ -115,6 +120,7 @@ def main(cfg: DictConfig):
     
     device = torch.device(cfg.device)
     os.makedirs(cfg.save_dir, exist_ok=True)
+    OmegaConf.save(cfg, os.path.join(cfg.save_dir, "config.yaml"), resolve=True)
 
     # 2. 准备数据流 (Dataset & DataLoader)
     # # 实际项目中，替换 generate_mock_trajectories 为你的本地数据读取逻辑
@@ -134,7 +140,7 @@ def main(cfg: DictConfig):
     from data.maniskill_dataset import load_maniskill_h5 
     
     # 从 Hydra 配置中读取路径和限制参数
-    data_path = cfg.dataset.data_path
+    data_path = hydra.utils.to_absolute_path(cfg.dataset.data_path)
     max_episodes = cfg.dataset.get("max_episodes", None)
     
     # 动态加载数据
@@ -177,10 +183,12 @@ def main(cfg: DictConfig):
         batch_size=cfg.batch_size, 
         shuffle=True, 
         drop_last=True,
-        num_workers=4,          # 开启多进程数据加载 (可根据你的CPU核心数调整)
+        num_workers=cfg.num_workers,          # 开启多进程数据加载 (可根据你的CPU核心数调整)
         pin_memory=True,        # 开启锁页内存，加速 CPU Tensor 向 GPU 的拷贝
-        persistent_workers=True # 防止每个 epoch 重新创建 worker 导致的延迟
+        persistent_workers=cfg.num_workers > 0 # 防止每个 epoch 重新创建 worker 导致的延迟
     )
+    if len(dataloader) == 0:
+        raise ValueError("Dataset smaller than batch_size")
     print(f"✅ 数据加载完成! Total batches per epoch: {len(dataloader)}")
 
     # 3. 初始化网络模型
@@ -239,6 +247,7 @@ def main(cfg: DictConfig):
     # 5. 开始训练 (Training Loop)
     print(f"🔥 开始 IDQL 离线训练 (Total Epochs: {cfg.epochs})")
     
+    best_score = None
     for epoch in range(1, cfg.epochs + 1):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{cfg.epochs}", leave=False)
         epoch_metrics = {}
@@ -296,22 +305,26 @@ def main(cfg: DictConfig):
 
         print(f"Epoch {epoch:03d} | Actor Loss: {epoch_metrics['loss/actor']:.4f} | Q Value: {epoch_metrics['q_value']:.4f} | Accept Ratio: {epoch_metrics['metrics/accept_ratio']*100:.1f}%")
 
-        # 定期保存权重 (Save Checkpoint)
+        result = {}
+        if epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
+            result = evaluate_base(cfg, ema_policy, normalizer, cfg.save_dir, epoch)
+        state = dict(model_state_dict=base_policy.state_dict(),
+                     ema_model_state_dict=ema_policy.state_dict(), normalizer=normalizer.stats,
+                     config=OmegaConf.to_container(cfg, resolve=True), epoch=epoch, metrics=result)
+        if result:
+            score = (result['Eval/Success_Rate'], result['Eval/Mean_Reward'])
+            if best_score is None or score > best_score:
+                best_score = score
+                torch.save(state, os.path.join(ckpt_dir, 'best.pth'))
+                write_json(Path(cfg.save_dir)/'selection.json', dict(epoch=epoch, metrics=result,
+                    checkpoint=str(Path(ckpt_dir)/'best.pth'), weight_key='ema_model_state_dict'))
         if epoch % cfg.save_epoch == 0 or epoch == cfg.epochs:
-            ckpt_path = os.path.join(ckpt_dir, f"idql_policy_ep{epoch}.pth")
-            # 保存双份权重字典
-            torch.save({
-                'model_state_dict': base_policy.state_dict(),
-                'ema_model_state_dict': ema_policy.state_dict()
-            }, ckpt_path)
-            print(f"   💾 Saved Checkpoint (with EMA) to {ckpt_path}")
-            # 用 EMA 策略进行录像验证
-            # 注意第二入参：用平滑后的 ema_policy 去执行物理环境 Rollout
-            evaluate_and_record_video(cfg, ema_policy, epoch, device, normalizer=normalizer)
-            verify_overfitting_actions(cfg, ema_policy, batch, normalizer, epoch, device)
-            # 临时改成评估基础策略，看看是否过拟合
-            # evaluate_and_record_video(cfg, base_policy, epoch, device, normalizer=normalizer)
-            # verify_overfitting_actions(cfg, base_policy, dataloader, normalizer, epoch, device)
+            torch.save(state, os.path.join(ckpt_dir, f'idql_policy_ep{epoch}.pth'))
+            torch.save(state, os.path.join(ckpt_dir, 'last.pth'))
+            if cfg.get('debug_actions', False):
+                with preserve_rng():
+                    verify_overfitting_actions(cfg, ema_policy, batch, normalizer, epoch, device)
+        log_metrics(cfg.save_dir, epoch, {**epoch_metrics, **result}, stage='offline')
 
     if cfg.wandb.enable:
         wandb.finish()
