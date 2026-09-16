@@ -34,10 +34,59 @@ def main():
     with h5py.File(args.h5, 'r') as f:
         for index, (key, ep) in enumerate(zip(f.keys(), raw)):
             g = f[key]
-            ep['success'] = g['success'][:].reshape(-1).astype(bool)
+            success = g['success'][:].reshape(-1).astype(bool)
+            terminated = g['terminated'][:].reshape(-1).astype(bool)
+            raw_truncated = g['truncated'][:].reshape(-1).astype(bool)
+
+            t = len(ep['action'])
+            if t == 0:
+                raise ValueError(f'{key}: empty trajectory')
+
+            for name, values in (
+                ('success', success),
+                ('terminated', terminated),
+                ('truncated', raw_truncated),
+            ):
+                if len(values) != t:
+                    raise ValueError(f'{key}: {name} length differs from actions')
+
+            if len(ep['pc']) != t + 1 or len(ep['state']) != t + 1:
+                raise ValueError(f'{key}: expected T+1 observations')
+
+            # Align imported demonstrations with the current environment horizon.
+            horizon = int(cfg.env.max_episode_steps)
+            if horizon < 1:
+                raise ValueError('max_episode_steps must be positive')
+
+            stop = min(t, horizon)
+
+            # Keep the first genuine terminal transition and discard later actions.
+            terminal_indices = np.flatnonzero(terminated)
+            if terminal_indices.size:
+                stop = min(stop, int(terminal_indices[0]) + 1)
+
+            ep['pc'] = ep['pc'][:stop + 1]
+            ep['state'] = ep['state'][:stop + 1]
+            ep['action'] = ep['action'][:stop]
+
+            ep['success'] = success[:stop].copy()
             ep['reward'] = ep['success'].astype(np.float32)
-            ep['terminated'] = g['terminated'][:].reshape(-1).astype(bool)
-            ep['truncated'] = g['truncated'][:].reshape(-1).astype(bool)
+            ep['terminated'] = terminated[:stop].copy()
+
+            # Historical timeout flags may remain true during continued recording.
+            # Rebuild truncation for the current horizon or recording boundary.
+            ep['truncated'] = np.zeros(stop, dtype=bool)
+            if not ep['terminated'][-1]:
+                ep['truncated'][-1] = True
+
+            if index < 5:
+                print(
+                    f'{key}: actions {t} -> {stop}, '
+                    f'terminated={bool(ep["terminated"][-1])}, '
+                    f'truncated={bool(ep["truncated"][-1])}, '
+                    f'success_any={bool(ep["success"].any())}',
+                    flush=True,
+                )
             if not cfg.env.use_color:
                 ep['pc'] = ep['pc'][..., :3]
             file = out/f'episode_{index:06d}.npz'

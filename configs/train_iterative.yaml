@@ -15,7 +15,7 @@ episodes_per_round: 100
 epochs: 30
 critic_warmup_epochs: 3
 batch_size: 64
-num_workers: 0
+num_workers: 4
 ema_decay: 0.999
 weight_key: auto
 collect_sampler: cps

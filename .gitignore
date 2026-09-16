@@ -7,3 +7,5 @@ checkpoints/
 *.pth
 *.log
 *.sh
+*.npz
+*.json
