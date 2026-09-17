@@ -1,0 +1,6 @@
+# Panda / pd_ee_delta_pose task profile.
+env:
+  env_id: StackCube-v1
+model:
+  action_dim: 7
+  state_dim: 16

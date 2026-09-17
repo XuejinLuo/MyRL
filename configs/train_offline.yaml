@@ -1,35 +1,16 @@
-# configs/train_offline.yaml
-# 核心魔法：Hydra 会自动去对应文件夹下加载这些 yaml 并挂载到 cfg 树上
+# Stage wiring; edit the shared control panel in config.yaml.
 defaults:
-  - model: flow_3d         # 加载 configs/model/flow_3d.yaml 作为 cfg.model
-  - algo: idql             # 加载 configs/algo/idql.yaml 作为 cfg.algo
-  - dataset: offline_data  # 加载 configs/dataset/offline_data.yaml 作为 cfg.dataset
-  - env: maniskill 
-  - _self_                 # _self_ 保证下方定义的全局变量优先级最高，可覆盖子配置
-
-# 全局工程设置
-run_name: "idql_flow_chunk16_${env.env_id}"
-project: "my_rl100_infra"
-seed: 42
-device: "cuda"
-epochs: 200
-save_epoch: 10
-batch_size: 64
-save_dir: "./outputs/offline"
-
-wandb:
-  enable: true
-  project: "RL-100-Infra"
-  entity: null
-output: null
-num_workers: 4
-debug_actions: false
-noise_level: 0.7
-min_std: 0.0067
-eval:
-  every: 10
-  sampler: cps
-  seeds: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009]
-video:
-  every: 50
-  episodes: 2
+  - config
+  - algo: idql
+  - _self_
+stage: offline
+run_name: ${experiment}_offline
+output: ${paths.root}/offline
+save_dir: ${output}
+epochs: ${stages.offline.epochs}
+batch_size: ${stages.offline.batch_size}
+save_epoch: ${stages.offline.save_every}
+ema_decay: 0.999
+critic_warmup_epochs: ${stages.offline.critic_warmup_epochs}
+algo:
+  use_bc_only: ${stages.offline.use_bc_only}

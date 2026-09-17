@@ -1,27 +1,15 @@
+# Stage wiring; edit the shared control panel in config.yaml.
 defaults:
-  - model: flow_3d
+  - config
   - algo: pg
-  - env: maniskill
   - _self_
-run_name: "rl100_flow_ppo_${env.env_id}"
-seed: 42
-device: cuda
-epochs: 100
-batch_size: 128
-save_dir: ./outputs/online
-save_epoch: 5
-resume: null
+stage: online
+run_name: ${experiment}_online
+output: ${paths.root}/online
+save_dir: ${output}
+epochs: ${stages.online.epochs}
+batch_size: ${stages.online.batch_size}
+save_epoch: ${stages.online.save_every}
+resume: ${stages.online.resume}
 eval_only: false
 quiet: false
-eval:
-  every: 5
-  sampler: cps
-  seeds: [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009]
-wandb:
-  enable: false
-  project: RL-100-Infra
-
-output: null
-video:
-  every: 10
-  episodes: 2

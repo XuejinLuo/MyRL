@@ -12,12 +12,12 @@ target_kl: 0.01
 gamma: 0.99
 gae_lambda: 0.95
 reward_scale: 1.0
-noise_level: 0.7
-min_std: 0.0067
+noise_level: ${noise_level}
+min_std: ${min_std}
 # Full latent event is valid for coupled Transformer chunk coordinates.
 # prefix reproduces upstream executed-prefix surrogate; it is an approximation.
 ratio_scope: full
 verify_logprobs: true
-pretrained_ckpt: "/home/luo/MyRL/outputs/offline/idql_flow_chunk16_PullCubeTool_20260908_105144/checkpoints/idql_policy_ep60.pth"
-stats_path: null
-pretrained_weight_key: auto  # auto prefers EMA for offline checkpoints
+pretrained_ckpt: ${stages.online.initial_ckpt}
+stats_path: ${stages.online.stats_path}
+pretrained_weight_key: auto
