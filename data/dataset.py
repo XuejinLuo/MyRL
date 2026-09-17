@@ -118,7 +118,7 @@ class TrajectoryDataset(Dataset):
 
         return {
             k: torch.as_tensor(
-                np.array(v, copy=True), dtype=torch.float32
+                np.asarray(v), dtype=torch.float32
             )
             for k, v in row.items()
         }

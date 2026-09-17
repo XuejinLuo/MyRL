@@ -46,11 +46,13 @@ def load_demonstrations(cfg):
             if len(terminals):
                 stop = min(stop, int(terminals[0])+1)
             cloud = obs['pointcloud']
+            # Read once per trajectory instead of repeated HDF5 lookups/decompression per frame.
+            xyzw_frames = cloud['xyzw'][:stop+1]
+            rgb_frames = cloud['rgb'][:stop+1] if 'rgb' in cloud else None
             frames = []
-            for i in range(stop+1):
-                xyzw = cloud['xyzw'][i]
+            for i, xyzw in enumerate(xyzw_frames):
                 valid = xyzw[..., 3] > 0
-                rgb = cloud['rgb'][i][valid] / 255.0 if 'rgb' in cloud else None
+                rgb = rgb_frames[i][valid] / 255.0 if rgb_frames is not None else None
                 frames.append(preprocess_points(xyzw[valid, :3], rgb,
                     cfg.env.workspace_bounds, cfg.env.num_points, cfg.env.use_color))
             ep = dict(pc=np.stack(frames),
@@ -73,7 +75,7 @@ def export_demonstrations(episodes, cfg, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     items = []
-    for index, ep in enumerate(episodes):
+    for index, ep in enumerate(tqdm(episodes, desc='Exporting demonstrations')):
         path = directory/f'episode_{index:06d}.npz'
         save_episode(path, ep)
         items.append(dict(path=path.name, sha256=digest(path)))

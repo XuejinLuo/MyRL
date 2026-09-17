@@ -33,7 +33,7 @@
 2. **区分终止与超时。** 真实 terminal 不 bootstrap，timeout 从真实最终观察 bootstrap。H5 必须提供 T+1 观察及 success/terminated/truncated 标签，不再把最后一步强行当成功或 terminal。
 3. **保留既有迭代导入的 horizon 处理。** 演示截到第一个真实 terminal、当前任务 horizon 或文件结束；历史持续为真的 timeout 标记不当作每步 terminal，截断末端按 timeout 标记。
 4. **统一点云预处理。** 演示与在线观测共用裁剪、随机采样和颜色拼接；排除齐次坐标 w=0 的无效点与非有限值。缺少 TCP pose 明确报错。
-5. **BC 初始化成为直接 offline 的默认。** 与之前 StackCube 一键流程一致；需要离线 IDQL 时修改 `stages.offline.use_bc_only: false`。
+5. **BC 初始化成为直接 offline 的默认。** 这是相对重构前最新代码的改变：`424ee29` 的直接入口及 StackCube 总入口都为 IDQL，先前称“与旧流程一致”不准确。需要离线 IDQL 时修改 `stages.offline.use_bc_only: false`。
 6. **权重与指标绑定。** 两个离线阶段保存的 `model_state_dict` 就是评估过的 EMA 策略；不再要求下游猜测 raw/EMA。旧 checkpoint 中的 `ema_model_state_dict` 仍支持读取。
 7. **统一选择规则。** 成功率优先，平均 reward 打破平局；迭代候选与本轮 incumbent 使用相同验证种子比较。无改进保留 incumbent，但采集数据继续累积。
 8. **在线 PPO 优化公式与默认超参数未改。** 删除了训练入口中特有的额外 ODE baseline；独立 `evaluate.py` 统一提供 CPS/ODE 对比。

@@ -92,6 +92,8 @@ def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, mon
         return ChunkActionWrapper(env, cfg.model.chunk_size, cfg.env.exec_steps)
     monkeypatch.setitem(sys.modules, 'envs.factory', SimpleNamespace(make_env=make_env))
     configs = {stage: config(stage, tmp_path) for stage in ('offline', 'iterative', 'online')}
+    configs['offline'].eval.every = 2
+    configs['offline'].save_epoch = 2
     offline.run(configs['offline'])
     iterative.run(configs['iterative'])
     online.run(configs['online'])
@@ -102,6 +104,11 @@ def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, mon
             assert (output/name).exists(), (stage, name)
         rows = [json.loads(line) for line in (output/'metrics.jsonl').read_text().splitlines()]
         assert len(list(csv.DictReader((output/'metrics.csv').open()))) == len(rows)
+        if stage == 'offline':
+            assert rows[0]['Time/Artifact_Seconds'] == 0
+            assert rows[0]['Time/Eval_Seconds'] == 0
+            assert rows[0]['Train/Batches'] == 1
+            assert rows[0]['Train/Samples_Per_Second'] > 0
         assert len({(row['round'], row['epoch']) for row in rows}) == len(rows)
         for row in rows:
             assert row['schema'] == 'myrl_metrics_v2' and row['stage'] == stage
@@ -173,3 +180,55 @@ def test_common_validation_rejects_inconsistent_video_and_test_seeds(tmp_path):
     cfg.comparison.seed_start = 2000
     with pytest.raises(ValueError, match='disjoint'):
         validate_common(cfg)
+
+
+def test_dataset_is_not_mutated_and_single_process_loader_works(tmp_path):
+    from data.dataset import TrajectoryDataset
+    from utils.normalizer import MinMaxNormalizer
+    from workflows.offline_round import build_loader
+    cfg = config('offline', tmp_path)
+    ep = primitive_episode()
+    original = {key: value.copy() for key, value in ep.items()}
+    norm = MinMaxNormalizer()
+    norm.fit({key: ep[key] for key in ('action', 'state')})
+    dataset = TrajectoryDataset([ep], cfg, norm)
+    item = dataset[0]
+    for value in item.values():
+        value.add_(100)
+    for key in ep:
+        np.testing.assert_array_equal(ep[key], original[key])
+    single = build_loader(dataset, cfg, torch.device('cpu'))
+    assert single.multiprocessing_context is None
+    assert len(list(single)) == 1
+
+
+def test_loader_spawn_persists_across_epochs(tmp_path):
+    # Tensor transfer uses a local Unix socket; some hosted test runtimes prohibit it.
+    import socket
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip('Runtime prohibits Unix sockets required for tensor IPC')
+    else:
+        probe.close()
+    from data.dataset import TrajectoryDataset
+    from utils.normalizer import MinMaxNormalizer
+    from workflows.offline_round import build_loader
+    cfg = config('offline', tmp_path)
+    ep = primitive_episode()
+    norm = MinMaxNormalizer()
+    norm.fit({key: ep[key] for key in ('action', 'state')})
+    dataset = TrajectoryDataset([ep], cfg, norm)
+    cfg.num_workers = 1
+    loader = build_loader(dataset, cfg, torch.device('cpu'))
+    loader.timeout = 20
+    assert loader.multiprocessing_context.get_start_method() == 'spawn'
+    try:
+        first = list(loader)
+        worker_pids = [worker.pid for worker in loader._iterator._workers]
+        second = list(loader)
+        assert len(first) == len(second) == 1
+        assert worker_pids == [worker.pid for worker in loader._iterator._workers]
+    finally:
+        if loader._iterator is not None:
+            loader._iterator._shutdown_workers()
