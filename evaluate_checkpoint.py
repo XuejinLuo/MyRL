@@ -13,7 +13,7 @@ def main():
     p.add_argument('--seed-start', type=int, default=3000)
     p.add_argument('--episodes', type=int, default=100)
     p.add_argument('--samplers', nargs='+', choices=['cps', 'ode'], default=['cps', 'ode'])
-    p.add_argument('--video-episodes', type=int, default=2)
+    p.add_argument('--video-episodes', type=int, default=5)
     p.add_argument('--device', default='cuda')
     args = p.parse_args()
     if args.episodes < 1 or args.video_episodes < 0:

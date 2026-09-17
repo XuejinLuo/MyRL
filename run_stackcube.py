@@ -15,7 +15,7 @@ def build_commands(args):
     val = 'eval.seeds=[' + ','.join(map(str, range(2000, 2000+args.val_episodes))) + ']'
     test = 'test_seeds=[' + ','.join(map(str, range(3000, 3000+args.test_episodes))) + ']'
     shared = ['env=stackcube', f'device={args.device}', val, 'eval.sampler=cps',
-              f'video.every={args.video_every}', 'video.episodes=2', 'hydra.job.chdir=false']
+              f'video.every={args.video_every}', 'video.episodes=5', 'hydra.job.chdir=false']
     offline, iterative, online = [out/x for x in ('offline', 'iterative', 'online')]
     initial = offline/'checkpoints'/'best.pth'
     stats = offline/'checkpoints'/'dataset_stats.json'
