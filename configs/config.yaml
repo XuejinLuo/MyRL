@@ -1,0 +1,92 @@
+# Shared control panel. Choose a task here; all three entry points inherit it.
+defaults:
+  - env: maniskill
+  - model: flow_3d
+  - task@_global_: stackcube
+  - _self_
+
+experiment: run01
+seed: 42
+device: cuda
+num_workers: 4
+paths:
+  demos: ${oc.env:HOME}/.maniskill/demos
+  root: outputs/${env.env_id}/${experiment}
+dataset:
+  data_path: ${paths.demos}/${env.env_id}/motionplanning/trajectory.pointcloud.${env.control_mode}.physx_cpu.h5
+  max_episodes: 1000
+  # Frozen primitive data exported by offline, reused by iterative.
+  manifest: ${paths.root}/offline/data/manifest.json
+  max_rejected_episodes: 3
+  max_rejected_fraction: 0.01
+
+eval:
+  every: 10
+  sampler: cps
+  seeds: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009]
+video:
+  every: 10
+  episodes: 5
+noise_level: 0.7
+min_std: 0.0067
+wandb:
+  enable: false
+  project: MyRL
+  entity: null
+
+stages:
+  offline:
+    epochs: 200
+    batch_size: 64
+    save_every: 10
+    critic_warmup_epochs: 0
+    use_bc_only: true
+  iterative:
+    initial_ckpt: ${paths.root}/offline/checkpoints/best.pth
+    stats_path: ${paths.root}/offline/checkpoints/dataset_stats.json
+    rounds: 3
+    episodes_per_round: 100
+    epochs: 30
+    batch_size: 64
+    save_every: 10
+    critic_warmup_epochs: 3
+    collect_seed_start: 10000
+    collect_sampler: ${eval.sampler}
+    resume: false
+  online:
+    # Set source_stage: offline to skip iterative training.
+    source_stage: iterative
+    initial_ckpt: ${paths.root}/${stages.online.source_stage}/checkpoints/best.pth
+    stats_path: null
+    epochs: 100
+    batch_size: 128
+    save_every: 10
+    resume: null
+
+# Separate final comparison; never used for checkpoint selection.
+comparison:
+  checkpoints:
+    offline: ${paths.root}/offline/checkpoints/best.pth
+    iterative: ${paths.root}/iterative/checkpoints/best.pth
+    online: ${paths.root}/online/checkpoints/best.pth
+  output: ${paths.root}/comparison
+  seed_start: 3000
+  episodes: 100
+  samplers: [cps, ode]
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
+  job_logging:
+    version: 1
+    disable_existing_loggers: false
+    handlers:
+      console:
+        class: logging.StreamHandler
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: [console]

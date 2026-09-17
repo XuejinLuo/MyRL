@@ -1,15 +1,11 @@
-# configs/env/maniskill.yaml
-env_id: "StackCube-v1"              # 目标任务，后续切换任务只改这里！例如: PickCube-v1, PushCube-v1
-obs_mode: "pointcloud"             # 观测模式
-control_mode: "pd_ee_delta_pose"   # 控制模式
-render_mode: "rgb_array"           # 评估录像所需的渲染模式
-
-# 点云与动作执行参数
+# Shared observation/control protocol. Task files override only differences.
+env_id: ???
+obs_mode: pointcloud
+control_mode: pd_ee_delta_pose
+render_mode: rgb_array
 num_points: 1024
 use_color: true
 exec_steps: 2
 exp_weight: 0.01
 max_episode_steps: 300
-
-# 工作空间裁剪范围 (桌面操作)
 workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]

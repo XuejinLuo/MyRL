@@ -6,9 +6,9 @@ from torch.utils.data import DataLoader
 from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.embodied_idql import (CriticFeatureExtractor, IDQL_VNet_Wrapper,
     IDQL_QNet_Wrapper, Policy_IDQL_Wrapper, EmbodiedIDQL)
-from data.iterative_dataset import IterativeDataset
-from data.iterative_store import write_json
-from utils.experiment import log_metrics
+from data.dataset import TrajectoryDataset
+from data.episodes import write_json
+from utils.experiment import log_metrics, selection_score, write_selection, evaluation_paths
 
 
 class PrefixQ(IDQL_QNet_Wrapper):
@@ -31,9 +31,9 @@ class RoundIDQL(EmbodiedIDQL):
             self.discount = previous
 
 
-def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, baseline):
+def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, baseline=None, log_callback=None):
     device = torch.device(cfg.device)
-    dataset = IterativeDataset(episodes, cfg, normalizer)
+    dataset = TrajectoryDataset(episodes, cfg, normalizer)
     if len(dataset) < cfg.batch_size:
         raise ValueError('Dataset smaller than batch_size; lower batch_size')
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
@@ -47,7 +47,7 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
     agent = RoundIDQL(Policy_IDQL_Wrapper(base), q, v, device=device,
         **{k: cfg.algo[k] for k in ('tau', 'discount', 'beta', 'tau_target', 'actor_lr', 'critic_lr', 'use_bc_only')})
     ema = copy.deepcopy(base).eval().requires_grad_(False)
-    best_rate = baseline['Eval/Success_Rate']
+    best_score = selection_score(baseline) if baseline else None
     selected = None
     directory = Path(directory)
     for epoch in range(1, cfg.epochs + 1):
@@ -79,18 +79,35 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
             for k, val in metrics.items():
                 sums[k] = sums.get(k, 0.) + val
         row = dict(epoch=epoch, **{k: v/len(loader) for k, v in sums.items()})
-        if epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
-            raw = copy.deepcopy(base.state_dict())
+        result = {}
+        evaluate_now = epoch % cfg.eval.every == 0 or epoch == cfg.epochs
+        save_now = epoch % cfg.save_epoch == 0 or epoch == cfg.epochs
+        candidate = directory/'checkpoints'/f'epoch_{epoch:04d}.pth'
+        raw = copy.deepcopy(base.state_dict())
+        try:
             base.load_state_dict(ema.state_dict())
-            result = evaluate(epoch=epoch)
-            row.update(result)
-            candidate = directory/'checkpoints'/f'offline_ep{epoch}.pth'
-            save(candidate, epoch, result)
-            if result['Eval/Success_Rate'] > best_rate:
-                best_rate, selected = result['Eval/Success_Rate'], str(candidate)
+            if evaluate_now:
+                result = evaluate(epoch=epoch)
+                row.update(result)
+            if evaluate_now or save_now:
+                save(candidate, epoch, result)
+                save(directory/'checkpoints'/'last.pth', epoch, result)
+            if result and (best_score is None or selection_score(result) > best_score):
+                best_score, selected = selection_score(result), str(candidate)
+                save(directory/'checkpoints'/'best.pth', epoch, result)
+                write_selection(directory, epoch, result, directory/'checkpoints'/'best.pth',
+                                stage=cfg.stage)
+        finally:
             base.load_state_dict(raw)
-        log_metrics(directory, epoch, {k: v for k, v in row.items() if k != 'epoch'}, stage='iterative')
-        log_metrics(directory.parent, epoch, {k: v for k, v in row.items() if k != 'epoch'},
-                    stage='iterative', round=directory.name)
+        context = dict(stage=cfg.stage, sampler=cfg.eval.sampler,
+            round=directory.name if cfg.stage == 'iterative' else None,
+            checkpoint=str(candidate) if evaluate_now or save_now else None,
+            evaluation=str(evaluation_paths(cfg, directory, epoch)[0]) if result else None)
+        metrics = {k: v for k, v in row.items() if k != 'epoch'}
+        log_metrics(directory, epoch, metrics, **context)
+        if cfg.stage == 'iterative':
+            log_metrics(directory.parent, epoch, metrics, **context)
+        if log_callback:
+            log_callback(metrics, epoch)
         print(row, flush=True)
     return selected
