@@ -39,6 +39,17 @@ python train_online.py
 
 若跳过迭代阶段，修改 `stages.online.source_stage: offline`，再单独运行 `python train_online.py`。使用已有权重时，修改对应的 `initial_ckpt`；迭代阶段还需要匹配的 `stats_path` 与 `dataset.manifest`。
 
+## StackCube 目标点预算实验
+
+StackCube 默认改为 segmentation 辅助采样：Cube A/B 各预留最多 256 个独立源点，
+不足时全部保留，剩余预算从未选点回填，总输入仍为 1024。实时 ID 按物体名称解析。
+默认实验名为 `run03_object_budget`；直接 `python train_offline.py` 会从原始 H5
+重新生成训练输入。切回随机对照：`env.sampling.mode=random`，同时换一个 experiment。
+
+先运行 `python -m tools.diagnostics.check_point_sampling` 查看同一批帧的随机/预算采样统计。
+本实验用于验证目标点丢失的影响，使用仿真分割信息；网络与训练参数未改。
+H5 ID、边界处理、重训与对照评估详见 [点云采样实验](docs/POINT_SAMPLING.md)。
+
 ## 任务切换
 
 只需在 `configs/config.yaml` 的 defaults 中选择任务。环境 ID、默认演示路径、输出目录、各阶段输入权重路径同步变化。

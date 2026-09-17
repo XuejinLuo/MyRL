@@ -24,6 +24,7 @@ def config(stage, tmp_path):
     cfg.device = 'cpu'
     cfg.paths.root = str(tmp_path/'run')
     cfg.num_workers = 0
+    cfg.env.sampling.mode = "random"  # Tiny synthetic environment has no objects.
     cfg.env.num_points = 4
     cfg.env.use_color = False
     cfg.env.max_episode_steps = 3

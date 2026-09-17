@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-17 — StackCube 目标点预算对照实验
+
+- StackCube 默认使用 segmentation 为 cubeA/cubeB 各预留 256 个点，总输入保持 1024；稀少目标保留全部源点，剩余预算无放回回填后打乱。
+- H5 读取和实时观测共用采样；H5 ID 可配置，实时 ID 按场景物体名称解析，缺少分割数据明确报错。
+- 默认新实验名 run03_object_budget；offline 从原始 H5 重新生成输入及 manifest，保留 random 模式做对照。网络、BC 和优化超参数不变。
+- 新增生产采样函数驱动的 H5 统计对照工具、16 项采样/数据链路测试和重训文档。
+- 验证：43 项 CPU 测试通过，1 项跳过；未访问真实演示、未运行 ManiSkill 仿真或 GPU 训练，成功率变化需本机对照验证。
+
 ## 2026-09-17 — 离线 worker 段错误与额外开销修复
 
 - 用户日志显示 SAPIEN CUDA initialization error 后 DataLoader worker SIGSEGV；推测为评估后 fork 继承运行时状态，尚无本机 SAPIEN 复现。

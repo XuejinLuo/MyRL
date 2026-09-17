@@ -6,8 +6,10 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
     """
     将 ManiSkill 原生的点云字典转换为你的 Infra 所需的极简字典格式
     """
-    def __init__(self, env, state_dim=16):
+    def __init__(self, env, state_dim=16, sampling=None):
         super().__init__(env)
+        self.sampling_objects = list((sampling or {}).get('objects', [])) if (
+            (sampling or {}).get('mode', 'random') == 'object_budget') else []
         # 你可以根据真实的 action_dim (比如 8) 和 state_dim (比如 16) 修改下面
         self.observation_space = gym.spaces.Dict({
             'xyz': gym.spaces.Box(-np.inf, np.inf, shape=(100000, 3), dtype=np.float32),
@@ -41,9 +43,19 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
         else:
             xyz, rgb = np.zeros((0, 3)), np.zeros((0, 3))
 
+        segmentation = None
+        if self.sampling_objects:
+            if 'segmentation' not in obs.get('pointcloud', {}):
+                raise ValueError('object_budget requires live pointcloud segmentation')
+            segmentation = to_np(obs['pointcloud']['segmentation']).reshape(-1)
+            if len(segmentation) != len(xyz):
+                raise ValueError('Live segmentation and xyz lengths differ')
+
         if 'xyzw' in obs.get('pointcloud', {}):
             valid = xyzw[:, 3] > 0
             xyz, rgb = xyz[valid], rgb[valid]
+            if segmentation is not None:
+                segmentation = segmentation[valid]
 
         # 2. 提取机器人本体状态 (Proprioception)
         qpos = to_np(obs['agent']['qpos']).reshape(-1)
@@ -59,8 +71,15 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
         # 将 qpos 和 tcp_pose 拼接
         state = np.concatenate([qpos, tcp_pose]).astype(np.float32) 
 
-        return {
+        result = {
             'xyz': xyz, 
             'rgb': rgb, 
             'state': state
         }
+        if self.sampling_objects:
+            from data.pointcloud import resolve_target_ids
+            result['segmentation'] = segmentation
+            # Scene IDs can change after reconfiguration/reset.
+            result['target_ids'] = resolve_target_ids(
+                self.sampling_objects, self.unwrapped.segmentation_id_map)
+        return result

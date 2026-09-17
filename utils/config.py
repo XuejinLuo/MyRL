@@ -1,8 +1,10 @@
 """Shared configuration validation; fail before loading large datasets."""
 import numpy as np
+from data.pointcloud import validate_sampling
 
 
 def validate_common(cfg):
+    validate_sampling(cfg.env.get("sampling"), cfg.env.num_points)
     if cfg.model.algo_type != 'flow':
         raise ValueError('The three-stage CPS/PPO workflow requires model.algo_type=flow')
     if not 1 <= cfg.env.exec_steps <= cfg.model.chunk_size:

@@ -18,7 +18,8 @@ class PointCloudObservationWrapper(gym.ObservationWrapper):
         env: gym.Env, 
         num_points: int = 1024, 
         workspace_bounds: Optional[np.ndarray] = None, 
-        use_color: bool = False
+        use_color: bool = False,
+        sampling=None,
     ):
         """
         :param env: 原始 Gymnasium 环境
@@ -30,6 +31,7 @@ class PointCloudObservationWrapper(gym.ObservationWrapper):
         self.num_points = num_points
         self.workspace_bounds = workspace_bounds
         self.use_color = use_color
+        self.sampling = sampling
 
         # 校验原始环境是否包含我们需要的键
         assert isinstance(self.env.observation_space, spaces.Dict), "基础环境观测必须是 Dict 空间"
@@ -54,5 +56,7 @@ class PointCloudObservationWrapper(gym.ObservationWrapper):
     def observation(self, obs):
         from data.pointcloud import preprocess_points
         return {'point_cloud': preprocess_points(obs['xyz'], obs.get('rgb'),
-                    self.workspace_bounds, self.num_points, self.use_color),
+                    self.workspace_bounds, self.num_points, self.use_color,
+                    sampling=self.sampling, segmentation=obs.get('segmentation'),
+                    target_ids=obs.get('target_ids')),
                 'state': obs['state']}
