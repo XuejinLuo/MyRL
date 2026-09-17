@@ -32,7 +32,7 @@ python train_online.py
 - `stages.offline/iterative/online` 分别控制训练轮数、batch size、保存频率和输入权重。
 - 三阶段使用同一份 `eval`：默认 CPS、每 10 epoch 评估、固定 2000–2009 共 10 个种子。需要更多回合时，在 `eval.seeds` 中增加种子，三个阶段一起生效。
 - 录像默认每 10 epoch 以及最后一次评估保存前 **5 个 episode**；最多不超过评估回合数。`video.every: 0` 关闭训练录像。
-- 默认 offline 的 actor 使用 BC 初始化，iterative 使用 IDQL 拒绝采样。需要直接离线 IDQL 时，将 `stages.offline.use_bc_only` 改为 `false`。
+- 默认 offline 的 actor 使用 BC 初始化，iterative 使用 IDQL 拒绝采样（重构前最新代码两者均为 IDQL；这是重构时的默认值变化）。需要直接离线 IDQL 时，将 `stages.offline.use_bc_only` 改为 `false`。
 - 算法参数分别在 `configs/algo/idql.yaml` 和 `configs/algo/pg.yaml`，网络参数在 `configs/model/flow_3d.yaml`。三阶段流程目前要求 Flow 模型。
 
 离线阶段会自动导出本次实际读取的 primitive 演示、manifest 和归一化参数，迭代阶段直接复用，不再需要单独运行转换脚本。
@@ -119,3 +119,13 @@ python -m pytest -q
 ```
 
 CPU 测试包含三个阶段的真实优化器更新、小型模拟环境、权重衔接、统一输出和迭代续跑；不等同于完整 ManiSkill GPU 训练。本次没有测量 StackCube 等任务的成功率，也没有验证真实渲染。
+
+### DataLoader 崩溃与性能诊断
+
+默认 `num_workers: 0`，不启动数据加载子进程。数据已预载入内存；这是规避 SAPIEN/CUDA 初始化后 fork worker 导致段错误、同时避免 spawn 复制大规模数据的保守默认值，不保证它在所有机器上最快。
+
+如有足够 CPU 内存，可在配置中尝试 `num_workers: 1` 或 `2`；代码固定采用 `spawn` 和常驻 worker，不再使用系统默认的 fork。内存中的轨迹会复制到每个 spawn worker，应比较实测吞吐后决定 worker 数。
+
+两个离线阶段新增 `Time/Train_Seconds`（包含数据加载、传输和更新）、`Time/Eval_Seconds`、`Time/Artifact_Seconds`（权重切换/保存/恢复）与 `Train/Samples_Per_Second`。GPU 在 epoch 计时边界同步；epoch 总耗时不包含末尾日志写入。BC/IDQL、batch size、数据量和采样接受率不同时，不能只按 GPU 占用率比较速度。
+
+已有输出不会被覆盖；崩溃后重跑需使用新的 `experiment`。当前 offline checkpoint 没有优化器状态，不支持从崩溃 epoch 精确续训；保留已保存的权重用于评估或后续阶段。

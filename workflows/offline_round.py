@@ -1,5 +1,6 @@
 """One IDQL round, reusing the existing dictionary adapters."""
 import copy
+from time import perf_counter
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
@@ -7,7 +8,6 @@ from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.embodied_idql import (CriticFeatureExtractor, IDQL_VNet_Wrapper,
     IDQL_QNet_Wrapper, Policy_IDQL_Wrapper, EmbodiedIDQL)
 from data.dataset import TrajectoryDataset
-from data.episodes import write_json
 from utils.experiment import log_metrics, selection_score, write_selection, evaluation_paths
 
 
@@ -31,13 +31,22 @@ class RoundIDQL(EmbodiedIDQL):
             self.discount = previous
 
 
+def build_loader(dataset, cfg, device):
+    # Never fork a parent that may already own CUDA/SAPIEN/Vulkan state.
+    # Trajectories are resident in RAM: spawn copies them to each worker.
+    options = dict(batch_size=cfg.batch_size, shuffle=True, drop_last=True,
+                   num_workers=cfg.num_workers, pin_memory=device.type == 'cuda')
+    if cfg.num_workers > 0:
+        options.update(multiprocessing_context='spawn', persistent_workers=True)
+    return DataLoader(dataset, **options)
+
+
 def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, baseline=None, log_callback=None):
     device = torch.device(cfg.device)
     dataset = TrajectoryDataset(episodes, cfg, normalizer)
     if len(dataset) < cfg.batch_size:
         raise ValueError('Dataset smaller than batch_size; lower batch_size')
-    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
-                        num_workers=cfg.num_workers, drop_last=True)
+    loader = build_loader(dataset, cfg, device)
     # FlowPPOPolicy evaluation adapter freezes the encoder at construction.
     # Re-enable it explicitly for offline updates.
     base.requires_grad_(True)
@@ -51,14 +60,16 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
     selected = None
     directory = Path(directory)
     for epoch in range(1, cfg.epochs + 1):
+        base.train()
+        agent.q_net.train()
+        agent.v_net.train()
+        agent.q_target.eval()
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        epoch_started = perf_counter()
         sums = {}
         for batch in loader:
-            base.train()
-            agent.q_net.train()
-            agent.v_net.train()
-            # Target statistics stay fixed; synchronize buffers after each update.
-            agent.q_target.eval()
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=device.type == 'cuda') for k, v in batch.items()}
             obs = dict(pc=batch['pc'], state=batch['state'])
             nxt = dict(pc=batch['next_pc'], state=batch['next_state'])
             # Q depends on executed prefix only. Actor retains the full prediction horizon.
@@ -78,27 +89,45 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
                     a.copy_(b)
             for k, val in metrics.items():
                 sums[k] = sums.get(k, 0.) + val
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        train_seconds = perf_counter() - epoch_started
         row = dict(epoch=epoch, **{k: v/len(loader) for k, v in sums.items()})
+        row.update({'Time/Train_Seconds': train_seconds, 'Train/Batches': len(loader),
+                    'Train/Samples': len(loader)*cfg.batch_size,
+                    'Train/Samples_Per_Second': len(loader)*cfg.batch_size/max(train_seconds, 1e-9)})
         result = {}
         evaluate_now = epoch % cfg.eval.every == 0 or epoch == cfg.epochs
         save_now = epoch % cfg.save_epoch == 0 or epoch == cfg.epochs
         candidate = directory/'checkpoints'/f'epoch_{epoch:04d}.pth'
-        raw = copy.deepcopy(base.state_dict())
-        try:
-            base.load_state_dict(ema.state_dict())
-            if evaluate_now:
-                result = evaluate(epoch=epoch)
-                row.update(result)
-            if evaluate_now or save_now:
-                save(candidate, epoch, result)
-                save(directory/'checkpoints'/'last.pth', epoch, result)
-            if result and (best_score is None or selection_score(result) > best_score):
-                best_score, selected = selection_score(result), str(candidate)
-                save(directory/'checkpoints'/'best.pth', epoch, result)
-                write_selection(directory, epoch, result, directory/'checkpoints'/'best.pth',
-                                stage=cfg.stage)
-        finally:
-            base.load_state_dict(raw)
+        evaluation_seconds = artifact_seconds = 0.0
+        if evaluate_now or save_now:
+            artifact_started = perf_counter()
+            raw = copy.deepcopy(base.state_dict())
+            try:
+                base.load_state_dict(ema.state_dict())
+                if evaluate_now:
+                    evaluation_started = perf_counter()
+                    result = evaluate(epoch=epoch)
+                    evaluation_seconds = perf_counter() - evaluation_started
+                    row.update(result)
+                if evaluate_now or save_now:
+                    save(candidate, epoch, result)
+                    save(directory/'checkpoints'/'last.pth', epoch, result)
+                if result and (best_score is None or selection_score(result) > best_score):
+                    best_score, selected = selection_score(result), str(candidate)
+                    save(directory/'checkpoints'/'best.pth', epoch, result)
+                    write_selection(directory, epoch, result, directory/'checkpoints'/'best.pth',
+                                    stage=cfg.stage)
+            finally:
+                base.load_state_dict(raw)
+            del raw
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            artifact_seconds = max(0.0, perf_counter() - artifact_started - evaluation_seconds)
+        row.update({'Time/Eval_Seconds': evaluation_seconds,
+                    'Time/Artifact_Seconds': artifact_seconds,
+                    'Time/Epoch_Seconds': perf_counter() - epoch_started})
         context = dict(stage=cfg.stage, sampler=cfg.eval.sampler,
             round=directory.name if cfg.stage == 'iterative' else None,
             checkpoint=str(candidate) if evaluate_now or save_now else None,

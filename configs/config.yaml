@@ -8,7 +8,9 @@ defaults:
 experiment: run01
 seed: 42
 device: cuda
-num_workers: 4
+# In-memory trajectories: avoid CUDA/SAPIEN fork crashes and per-worker RAM copies.
+# Positive values use spawn + persistent workers; start small if RAM permits.
+num_workers: 0
 paths:
   demos: ${oc.env:HOME}/.maniskill/demos
   root: outputs/${env.env_id}/${experiment}

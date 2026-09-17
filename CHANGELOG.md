@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-17 — 离线 worker 段错误与额外开销修复
+
+- 用户日志显示 SAPIEN CUDA initialization error 后 DataLoader worker SIGSEGV；推测为评估后 fork 继承运行时状态，尚无本机 SAPIEN 复现。
+- 默认 num_workers=0；启用多 worker 时固定 spawn + persistent_workers，避免反复 fork。spawn 会复制内存轨迹，需留意 CPU 内存。
+- CUDA 恢复 pin_memory，并使用 non_blocking 传输；普通 epoch 不再复制/切换整份 EMA 权重，移除 Dataset 的二次 NumPy 拷贝。
+- H5 改为每条轨迹批量读取，而非逐帧重复访问；演示导出增加进度条。
+- 增加训练/评估/权重文件耗时及样本吞吐；保持 IDQL/BC 配置、训练目标、评估协议不变。
+- 更正历史说明：重构前最新 StackCube 总入口的 use_bc_only 实际为 false，并非 true。
+- 验证：27 项 CPU 测试通过；1 项 spawn 测试因当前运行环境禁止 Unix socket 而跳过，未复现真实 SAPIEN/GPU 崩溃。
+
 ## 2026-09-17 — 配置驱动的独立三阶段重构
 
 基准：`online@424ee29`。
