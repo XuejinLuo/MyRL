@@ -36,18 +36,29 @@ class RenderToNumpyWrapper(gym.Wrapper):
             frame = frame.astype(np.uint8)
             
         return frame
-def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, normalizer=None, seed: int = 42, max_steps: int = 300):
+def evaluate_and_record_video(
+    cfg, 
+    policy, 
+    epoch: int, 
+    device: torch.device, 
+    normalizer=None, 
+    base_seed: int = 2000, 
+    num_eval_episodes: int = 5, 
+    max_steps: int = 300
+):
     """
     独立且解耦的验证与录像接口
     Args:
         cfg: Hydra 传入的全局配置
-        policy: 当前训练的策略网络 (无需手动切换 eval 模式，内部会自动处理并还原)
+        policy: 当前训练的策略网络
         epoch: 当前训练的 Epoch
         device: 运行设备
-        seed: 环境随机种子，固定种子可以更好地观察模型在同一初始状态下的演进
-        max_steps: 强制截断步数，防止策略在早期未收敛时陷入死循环
+        normalizer: 状态和动作的归一化器
+        base_seed: 评估起始种子 (默认 2000，避免与训练种子重合)
+        num_eval_episodes: 评估并录制的 Episode 数量
+        max_steps: 每个 episode 强制截断步数
     """
-    print(f"\n🎬 正在为 Epoch {epoch} 进行 ManiSkill 验证测试并录制视频...")
+    print(f"\n🎬 正在为 Epoch {epoch} 进行 ManiSkill 验证测试并录制 {num_eval_episodes} 个视频 (Base Seed: {base_seed})...")
     
     # 记录模型原本的模式，并在测试后还原
     original_training_mode = policy.training 
@@ -74,18 +85,15 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, nor
         # 2. 先挂载渲染类型转换 Wrapper
         env = RenderToNumpyWrapper(env)
         
-        # 3. 再挂载录制 Wrapper
+        # 3. 再挂载录制 Wrapper (episode_trigger 设为逢 episode 必录)
         video_folder = os.path.join(cfg.save_dir, "eval_videos", f"epoch_{epoch}")
         os.makedirs(video_folder, exist_ok=True)
-        # episode_trigger=lambda x: True 表示逢 Episode 必录制
         env = RecordVideo(env, video_folder=video_folder, episode_trigger=lambda x: True, disable_logger=True)
         
-        # 4. 最后挂载数据对齐与状态 Wrapper
+        # 4. 挂载数据对齐与状态 Wrapper
         env = ManiSkillToRL100Wrapper(env)
         
-        ws_bounds = np.array([[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
-        
-        # 动态提取配置 (兼容 offline 和 online 两套参数树结构)
+        # 动态提取点云和动作 Chunk 配置
         num_points = cfg.env.num_points if "env" in cfg else cfg.dataset.n_points
         exec_steps = cfg.env.exec_steps if "env" in cfg else 2
         exp_weight = cfg.env.exp_weight if "env" in cfg else 0.01
@@ -106,71 +114,84 @@ def evaluate_and_record_video(cfg, policy, epoch: int, device: torch.device, nor
             env=env, chunk_size=cfg.model.chunk_size, exec_steps=exec_steps, exp_weight=exp_weight, use_ensembling=False
         )
         
-        # 4. 执行测试环境 Rollout
-        obs, _ = env.reset(seed=seed)
-        done, truncated = False, False
-        ep_reward = 0.0
-        success = False
-        step_count = 0
         num_infer_steps = cfg.model.get("num_inference_steps", 10)
-        
-        while not (done or truncated) and step_count < max_steps:
-            # 点云零均值化
-            if normalizer is not None and hasattr(normalizer, 'center_point_cloud'):
-                pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
-            else:
-                pc_centered = obs['point_cloud']
-            # State 归一化
-            if normalizer is not None:
-                obs_state = normalizer.normalize(obs['state'], 'state')
-            else:
-                obs_state = obs['state']
+        success_list = []
+        reward_list = []
 
-            # 观测转 Tensor
-            pc_tensor = torch.from_numpy(
-                np.ascontiguousarray(pc_centered)
-            ).float().unsqueeze(0).to(device)
+        # 5. 循环执行多个 Episode 测试
+        for ep_idx in range(num_eval_episodes):
+            current_seed = base_seed + ep_idx
+            obs, _ = env.reset(seed=current_seed)
+            done, truncated = False, False
+            ep_reward = 0.0
+            is_success = False
+            step_count = 0
+            
+            while not (done or truncated) and step_count < max_steps:
+                # 点云零均值化
+                if normalizer is not None and hasattr(normalizer, 'center_point_cloud'):
+                    pc_centered = normalizer.center_point_cloud(obs['point_cloud'], ws_bounds)
+                else:
+                    pc_centered = obs['point_cloud']
+                    
+                # State 归一化
+                if normalizer is not None:
+                    obs_state = normalizer.normalize(obs['state'], 'state')
+                else:
+                    obs_state = obs['state']
 
-            state_tensor = torch.from_numpy(
-                np.ascontiguousarray(obs_state)
-            ).float().unsqueeze(0).to(device)
+                # 观测转 Tensor
+                pc_tensor = torch.from_numpy(
+                    np.ascontiguousarray(pc_centered)
+                ).float().unsqueeze(0).to(device)
 
-            # 模型推断 (使用 AMP 自动混合精度加速)
-            with torch.no_grad():
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if device.type == 'cuda' else torch.no_grad():
-                    action_chunk = policy.sample(
-                        obs=pc_tensor, state=state_tensor, num_steps=num_infer_steps
-                    )
-            
-            # 环境执行
-            action_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
-            if normalizer is not None:
-                real_action = normalizer.unnormalize(action_np, 'action')
-            else:
-                real_action = action_np
-            obs, reward, done, truncated, info = env.step(real_action)
-            
-            if hasattr(reward, 'item'):
-                reward = reward.item()
-            ep_reward += float(reward)
-            
-            if hasattr(done, 'item'):
-                done = done.item()
-            if hasattr(truncated, 'item'):
-                truncated = truncated.item()
+                state_tensor = torch.from_numpy(
+                    np.ascontiguousarray(obs_state)
+                ).float().unsqueeze(0).to(device)
+
+                # 模型推断
+                with torch.no_grad():
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if device.type == 'cuda' else torch.no_grad():
+                        action_chunk = policy.sample(
+                            obs=pc_tensor, state=state_tensor, num_steps=num_infer_steps
+                        )
                 
-            _succ = info.get('success', False)
-            if hasattr(_succ, 'item'):
-                _succ = _succ.item()
-            if _succ:
-                success = True
-            step_count += 1
+                # 环境执行
+                action_np = action_chunk.squeeze(0).cpu().to(torch.float32).numpy()
+                if normalizer is not None:
+                    real_action = normalizer.unnormalize(action_np, 'action')
+                else:
+                    real_action = action_np
+                    
+                obs, reward, done, truncated, info = env.step(real_action)
+                
+                if hasattr(reward, 'item'):
+                    reward = reward.item()
+                ep_reward += float(reward)
+                
+                if hasattr(done, 'item'):
+                    done = done.item()
+                if hasattr(truncated, 'item'):
+                    truncated = truncated.item()
+                    
+                _succ = info.get('success', False)
+                if hasattr(_succ, 'item'):
+                    _succ = _succ.item()
+                if _succ:
+                    is_success = True
+                step_count += 1
 
-        print(f"✅ Epoch {epoch} 测试完成 | 总奖励: {ep_reward:.2f} | 是否成功: {success}")
-        print(f"🎞️ 视频已保存至: {video_folder}\n")
+            success_list.append(is_success)
+            reward_list.append(ep_reward)
+            print(f"  └─ Episode {ep_idx + 1}/{num_eval_episodes} (Seed: {current_seed}) | Reward: {ep_reward:.2f} | Success: {is_success} | Steps: {step_count}")
+
+        mean_reward = np.mean(reward_list)
+        success_rate = np.mean(success_list) * 100.0
+        print(f"✅ Epoch {epoch} 测试完成 | 平均奖励: {mean_reward:.2f} | 成功率: {success_rate:.1f}%")
+        print(f"🎞️ 视频已全部保存至: {video_folder}\n")
 
     finally:
-        # 6. 安全清理 (确保发生异常也会关闭环境并还原模型状态)
+        # 6. 安全清理
         if 'env' in locals():
             env.close()
         policy.train(original_training_mode)
