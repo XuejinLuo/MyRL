@@ -27,7 +27,8 @@ def make_env(cfg, primitive_wrapper=None, video=None):
     
     # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
     env = CPUGymWrapper(env)
-    env = ManiSkillToRL100Wrapper(env, state_dim=cfg.model.state_dim)
+    env = ManiSkillToRL100Wrapper(env, state_dim=cfg.model.state_dim,
+                                    sampling=cfg.env.get("sampling"))
     
     # 3. 接入你原来写好的 PointCloud Wrapper
     bounds = cfg.env.get("workspace_bounds", [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]])
@@ -37,7 +38,8 @@ def make_env(cfg, primitive_wrapper=None, video=None):
         env=env,
         num_points=cfg.env.num_points,  # 比如 1024
         workspace_bounds=ws_bounds,
-        use_color=cfg.env.use_color
+        use_color=cfg.env.use_color,
+        sampling=cfg.env.get("sampling"),
     )
     
     if video is not None:

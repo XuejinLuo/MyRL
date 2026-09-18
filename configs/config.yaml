@@ -5,7 +5,7 @@ defaults:
   - task@_global_: stackcube
   - _self_
 
-experiment: run02
+experiment: run03_object_budget
 seed: 42
 device: cuda
 # In-memory trajectories: avoid CUDA/SAPIEN fork crashes and per-worker RAM copies.
