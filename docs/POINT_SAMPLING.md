@@ -1,5 +1,3 @@
-> 历史 run03 物体预算实验说明。当前默认已改为 run04_fps；复现下述预算实验时，训练命令应显式加 `experiment=run03_object_budget env.sampling.mode=object_budget`（已有目录请另取新名）。诊断现在额外显示 FPS。最新流程见 [RL100_POINTCLOUD.md](RL100_POINTCLOUD.md)。
-
 # StackCube 目标点预算对照实验
 
 目的：检验小物体在全局随机降采样中丢失，是否限制离线 BC 的闭环成功率。

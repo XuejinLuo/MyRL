@@ -1,4 +1,4 @@
-"""Compare random/FPS/object budgets on identical H5 frames using production code."""
+"""Compare random/object budgets on the same H5 frames using production code."""
 import argparse
 from pathlib import Path
 import h5py
@@ -10,11 +10,10 @@ from data.pointcloud import preprocess_points, validate_sampling
 def inspect_sampling(cfg, max_episodes=100, frame_step=5, seed=42):
     if max_episodes < 1 or frame_step < 1:
         raise ValueError('max_episodes and frame_step must be positive')
-    # IDs are diagnostic labels only; FPS itself never receives segmentation.
-    budget_sampling = {'mode': 'object_budget',
-                       'objects': list(cfg.env.sampling.get('objects', []))}
-    objects = validate_sampling(budget_sampling, cfg.env.num_points)
-    modes = ('before', 'random', 'fps', 'object_budget')
+    objects = validate_sampling(cfg.env.sampling, cfg.env.num_points)
+    if not objects:
+        raise ValueError('Configure env.sampling.mode=object_budget for this comparison')
+    modes = ('before', 'random', 'object_budget')
     counts = {mode: {o['name']: [] for o in objects} for mode in modes}
     # Independent RNGs keep baseline draws unaffected by the alternative sampler.
     rngs = {mode: np.random.default_rng(seed) for mode in modes[1:]}
@@ -48,11 +47,10 @@ def inspect_sampling(cfg, max_episodes=100, frame_step=5, seed=42):
                 for obj in objects:
                     counts['before'][obj['name']].append(int(np.sum(seg[before_idx] == obj['h5_id'])))
                 for mode in modes[1:]:
-                    sampling = budget_sampling if mode == 'object_budget' else {'mode': mode}
+                    sampling = cfg.env.sampling if mode == 'object_budget' else {'mode': 'random'}
                     _, idx = preprocess_points(xyz, rgb, cfg.env.workspace_bounds,
                         cfg.env.num_points, cfg.env.use_color, sampling=sampling,
-                        segmentation=seg if mode == 'object_budget' else None,
-                        rng=rngs[mode], return_indices=True)
+                        segmentation=seg, rng=rngs[mode], return_indices=True)
                     # Count distinct source points, never inflated padding repeats.
                     idx = np.unique(idx[idx >= 0])
                     for obj in objects:
