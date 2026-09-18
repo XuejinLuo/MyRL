@@ -1,9 +1,9 @@
 # Panda / pd_ee_delta_pose task profile.
 env:
   env_id: StackCube-v1
-  # FPS uses no segmentation. Keep these IDs only for diagnostic/budget runs.
+  # Segmentation-assisted diagnostic: keep total input/network unchanged.
   sampling:
-    mode: fps
+    mode: object_budget
     objects:
       # H5 IDs from the supplied diagnostic script; verify for other datasets.
       - {name: cubeA, h5_id: 18, num_points: 256}

@@ -138,7 +138,6 @@ def config(path):
         cfg = compose(config_name='train_offline')
     cfg.dataset.data_path = str(path)
     cfg.env.workspace_bounds = BOUNDS
-    cfg.env.sampling = OmegaConf.create(SAMPLING)
     return cfg
 
 

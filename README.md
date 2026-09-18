@@ -39,32 +39,16 @@ python train_online.py
 
 若跳过迭代阶段，修改 `stages.online.source_stage: offline`，再单独运行 `python train_online.py`。使用已有权重时，修改对应的 `initial_ckpt`；迭代阶段还需要匹配的 `stats_path` 与 `dataset.manifest`。
 
-## 点云输入：裁剪 + FPS
+## StackCube 目标点预算实验
 
-默认输入改为按 XYZ 做最远点采样（FPS），保留对应 RGB，仍为 `1024 × 6`。
-训练和在线观测共用 `data/pointcloud.py`，不需要物体名称或 segmentation。
-在现有训练环境中先安装新增 CPU 依赖：
+StackCube 默认改为 segmentation 辅助采样：Cube A/B 各预留最多 256 个独立源点，
+不足时全部保留，剩余预算从未选点回填，总输入仍为 1024。实时 ID 按物体名称解析。
+默认实验名为 `run03_object_budget`；直接 `python train_offline.py` 会从原始 H5
+重新生成训练输入。切回随机对照：`env.sampling.mode=random`，同时换一个 experiment。
 
-```bash
-python -m pip install -r requirements-pointcloud.txt
-python -m tools.diagnostics.check_point_sampling --max-episodes 10
-python train_offline.py
-```
-
-默认实验名为 `run04_fps`，从原始 H5 重新采样、重新训练；不要复用旧 NPZ/manifest。
-诊断使用 H5 分割标签统计 random / fps / object_budget 对目标点的保留情况，
-标签不参与 FPS 采样。StackCube 的 H5 ID 仍需按实际数据核实。
-切换对照模式时同时使用新的 experiment：
-
-```bash
-python train_offline.py experiment=run04_random env.sampling.mode=random
-python train_offline.py experiment=run04_object_budget env.sampling.mode=object_budget
-```
-
-FPS 提升空间覆盖，不保证物体点预算，也不能恢复遮挡或裁剪前已缺失的几何。
-旧 checkpoint 按其保存的配置评估，缺少 sampling 配置仍使用历史 random 行为。
-依据、局限、重训和对照流程见 [RL-100 点云对照](docs/RL100_POINTCLOUD.md)；
-之前的分割预算实验见 [点云采样实验](docs/POINT_SAMPLING.md)。
+先运行 `python -m tools.diagnostics.check_point_sampling` 查看同一批帧的随机/预算采样统计。
+本实验用于验证目标点丢失的影响，使用仿真分割信息；网络与训练参数未改。
+H5 ID、边界处理、重训与对照评估详见 [点云采样实验](docs/POINT_SAMPLING.md)。
 
 ## 任务切换
 

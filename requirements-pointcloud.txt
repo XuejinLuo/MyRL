@@ -1,2 +1,0 @@
-# Additional dependency for env.sampling.mode=fps (CPU, no CUDA extension).
-fpsample==1.0.2
