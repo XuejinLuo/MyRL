@@ -10,7 +10,7 @@ exp_weight: 0.01
 max_episode_steps: 300
 workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]
 
-# Legacy checkpoints without this field also use random sampling.
+# Geometry-only input FPS; legacy checkpoints without this field use random.
 sampling:
-  mode: random
+  mode: fps
   objects: []

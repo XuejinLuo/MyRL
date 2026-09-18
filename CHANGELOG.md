@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-09-18 — RL-100 风格的无分割 FPS 输入
+
+- 新增 `env.sampling.mode=fps`：裁剪后在完整 XYZ 点云上做 CPU FPS，同索引保留 RGB，不先随机缩小候选池，不使用 segmentation。
+- 共用 H5/live 预处理；重合坐标去重，点数不足时保留每个位置后重复补齐，空云保持零填充。固定起点，不消耗训练 RNG。
+- 新增固定版本依赖 `requirements-pointcloud.txt`，缺失时明确报错，不悄悄回退随机采样。
+- 默认新实验 `run04_fps`；保留 random / object_budget 及旧 checkpoint 行为。网络、颜色、工作空间和训练超参数不变。
+- 同帧诊断扩展为 random / fps / object_budget；新增几何覆盖、RGB 对齐、无分割 H5/live 一致性和导出回归测试。
+- 验证：55 项 CPU 测试通过，1 项因当前环境禁止 Unix socket 跳过。合成 25000→1024 点预处理约 20.33 ms（7 次热运行中位数，含去重），非实机延迟保证。
+- 依据与重训说明：`docs/RL100_POINTCLOUD.md`。FPS 无目标点数保证；任务成功率需真实 H5 + ManiSkill 对照验证。
+
+
 ## 2026-09-17 — StackCube 目标点预算对照实验
 
 - StackCube 默认使用 segmentation 为 cubeA/cubeB 各预留 256 个点，总输入保持 1024；稀少目标保留全部源点，剩余预算无放回回填后打乱。
