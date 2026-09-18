@@ -8,6 +8,7 @@ from models.critics.q_v_network import VNetwork, TwinQNetwork
 from algos.embodied_idql import (CriticFeatureExtractor, IDQL_VNet_Wrapper,
     IDQL_QNet_Wrapper, Policy_IDQL_Wrapper, EmbodiedIDQL)
 from data.dataset import TrajectoryDataset
+from data.observations import batch_observation
 from utils.experiment import log_metrics, selection_score, write_selection, evaluation_paths
 
 
@@ -70,12 +71,15 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
         sums = {}
         for batch in loader:
             batch = {k: v.to(device, non_blocking=device.type == 'cuda') for k, v in batch.items()}
-            obs = dict(pc=batch['pc'], state=batch['state'])
-            nxt = dict(pc=batch['next_pc'], state=batch['next_state'])
+            obs = batch_observation(batch)
+            nxt = batch_observation(batch, 'next_')
             # Q depends on executed prefix only. Actor retains the full prediction horizon.
             metrics = agent.update_batch_critic(obs, batch['action_chunk'], batch['reward'][:, None],
                     nxt, batch['done'][:, None], batch['discount'][:, None])
             adv = metrics.pop('adv_for_actor')
+            if 'object_points' in obs:
+                from data.object_diagnostics import batch_object_metrics
+                metrics.update(batch_object_metrics(obs, cfg.env.observation))
             if epoch > cfg.critic_warmup_epochs:
                 metrics.update(agent.update_actor(obs, batch['action_chunk'], adv=adv))
             else:

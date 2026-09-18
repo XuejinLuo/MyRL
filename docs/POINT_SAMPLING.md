@@ -4,12 +4,15 @@
 本实验使用仿真 segmentation 辅助采样；ID 不输入网络。它不是纯视觉分割方案，
 也不能恢复相机未看到或已被工作空间裁剪掉的点。
 
-## 默认行为
+## 全局预算基线（当前需显式选择）
 
-`configs/task/stackcube.yaml` 默认启用：
+当前 StackCube 默认使用 object-centric，见 [新运行说明](OBJECT_CENTRIC.md)。
+本页保留全局 object-budget 基线：
 
 ```yaml
 env:
+  observation:
+    mode: global_object_budget
   sampling:
     mode: object_budget
     objects:
@@ -57,10 +60,10 @@ env:
 2. 开始新的离线训练：
 
    ```bash
-   python train_offline.py
+   python train_offline.py experiment=run03_object_budget env.observation.mode=global_object_budget
    ```
 
-   `configs/config.yaml` 的默认实验名已改为 `run03_object_budget`，避免覆盖 `run02`。
+   上述命令使用独立实验名 `run03_object_budget`，避免覆盖其他表示实验。
    offline 从 `dataset.data_path` 指定的原始 H5 重新生成采样输入，不读取旧 NPZ。
    新输入及其采样配置导出到：
 
@@ -74,7 +77,7 @@ env:
 3. 如需重新训练同代码的随机采样对照组：
 
    ```bash
-   python train_offline.py experiment=run03_random_control env.sampling.mode=random
+   python train_offline.py experiment=run03_random_control env.observation.mode=global_random
    ```
 
    两组保持相同训练种子、演示数、网络、训练轮数和评估种子。只有采样策略不同。
@@ -83,12 +86,13 @@ env:
 4. 独立评估时分别读取各自 checkpoint 的采样设置：
 
    ```bash
-   python evaluate.py 'comparison.checkpoints={offline:outputs/StackCube-v1/run03_object_budget/offline/checkpoints/best.pth}' comparison.output=outputs/StackCube-v1/run03_object_budget/test_offline
-   python evaluate.py 'comparison.checkpoints={offline:outputs/StackCube-v1/run03_random_control/offline/checkpoints/best.pth}' comparison.output=outputs/StackCube-v1/run03_random_control/test_offline
+   python evaluate.py '~comparison.checkpoints' '+comparison.checkpoints={offline:outputs/StackCube-v1/run03_object_budget/offline/checkpoints/best.pth}' comparison.output=outputs/StackCube-v1/run03_object_budget/test_offline
+   python evaluate.py '~comparison.checkpoints' '+comparison.checkpoints={offline:outputs/StackCube-v1/run03_random_control/offline/checkpoints/best.pth}' comparison.output=outputs/StackCube-v1/run03_random_control/test_offline
    ```
 
    默认都在 3000–3099 共 100 个测试种子上评估 CPS 和 ODE，查看各自 `summary.csv`
-   和逐 episode 结果。现有比较器拒绝在一次调用中混用不同 env 配置，所以分开调用。
+   和逐 episode 结果。默认比较器拒绝在一次调用中混用不同 env 配置，所以这里分开调用。
+   当前也支持显式 `comparison.allow_observation_variants=true`，见新运行说明。
    也可将随机组路径替换为已有 `run02` 的 checkpoint；评估会使用旧 checkpoint
    保存的随机采样配置。用验证集选择权重，最终测试用于报告结果。
 

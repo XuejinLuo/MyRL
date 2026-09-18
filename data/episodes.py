@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 import numpy as np
 
-SCHEMA = 'myrl_primitive_v1'
+from data.observations import observation_fields
+from data.object_centric import validate_object_arrays
+
+LEGACY_SCHEMA = 'myrl_primitive_v1'
+SCHEMA = 'myrl_primitive_v2'
+TRANSITION_FIELDS = ('action', 'reward', 'success', 'terminated', 'truncated')
 FIELDS = ('pc', 'state', 'action', 'reward', 'success', 'terminated', 'truncated')
 
 
@@ -23,11 +28,16 @@ def validate_episode(ep):
     t = len(ep['action'])
     if t < 1:
         raise ValueError('Empty episode')
-    for key in FIELDS:
+    obs_keys = observation_fields(ep)
+    if 'object_points' in ep:
+        if 'pc' in ep:
+            raise ValueError('Mixed global/object-centric observation schema')
+        validate_object_arrays(ep)
+    for key in (*obs_keys, *TRANSITION_FIELDS):
         a = np.asarray(ep[key])
-        if len(a) != t + (key in ('pc', 'state')) or not np.isfinite(a).all():
+        if len(a) != t + (key in obs_keys) or not np.isfinite(a).all():
             raise ValueError(f'Invalid {key}: expected T+1 observations, T transitions')
-    if ep['pc'].ndim != 3 or ep['state'].ndim != 2 or ep['action'].ndim != 2:
+    if ('pc' in ep and ep['pc'].ndim != 3) or ep['state'].ndim != 2 or ep['action'].ndim != 2:
         raise ValueError('Invalid observation/action dimensions')
     for key in ('reward', 'success', 'terminated', 'truncated'):
         if ep[key].shape != (t,):
@@ -49,13 +59,13 @@ def save_episode(path, ep):
         raise FileExistsError(path)
     tmp = path.with_suffix('.tmp')
     with tmp.open('wb') as f:
-        np.savez_compressed(f, **{k: ep[k] for k in FIELDS})
+        np.savez_compressed(f, **{k: ep[k] for k in (*observation_fields(ep), *TRANSITION_FIELDS)})
     tmp.replace(path)
 
 
 def load_episode(path):
     with np.load(path, allow_pickle=False) as f:
-        ep = {k: f[k] for k in FIELDS}
+        ep = {k: f[k] for k in f.files}
     validate_episode(ep)
     return ep
 
@@ -63,7 +73,7 @@ def load_episode(path):
 def load_sources(manifest):
     manifest = Path(manifest).resolve()
     spec = json.loads(manifest.read_text())
-    if spec['schema'] != SCHEMA or spec['reward_mode'] != 'success':
+    if spec['schema'] not in (LEGACY_SCHEMA, SCHEMA) or spec['reward_mode'] != 'success':
         raise ValueError('Unsupported dataset schema/reward mode')
     episodes, seen = [], set()
     for source in spec['sources']:
@@ -86,7 +96,8 @@ def transition(ep, start, chunk_size, exec_steps, gamma):
     chunk = ep['action'][start:start + chunk_size]
     if len(chunk) < chunk_size:
         chunk = np.concatenate([chunk, np.repeat(chunk[-1:], chunk_size-len(chunk), axis=0)])
-    return dict(pc=ep['pc'][start], state=ep['state'][start], action_chunk=chunk,
-                next_pc=ep['pc'][stop], next_state=ep['state'][stop],
+    obs = {k: ep[k][start] for k in observation_fields(ep)}
+    nxt = {'next_' + k: ep[k][stop] for k in observation_fields(ep)}
+    return dict(**obs, **nxt, action_chunk=chunk,
                 reward=np.float32(np.dot(gamma ** np.arange(length), ep['reward'][start:stop])),
                 done=np.float32(ep['terminated'][stop-1]), discount=np.float32(gamma ** length))

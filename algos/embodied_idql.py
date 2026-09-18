@@ -2,25 +2,18 @@
 import torch
 from torch import nn
 from algos.idql import IDQL
-from models.encoders.pointnext import PointNeXtEncoder
+from models.encoders.factory import build_encoder, encoder_options, encoder_observation
 
 class CriticFeatureExtractor(nn.Module):
     """ 为 Q / V 网络共享一个 3D 点云特征提取器 """
     def __init__(self, cfg):
         super().__init__()
-        self.encoder = PointNeXtEncoder(
-            in_channels=cfg.model.get("in_channels", 3),
-            output_dim=cfg.model.cond_dim,
-            use_state=cfg.model.use_state,
-            state_dim=cfg.model.state_dim
-        )
+        self.encoder = build_encoder(**encoder_options(cfg),
+            in_channels=cfg.model.in_channels, output_dim=cfg.model.cond_dim,
+            use_state=cfg.model.use_state, state_dim=cfg.model.state_dim)
+
     def forward(self, obs_dict):
-        # 强制将键名对齐为 PointNeXtEncoder 需要的 'point_cloud' 和 'state'
-        pn_dict = {
-            'point_cloud': obs_dict['pc'],
-            'state': obs_dict['state']
-        }
-        return self.encoder(pn_dict)
+        return self.encoder(encoder_observation(obs_dict))
 
 class IDQL_VNet_Wrapper(nn.Module):
     def __init__(self, encoder, v_net):
@@ -48,7 +41,7 @@ class Policy_IDQL_Wrapper(nn.Module):
     def compute_loss(self, obs_dict, actions):
         # 解包字典，传入 policy
         return self.policy.compute_loss(
-            obs=obs_dict['pc'],
+            obs=obs_dict['pc'] if 'pc' in obs_dict else obs_dict,
             actions=actions,
             state=obs_dict['state']
         )

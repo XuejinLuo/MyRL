@@ -1,7 +1,14 @@
 # Panda / pd_ee_delta_pose task profile.
 env:
   env_id: StackCube-v1
-  # Segmentation-assisted diagnostic: keep total input/network unchanged.
+  observation:
+    mode: object_centric
+    encoder_variant: points  # centers: visible-centroid + robot-state ablation
+    objects:
+      - {name: cubeA, role: manipulated, h5_id: 18, max_points: 256}
+      - {name: cubeB, role: target, h5_id: 19, max_points: 256}
+    context_points: 512
+  # Retained global_object_budget baseline (selected via observation.mode).
   sampling:
     mode: object_budget
     objects:

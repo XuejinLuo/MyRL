@@ -39,16 +39,25 @@ python train_online.py
 
 若跳过迭代阶段，修改 `stages.online.source_stage: offline`，再单独运行 `python train_online.py`。使用已有权重时，修改对应的 `initial_ckpt`；迭代阶段还需要匹配的 `stats_path` 与 `dataset.manifest`。
 
-## StackCube 目标点预算实验
+## StackCube Object-Centric 3D
 
-StackCube 默认改为 segmentation 辅助采样：Cube A/B 各预留最多 256 个独立源点，
-不足时全部保留，剩余预算从未选点回填，总输入仍为 1024。实时 ID 按物体名称解析。
-默认实验名为 `run03_object_budget`；直接 `python train_offline.py` 会从原始 H5
-重新生成训练输入。切回随机对照：`env.sampling.mode=random`，同时换一个 experiment。
+StackCube 默认采用 **GT segmentation → 独立物体点云 → object/context/state tokens → Flow Policy**。
+cubeA、cubeB 各最多 256 个真实点，背景最多 512 个点；不足部分零填充并显式 mask。
+物体分支使用 masked PointNet，不再参与全局 PointNeXt/FPS；Actor、Q、V 使用同一观测定义。
+默认实验名 `run04_object_centric`，从现有 H5 重新预处理并训练，无须重新采集演示。
 
-先运行 `python -m tools.diagnostics.check_point_sampling` 查看同一批帧的随机/预算采样统计。
-本实验用于验证目标点丢失的影响，使用仿真分割信息；网络与训练参数未改。
-H5 ID、边界处理、重训与对照评估详见 [点云采样实验](docs/POINT_SAMPLING.md)。
+```bash
+python -m tools.diagnostics.check_object_centric --max-episodes 10
+python -m tools.diagnostics.overfit_object_centric --max-episodes 2 --steps 100
+python train_offline.py
+```
+
+先确认两个物体的有效点数和 missing rate，再做完整训练。第一阶段使用 ManiSkill GT 分割，
+尚未接入 SAM 或真实机器人。旧基线保留：`env.observation.mode=global_random` 或
+`env.observation.mode=global_object_budget`，并选择新的 `experiment`。
+显式 `observation.mode` 优先于旧 `sampling.mode`。
+架构、输入约定、四组消融与固定 100 seeds 对比见 [Object-Centric 运行说明](docs/OBJECT_CENTRIC.md)。
+历史全局预算方法见 [点云采样实验](docs/POINT_SAMPLING.md)。
 
 ## 任务切换
 
@@ -111,6 +120,8 @@ python evaluate.py
 | `data/episodes.py` | 轨迹校验、manifest、哈希及执行前缀 transition |
 | `data/dataset.py` | 两个离线阶段共用的 `TrajectoryDataset` |
 | `data/pointcloud.py` | 演示与实时观测共用的裁剪和采样 |
+| `data/object_centric.py`、`data/observations.py` | 物体点云构建、观测路由与统一归一化 |
+| `models/encoders/object_centric.py` | 带 mask 的物体/背景编码与 token 融合 |
 | `evaluation/` | 固定种子评估、录像和最终对比 |
 | `envs/factory.py` | 三阶段共用的 ManiSkill 环境构建 |
 | `models/factory.py`、`models/checkpoint.py` | 模型/观测编码构建、checkpoint 协议 |
@@ -126,10 +137,11 @@ python evaluate.py
 使用原有环境中的 PyTorch、Hydra/OmegaConf、NumPy、h5py、Gymnasium、tqdm、imageio，以及 pytest：
 
 ```bash
-python -m pytest -q
+python -m pytest -q tests/test_object_centric.py tests/test_point_sampling.py tests/test_stages.py tests/test_experiment.py tests/test_flow_ppo.py tests/test_iterative_data.py tests/test_primitive_recording.py
 ```
 
 CPU 测试包含三个阶段的真实优化器更新、小型模拟环境、权重衔接、统一输出和迭代续跑；不等同于完整 ManiSkill GPU 训练。本次没有测量 StackCube 等任务的成功率，也没有验证真实渲染。
+上述命令排除了 `tests/` 内依赖本机 H5 路径的历史人工诊断脚本。
 
 ### DataLoader 崩溃与性能诊断
 

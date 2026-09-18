@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from data.episodes import transition
+from data.episodes import transition, validate_episode
+from data.observations import (observation_fields, normalize_observation,
+                               validate_observation, batch_observation)
 
 
 class TrajectoryDataset(Dataset):
@@ -30,10 +32,11 @@ class TrajectoryDataset(Dataset):
         rejected = []
 
         for index, ep in enumerate(episodes):
-            if ep['pc'].shape[1:] != (
-                cfg.env.num_points, cfg.model.in_channels
-            ):
-                raise ValueError('Point cloud shape does not match config')
+            validate_episode(ep)
+            validate_observation({k: ep[k][0] for k in observation_fields(ep)}, cfg)
+            if 'object_points' in ep:
+                from data.object_centric import validate_object_arrays
+                validate_object_arrays(ep, cfg.env.observation, cfg.model.in_channels)
 
             if (
                 ep['state'].shape[1] != cfg.model.state_dim
@@ -104,13 +107,9 @@ class TrajectoryDataset(Dataset):
             self.discount,
         )
 
-        for k in ('pc', 'next_pc'):
-            row[k] = norm.center_point_cloud(
-                row[k], self.workspace_bounds
-            )
-
-        for k in ('state', 'next_state'):
-            row[k] = norm.normalize(row[k], 'state')
+        for prefix in ('', 'next_'):
+            obs = normalize_observation(batch_observation(row, prefix), norm, self.workspace_bounds)
+            row.update({prefix + k: v for k, v in obs.items()})
 
         row['action_chunk'] = norm.normalize(
             row['action_chunk'], 'action'
@@ -118,7 +117,8 @@ class TrajectoryDataset(Dataset):
 
         return {
             k: torch.as_tensor(
-                np.asarray(v), dtype=torch.float32
+                np.array(v, copy=True), dtype=(torch.bool if 'mask' in k or k.endswith('object_valid')
+                    else torch.int64 if k.endswith('object_roles') else torch.float32)
             )
             for k, v in row.items()
         }

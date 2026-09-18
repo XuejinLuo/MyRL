@@ -14,3 +14,7 @@ workspace_bounds: [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.5]]
 sampling:
   mode: random
   objects: []
+
+# null honors legacy sampling.mode; task profiles may select a new representation.
+observation:
+  mode: null

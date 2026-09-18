@@ -1,18 +1,19 @@
 """Record below ChunkActionWrapper, after its clipping, before observation normalization."""
 import numpy as np
 import gymnasium as gym
+from data.observations import episode_observation
 
 
 class PrimitiveRecorder(gym.Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self.rows = {k: [] for k in ('pc', 'state', 'action', 'reward', 'success', 'terminated', 'truncated')}
+        self.rows = {k: [] for k in (*episode_observation(obs), 'action', 'reward', 'success', 'terminated', 'truncated')}
         self._obs(obs)
         return obs, info
 
     def _obs(self, obs):
-        self.rows['pc'].append(np.array(obs['point_cloud'], dtype=np.float32, copy=True))
-        self.rows['state'].append(np.array(obs['state'], dtype=np.float32, copy=True))
+        for key, value in episode_observation(obs).items():
+            self.rows[key].append(np.array(value, copy=True))
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
