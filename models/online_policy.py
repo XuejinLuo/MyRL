@@ -18,7 +18,7 @@ class FlowPPOPolicy(nn.Module):
         self.eval()
 
     @torch.no_grad()
-    def encode(self, pc, state):
+    def encode(self, pc, state=None):
         self.eval()
         return self.policy._get_condition(pc, state).detach()
 

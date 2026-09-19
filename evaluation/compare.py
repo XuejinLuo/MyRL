@@ -10,6 +10,19 @@ from utils.experiment import evaluate_base, write_json
 from data.episodes import digest
 
 
+def comparison_protocol(config, normalizer, noise_level, min_std, allow_observation_variants=False):
+    """Opt-in representation ablations; control/action/seeds stay strictly matched."""
+    import copy
+    env, model = copy.deepcopy(config['env']), copy.deepcopy(config['model'])
+    if allow_observation_variants:
+        for key in ('sampling', 'observation', 'num_points', 'use_color'):
+            env.pop(key, None)
+        for key in ('encoder_type', 'in_channels'):
+            model.pop(key, None)
+    return dict(env=env, model=model, normalizer=normalizer,
+                noise_level=noise_level, min_std=min_std)
+
+
 def run(settings):
     options = settings.comparison
     seeds = list(range(options.seed_start, options.seed_start + options.episodes))
@@ -21,7 +34,7 @@ def run(settings):
     if out.exists():
         raise FileExistsError(f'{out}: select a new comparison.output')
     # Preflight every input before producing a partially comparable report.
-    inputs, protocol = [], None
+    inputs, protocol, observation_protocols = [], None, {}
     for label, checkpoint in options.checkpoints.items():
         if Path(label).name != label or label in ('.', '..'):
             raise ValueError('Comparison labels must be simple directory names')
@@ -33,8 +46,9 @@ def run(settings):
         cfg.device = settings.device
         cfg.noise_level = cfg.get('noise_level', cfg.algo.get('noise_level', .7))
         cfg.min_std = cfg.get('min_std', cfg.algo.get('min_std', .0067))
-        current = dict(env=cp['config']['env'], model=cp['config']['model'],
-                       normalizer=cp['normalizer'], noise_level=cfg.noise_level, min_std=cfg.min_std)
+        current = comparison_protocol(cp['config'], cp['normalizer'], cfg.noise_level, cfg.min_std,
+                                      options.get('allow_observation_variants', False))
+        observation_protocols[label] = dict(env=cp['config']['env'], model=cp['config']['model'])
         if protocol is not None and protocol != current:
             raise ValueError('Cannot compare incompatible environment/model/normalizer/sampler settings')
         protocol = current
@@ -64,7 +78,8 @@ def run(settings):
             rows.append(dict(stage=label, sampler=sampler, checkpoint=str(path),
                              checkpoint_sha256=digest(path), **result))
         del base, cp
-    write_json(out/'summary.json', dict(protocol=protocol, test_seeds=seeds, results=rows))
+    write_json(out/'summary.json', dict(protocol=protocol, observations=observation_protocols,
+                                       test_seeds=seeds, results=rows))
     with (out/'summary.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()

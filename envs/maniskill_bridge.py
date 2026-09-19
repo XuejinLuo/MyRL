@@ -6,10 +6,13 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
     """
     将 ManiSkill 原生的点云字典转换为你的 Infra 所需的极简字典格式
     """
-    def __init__(self, env, state_dim=16, sampling=None):
+    def __init__(self, env, state_dim=16, sampling=None, objects=None, require_rgb=False):
         super().__init__(env)
+        self.require_rgb = require_rgb
         self.sampling_objects = list((sampling or {}).get('objects', [])) if (
             (sampling or {}).get('mode', 'random') == 'object_budget') else []
+        if objects is not None:
+            self.sampling_objects = list(objects)
         # 你可以根据真实的 action_dim (比如 8) 和 state_dim (比如 16) 修改下面
         self.observation_space = gym.spaces.Dict({
             'xyz': gym.spaces.Box(-np.inf, np.inf, shape=(100000, 3), dtype=np.float32),
@@ -39,6 +42,8 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
                 # 归一化到 0~1
                 rgb = to_np(pc_dict['rgb']).reshape(-1, 3) / 255.0 
             else:
+                if self.require_rgb:
+                    raise ValueError('object_centric with use_color requires live RGB')
                 rgb = np.zeros_like(xyz)
         else:
             xyz, rgb = np.zeros((0, 3)), np.zeros((0, 3))
@@ -46,7 +51,7 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
         segmentation = None
         if self.sampling_objects:
             if 'segmentation' not in obs.get('pointcloud', {}):
-                raise ValueError('object_budget requires live pointcloud segmentation')
+                raise ValueError('Segmented observation requires live pointcloud segmentation')
             segmentation = to_np(obs['pointcloud']['segmentation']).reshape(-1)
             if len(segmentation) != len(xyz):
                 raise ValueError('Live segmentation and xyz lengths differ')

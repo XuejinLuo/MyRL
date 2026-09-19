@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from typing import Optional, Dict, Tuple, Union
 
 # 导入你提供的各个模块 (请确保这些文件在你的 PYTHONPATH 中)
-from models.encoders.pointnext import PointNeXtEncoder
+from models.encoders.factory import build_encoder, encoder_observation
 from models.backbones.transformer import ActionDiffusionTransformer
 from models.backbones.unet1d import ConditionalUnet1D
 from algos.diffusion_utils.flow_matching import OTFlowMatching
@@ -39,6 +39,7 @@ class EmbodiedGenPolicy(nn.Module):
         # 3. 生成算法配置
         algo_type: str = "flow",            # "flow" (推荐) or "diffusion"
         num_train_steps: int = 100,         # 仅 Diffusion 需要
+        encoder_variant: str = 'points',
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -50,15 +51,8 @@ class EmbodiedGenPolicy(nn.Module):
         # ====================================================================
         # 1. 实例化 3D 编码器 (Encoder)
         # ====================================================================
-        if encoder_type == "pointnext":
-            self.encoder = PointNeXtEncoder(
-                in_channels=in_channels, 
-                output_dim=cond_dim, 
-                use_state=use_state, 
-                state_dim=state_dim
-            )
-        else:
-            raise NotImplementedError(f"Unsupported encoder: {encoder_type}")
+        self.encoder = build_encoder(encoder_type, in_channels, cond_dim,
+                                     use_state, state_dim, encoder_variant)
 
         # ====================================================================
         # 2. 实例化 骨干网络 (Backbone)
@@ -93,10 +87,10 @@ class EmbodiedGenPolicy(nn.Module):
 
     def _get_condition(self, obs: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
         """ 内部辅助函数：将点云和本体状态打包喂给 Encoder """
-        obs_dict = {'point_cloud': obs}
-        if self.use_state and state is not None:
-            obs_dict['state'] = state
-        return self.encoder(obs_dict)
+        return self.encoder(encoder_observation(obs, state))
+
+    def encode(self, obs, state=None):
+        return self._get_condition(obs, state)
 
     # ========================================================================
     # [核心接口 1] Distillation / 基础前向计算
@@ -166,7 +160,8 @@ class EmbodiedGenPolicy(nn.Module):
             # [Fix: CFG 修复] - 补充 uncond_cond 生成逻辑，否则 cfg_weight 传入底层会失效
             uncond_cond = None
             if cfg_weight != 1.0:
-                dummy_obs = torch.zeros_like(obs)
+                dummy_obs = ({k: (v if k == 'object_roles' else torch.zeros_like(v))
+                              for k, v in obs.items()} if isinstance(obs, dict) else torch.zeros_like(obs))
                 dummy_state = torch.zeros_like(state) if (self.use_state and state is not None) else None
                 uncond_cond = self._get_condition(dummy_obs, dummy_state)
             
@@ -208,9 +203,8 @@ class EmbodiedGenPolicy(nn.Module):
         """
         在线强化微调的回归评估。返回每个样本的 Vector Field MSE
         """        
-        B = obs.shape[0]
-        device = obs.device
         cond = self._get_condition(obs, state)
+        B, device = cond.shape[0], cond.device
         
         if noise is None:
             noise = torch.randn_like(actions)

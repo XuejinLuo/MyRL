@@ -5,7 +5,7 @@ defaults:
   - task@_global_: stackcube
   - _self_
 
-experiment: run03_object_budget
+experiment: run04_object_centric
 seed: 42
 device: cuda
 # In-memory trajectories: avoid CUDA/SAPIEN fork crashes and per-worker RAM copies.
@@ -67,6 +67,7 @@ stages:
 
 # Separate final comparison; never used for checkpoint selection.
 comparison:
+  allow_observation_variants: false  # Explicit opt-in for representation ablations.
   checkpoints:
     offline: ${paths.root}/offline/checkpoints/best.pth
     iterative: ${paths.root}/iterative/checkpoints/best.pth

@@ -1,26 +1,28 @@
 """Policy construction and normalized observation encoding shared by all stages."""
 import numpy as np
 import torch
+from data.observations import (episode_observation, normalize_observation, validate_observation)
+from models.encoders.factory import encoder_options
 
 
 def build_base(cfg, device):
     from models.policy import EmbodiedGenPolicy
     keys = ('in_channels', 'action_dim', 'chunk_size', 'use_state', 'state_dim',
             'encoder_type', 'backbone_type', 'cond_dim', 'algo_type')
-    return EmbodiedGenPolicy(**{k: cfg.model[k] for k in keys}).to(device)
+    options = {k: cfg.model[k] for k in keys}
+    options.update(encoder_options(cfg))
+    return EmbodiedGenPolicy(**options).to(device)
 
 
 def observation_encoder(cfg, actor, normalizer, device):
     bounds = np.asarray(cfg.env.workspace_bounds)
     def encode(obs):
-        pc = np.asarray(obs['point_cloud'], dtype=np.float32)
-        state = np.asarray(obs['state'], dtype=np.float32)
-        if pc.shape != (cfg.env.num_points, cfg.model.in_channels) or state.shape != (cfg.model.state_dim,):
-            raise ValueError(f'Observation shape mismatch: pc={pc.shape}, state={state.shape}')
-        if not np.isfinite(pc).all() or not np.isfinite(state).all():
-            raise ValueError('Nonfinite observation')
-        pc = normalizer.center_point_cloud(pc, bounds)
-        state = normalizer.normalize(state, 'state')
-        return actor.encode(torch.as_tensor(pc, device=device)[None],
-                            torch.as_tensor(state, device=device)[None])
+        obs = episode_observation(obs)
+        validate_observation(obs, cfg)
+        normalized = normalize_observation(obs, normalizer, bounds)
+        tensors = {k: torch.as_tensor(v, device=device)[None] for k, v in normalized.items()}
+        if 'pc' in tensors:
+            # Retain compatibility with the historical two-argument adapter.
+            return actor.encode(tensors['pc'], tensors['state'])
+        return actor.encode(tensors)
     return encode

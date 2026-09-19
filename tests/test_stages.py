@@ -25,6 +25,7 @@ def config(stage, tmp_path):
     cfg.paths.root = str(tmp_path/'run')
     cfg.num_workers = 0
     cfg.env.sampling.mode = "random"  # Tiny synthetic environment has no objects.
+    cfg.env.observation.mode = None  # Explicitly exercise legacy observation routing.
     cfg.env.num_points = 4
     cfg.env.use_color = False
     cfg.env.max_episode_steps = 3
@@ -78,21 +79,44 @@ def primitive_episode():
         terminated=np.zeros(3, dtype=bool), truncated=np.array([False, False, True]))
 
 
-def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize('structured', [False, True])
+def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, monkeypatch, structured):
     from workflows import offline, iterative, online, offline_round
     from evaluation import compare
-    for module in (offline, iterative, online, compare):
-        monkeypatch.setattr(module, 'build_base', lambda cfg, device: TrainableTinyPolicy().to(device))
-    monkeypatch.setattr(offline_round, 'CriticFeatureExtractor', CriticFeatures)
-    monkeypatch.setattr(offline, 'load_demonstrations', lambda cfg: [primitive_episode()])
+    if not structured:
+        for module in (offline, iterative, online, compare):
+            monkeypatch.setattr(module, 'build_base', lambda cfg, device: TrainableTinyPolicy().to(device))
+        monkeypatch.setattr(offline_round, 'CriticFeatureExtractor', CriticFeatures)
+    from tests.test_object_centric import build, CONFIG
+    def episode():
+        ep = primitive_episode()
+        if structured:
+            ep.pop('pc')
+            ep.update({k: np.stack([v]*4) for k, v in build(use_color=False).items()})
+        return ep
+    monkeypatch.setattr(offline, 'load_demonstrations', lambda cfg: [episode()])
+
+    class ObjectToyEnv(ToyEnv):
+        def observation(self, obs):
+            return dict(**build(use_color=False), state=obs['state'])
+        def reset(self, **kwargs):
+            obs, info = super().reset(**kwargs)
+            return self.observation(obs), info
+        def step(self, action):
+            obs, *rest = super().step(action)
+            return self.observation(obs), *rest
 
     def make_env(cfg, primitive_wrapper=None, video=None):
-        env = ToyEnv()
+        env = ObjectToyEnv() if structured else ToyEnv()
         if primitive_wrapper:
             env = primitive_wrapper(env)
         return ChunkActionWrapper(env, cfg.model.chunk_size, cfg.env.exec_steps)
     monkeypatch.setitem(sys.modules, 'envs.factory', SimpleNamespace(make_env=make_env))
     configs = {stage: config(stage, tmp_path) for stage in ('offline', 'iterative', 'online')}
+    if structured:
+        for cfg in configs.values():
+            cfg.env.observation = CONFIG
+            cfg.model.cond_dim = 32
     configs['offline'].eval.every = 2
     configs['offline'].save_epoch = 2
     offline.run(configs['offline'])

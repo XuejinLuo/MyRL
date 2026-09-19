@@ -137,6 +137,7 @@ def config(path):
     with initialize_config_dir(version_base=None, config_dir=str(Path(__file__).resolve().parents[1]/'configs')):
         cfg = compose(config_name='train_offline')
     cfg.dataset.data_path = str(path)
+    cfg.env.observation.mode = 'global_object_budget'
     cfg.env.workspace_bounds = BOUNDS
     return cfg
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-18 — GT segmentation / Object-Centric 3D
+
+- 新增独立 object/context/state 表示；默认 StackCube 为 256/256/512 点上限。目标无放回采样，少点/空物体用零 padding + mask，不重拼成全局点云。
+- Actor/Q/V 统一选择 masked PointNet + token Transformer 编码器，默认仍输出 256 维；保留全局 random/object-budget 与 PointNeXt。Flow、action chunk、IDQL/PPO 目标和评估种子协议不变。
+- 共用 H5/live builder、观测归一化、v2 结构化 episode/recorder/transition；保留 v1 读取。实时 ID 按名称解析，H5 ID 明确配置。
+- 增加可见中心消融（不是真实位姿 oracle）、H5 统计、BC 小批量 sanity 工具、训练点数/缺失指标和显式跨表示对比。
+- 验证：61 项 CPU 回归/集成通过，1 项 spawn 测试因 Unix socket 权限跳过；含实际 object encoder/Flow backbone 的三阶段交接。未运行真实 H5/ManiSkill 成功率实验。
+- 使用现有 H5 重新训练；旧 PointNeXt 权重不能直接移植。新默认 experiment=run04_object_centric，详见 docs/OBJECT_CENTRIC.md。
+
 ## 2026-09-17 — StackCube 目标点预算对照实验
 
 - StackCube 默认使用 segmentation 为 cubeA/cubeB 各预留 256 个点，总输入保持 1024；稀少目标保留全部源点，剩余预算无放回回填后打乱。

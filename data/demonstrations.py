@@ -5,17 +5,20 @@ import numpy as np
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from data.episodes import SCHEMA, digest, save_episode, validate_episode
-from data.pointcloud import preprocess_points, validate_sampling
+from data.pointcloud import preprocess_points
+from data.object_centric import build_object_observation
+from data.observations import observation_mode, sampling_config, validate_observation_config
 from utils.experiment import write_json
 
 
 def load_demonstrations(cfg):
     path = Path(cfg.dataset.data_path).expanduser().resolve()
-    sampling = cfg.env.get('sampling')
-    objects = validate_sampling(sampling, cfg.env.num_points)
+    sampling = sampling_config(cfg.env)
+    objects = validate_observation_config(cfg.env)
+    structured = observation_mode(cfg.env) == 'object_centric'
     if objects:
         print('[Point sampling] H5 targets: ' + ', '.join(
-            f"{o['name']} id={o['h5_id']} budget={o['num_points']}" for o in objects), flush=True)
+            f"{o['name']} id={o['h5_id']} budget={o.get('max_points', o.get('num_points'))}" for o in objects), flush=True)
     episodes = []
     with h5py.File(path, 'r') as source:
         keys = list(source.keys())
@@ -52,7 +55,7 @@ def load_demonstrations(cfg):
                 stop = min(stop, int(terminals[0])+1)
             cloud = obs['pointcloud']
             if objects and 'segmentation' not in cloud:
-                raise ValueError(f'{key}: object_budget requires H5 pointcloud/segmentation')
+                raise ValueError(f'{key}: Segmented observation requires H5 pointcloud/segmentation')
             if objects and len(cloud['segmentation']) != t + 1:
                 raise ValueError(f'{key}: expected T+1 segmentation observations')
             # Read once per trajectory instead of repeated HDF5 lookups/decompression per frame.
@@ -64,11 +67,15 @@ def load_demonstrations(cfg):
                 xyzw = xyzw.reshape(-1, 4)
                 valid = xyzw[:, 3] > 0
                 rgb = rgb_frames[i].reshape(-1, 3)[valid] / 255.0 if rgb_frames is not None else None
-                frames.append(preprocess_points(xyzw[valid, :3], rgb,
-                    cfg.env.workspace_bounds, cfg.env.num_points, cfg.env.use_color,
-                    sampling=sampling,
-                    segmentation=seg_frames[i].reshape(-1)[valid] if objects else None))
-            ep = dict(pc=np.stack(frames),
+                segmentation = seg_frames[i].reshape(-1)[valid] if objects else None
+                if structured:
+                    frames.append(build_object_observation(xyzw[valid, :3], rgb, segmentation,
+                        cfg.env.workspace_bounds, cfg.env.observation, cfg.env.use_color))
+                else:
+                    frames.append(dict(pc=preprocess_points(xyzw[valid, :3], rgb,
+                        cfg.env.workspace_bounds, cfg.env.num_points, cfg.env.use_color,
+                        sampling=sampling, segmentation=segmentation)))
+            ep = dict(**{k: np.stack([frame[k] for frame in frames]) for k in frames[0]},
                 state=np.concatenate([obs['agent']['qpos'][:stop+1], tcp[:stop+1]], axis=-1).astype(np.float32),
                 action=actions[:stop], success=labels['success'][:stop].astype(bool),
                 terminated=labels['terminated'][:stop].astype(bool), truncated=np.zeros(stop, dtype=bool))

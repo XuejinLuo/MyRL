@@ -1,10 +1,12 @@
 """Shared configuration validation; fail before loading large datasets."""
 import numpy as np
-from data.pointcloud import validate_sampling
+from data.observations import validate_observation_config, observation_mode
 
 
 def validate_common(cfg):
-    validate_sampling(cfg.env.get("sampling"), cfg.env.num_points)
+    validate_observation_config(cfg.env)
+    if observation_mode(cfg.env) == "object_centric" and cfg.model.cond_dim % 4:
+        raise ValueError("Object-centric cond_dim must be divisible by 4")
     if cfg.model.algo_type != 'flow':
         raise ValueError('The three-stage CPS/PPO workflow requires model.algo_type=flow')
     if not 1 <= cfg.env.exec_steps <= cfg.model.chunk_size:
