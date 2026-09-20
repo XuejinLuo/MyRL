@@ -1,10 +1,12 @@
 """Shared configuration validation; fail before loading large datasets."""
 import numpy as np
 from data.observations import validate_observation_config, observation_mode
+from models.encoders.factory import encoder_options
 
 
 def validate_common(cfg):
     validate_observation_config(cfg.env)
+    encoder_options(cfg)  # Reject invalid state-skip experiments before H5 ingestion.
     if observation_mode(cfg.env) == "object_centric" and cfg.model.cond_dim % 4:
         raise ValueError("Object-centric cond_dim must be divisible by 4")
     if cfg.model.algo_type != 'flow':

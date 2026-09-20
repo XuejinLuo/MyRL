@@ -79,8 +79,8 @@ def primitive_episode():
         terminated=np.zeros(3, dtype=bool), truncated=np.array([False, False, True]))
 
 
-@pytest.mark.parametrize('structured', [False, True])
-def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, monkeypatch, structured):
+@pytest.mark.parametrize('structured,state_skip', [(False, False), (True, False), (True, True)])
+def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, monkeypatch, structured, state_skip):
     from workflows import offline, iterative, online, offline_round
     from evaluation import compare
     if not structured:
@@ -116,6 +116,8 @@ def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, mon
     if structured:
         for cfg in configs.values():
             cfg.env.observation = CONFIG
+            if state_skip:
+                OmegaConf.update(cfg, 'env.observation.state_skip', True, force_add=True)
             cfg.model.cond_dim = 32
     configs['offline'].eval.every = 2
     configs['offline'].save_epoch = 2
@@ -146,6 +148,9 @@ def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, mon
         selection = json.loads((output/'selection.json').read_text())
         cp = torch.load(selection['checkpoint'], weights_only=True)
         assert cp['metrics'] == selection['metrics']
+        if state_skip:
+            assert cp['config']['env']['observation']['state_skip'] is True
+            assert any('state_projection.weight' in key for key in cp['model_state_dict'])
     episodes, _ = load_sources(Path(configs['iterative'].output)/'round_000'/'manifest.json')
     assert len(episodes) == 3
     cfg = configs['iterative']

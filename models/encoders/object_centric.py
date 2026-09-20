@@ -25,10 +25,14 @@ class ObjectPointEncoder(nn.Module):
 
 class ObjectCentricEncoder(nn.Module):
     def __init__(self, in_channels=6, output_dim=256, use_state=True,
-                 state_dim=16, variant='points'):
+                 state_dim=16, variant='points', state_skip=False):
         super().__init__()
         if output_dim % 4 or variant not in ('points', 'centers'):
             raise ValueError('Require output_dim divisible by 4 and points/centers variant')
+        if not isinstance(state_skip, bool):
+            raise ValueError('state_skip must be boolean')
+        if state_skip and (not use_state or state_dim < 1):
+            raise ValueError('state_skip requires use_state=True and positive state_dim')
         self.use_state, self.variant = use_state, variant
         self.object_encoder = ObjectPointEncoder(in_channels, output_dim)
         self.context_encoder = ObjectPointEncoder(in_channels, output_dim)
@@ -45,6 +49,16 @@ class ObjectCentricEncoder(nn.Module):
             dropout=0., activation='gelu', batch_first=True, norm_first=True)
         self.fusion = nn.TransformerEncoder(layer, 2, enable_nested_tensor=False)
         self.output_norm = nn.LayerNorm(output_dim)
+        self.state_projection = None
+        if state_skip:
+            # Start as the legacy readout, without shifting downstream model RNG.
+            # The zero-initialized state columns are trainable from the first update.
+            with torch.random.fork_rng(devices=[]):
+                self.state_projection = nn.Linear(output_dim + state_dim, output_dim)
+            with torch.no_grad():
+                self.state_projection.weight.zero_()
+                self.state_projection.weight[:, :output_dim].copy_(torch.eye(output_dim))
+                self.state_projection.bias.zero_()
 
     def forward(self, obs):
         valid = obs['object_valid'].bool()
@@ -68,4 +82,8 @@ class ObjectCentricEncoder(nn.Module):
         if self.use_state:
             tokens.append((self.state_encoder(obs['state']) + self.token_type[2])[:, None])
         fused = self.fusion(torch.cat(tokens, dim=1))
-        return self.output_norm(fused[:, 0])
+        condition = self.output_norm(fused[:, 0])
+        if self.state_projection is not None:
+            # Same normalized robot state used by the existing token; no new features.
+            condition = self.state_projection(torch.cat([condition, obs['state']], dim=-1))
+        return condition

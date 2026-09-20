@@ -40,6 +40,7 @@ class EmbodiedGenPolicy(nn.Module):
         algo_type: str = "flow",            # "flow" (推荐) or "diffusion"
         num_train_steps: int = 100,         # 仅 Diffusion 需要
         encoder_variant: str = 'points',
+        state_skip: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -52,7 +53,7 @@ class EmbodiedGenPolicy(nn.Module):
         # 1. 实例化 3D 编码器 (Encoder)
         # ====================================================================
         self.encoder = build_encoder(encoder_type, in_channels, cond_dim,
-                                     use_state, state_dim, encoder_variant)
+                                     use_state, state_dim, encoder_variant, state_skip)
 
         # ====================================================================
         # 2. 实例化 骨干网络 (Backbone)
