@@ -101,6 +101,65 @@ python evaluate.py comparison.allow_observation_variants=true \
 
 ## 数据、checkpoint 和后续阶段
 
+### 单项消融：融合输出直接拼接 robot state
+
+可选 `env.observation.state_skip=true` 只增加一条 state 直接通路：
+
+```text
+h = LayerNorm(Transformer(tokens)[:, 0])
+condition = Linear(concat(h, normalized_robot_state))
+```
+
+保留现有 state token；直接拼接的是 dataset/rollout 共用 normalizer 产生的同一份
+robot state（StackCube 为 16 维 qpos + TCP pose），不增加 TCP–物体或物体–物体相对位置。
+输出维度仍是 `model.cond_dim`（默认 256）。points/centers 均支持；global 模式或
+`model.use_state=false` 时开启会在读取 H5 前报错。Actor/Q/V 均沿用共享工厂、独立参数。
+
+新 Linear 初始化为 `[I, 0]`、bias=0，初始输出等于原融合输出，state 列可训练。
+该层构造不消耗后续模型初始化的 CPU RNG，因此相同 seed 下已有编码器与 Flow
+backbone 的初始权重不变。新投影仅增加 `cond_dim * (cond_dim + state_dim + 1)` 个参数
+（默认每个编码器 69,888 个），这是本消融的额外模型容量。
+
+此开关默认缺省/关闭，缺省与 false 均保留原 state_dict 结构。为兼容旧配置及阶段交接，
+没有向默认 YAML 注入新字段；Hydra 命令用 **`+`** 添加：
+
+```bash
+python train_offline.py experiment=oc_points_state_skip \
+  env.observation.mode=object_centric env.observation.encoder_variant=points \
+  +env.observation.state_skip=true
+```
+
+如果要对照 centers，将 experiment 改为 `oc_centers_state_skip`，variant 改为 `centers`。
+保持各自无 skip 基线的训练轮数、演示、seed、选模和评估协议相同。
+开启后需使用新实验目录重新训练，不能只在旧模型评估时打开；旧模型仍按原结构评估。
+checkpoint 自动保存此开关，`evaluate.py` 用 checkpoint 内嵌配置重建网络。
+
+仅评估新增 points 模型：
+
+```bash
+python evaluate.py '~comparison.checkpoints' \
+  '+comparison.checkpoints={offline:outputs/StackCube-v1/oc_points_state_skip/offline/checkpoints/best.pth}' \
+  comparison.output=outputs/StackCube-v1/oc_points_state_skip/test_best_100 \
+  comparison.seed_start=3000 comparison.episodes=100 video.episodes=0
+```
+
+此命令同时报告 CPS/ODE，不需要在评估启动配置重复设置 state_skip。不同表示/skip
+配置的多个 checkpoint 一起比较时，仍需 `comparison.allow_observation_variants=true`。
+顶层评估 `config.yaml` 是启动设置；实际网络/观测配置见汇总 `summary.json` 的
+`observations`，实际选中 epoch 见训练 `selection.json`。
+
+后续训练继续显式传入同一开关和实验名：
+
+```bash
+python train_iterative.py experiment=oc_points_state_skip +env.observation.state_skip=true
+python train_online.py experiment=oc_points_state_skip +env.observation.state_skip=true
+```
+
+在线 PPO 仍按原流程冻结整个 encoder（包括新投影）；本修改不改变训练目标、采样、
+归一化、动作执行或评估规则。CPU 测试仅验证通路、梯度与阶段交接，不代表任务成功率提高。
+
+### 原始数据与阶段交接
+
 新导出的 manifest 使用 `myrl_primitive_v2`，物体字段为独立 NPZ 数组；所有观测保留 T+1 帧。
 v1 global 数据仍可读；global/object schema 不可混用。重用原始 H5 重新 preprocessing 即可，
 不要把已下采样的旧 1024 点 NPZ 转成 object-centric（丢失的点无法恢复）。

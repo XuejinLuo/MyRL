@@ -167,11 +167,14 @@ def test_center_ablation_ignores_cloud_extent_and_context():
     torch.testing.assert_close(encoder(obs), expected)
 
 
-def test_dataset_rollout_normalization_actor_critic_and_bc_gradient(tmp_path):
+@pytest.mark.parametrize('state_skip', [False, True])
+def test_dataset_rollout_normalization_actor_critic_and_bc_gradient(tmp_path, state_skip):
     from algos.embodied_idql import CriticFeatureExtractor, Policy_IDQL_Wrapper
     path = tmp_path/'source.h5'
     make_h5(path)
     cfg = object_config(path)
+    if state_skip:
+        OmegaConf.update(cfg, 'env.observation.state_skip', True, force_add=True)
     ep, = load_demonstrations(cfg)
     original = {k: v.copy() for k, v in ep.items()}
     norm = MinMaxNormalizer()
@@ -183,9 +186,13 @@ def test_dataset_rollout_normalization_actor_critic_and_bc_gradient(tmp_path):
     assert obs['object_point_mask'].dtype == torch.bool
     base = build_base(cfg, 'cpu')
     assert isinstance(base.encoder, ObjectCentricEncoder)
-    for _ in range(2):
-        assert isinstance(CriticFeatureExtractor(cfg).encoder, ObjectCentricEncoder)
-        assert CriticFeatureExtractor(cfg)(obs).shape == (1, 256)
+    critics = [CriticFeatureExtractor(cfg) for _ in range(2)]
+    for critic in critics:
+        assert isinstance(critic.encoder, ObjectCentricEncoder)
+        assert (critic.encoder.state_projection is not None) == state_skip
+        assert critic(obs).shape == (1, 256)
+    assert not set(map(id, critics[0].parameters())) & set(map(id, critics[1].parameters()))
+    assert not set(map(id, base.parameters())) & set(map(id, critics[0].parameters()))
     base.eval()
     expected = base.encode(obs).detach()
     actor = FlowPPOPolicy(base, num_steps=2)
@@ -202,6 +209,8 @@ def test_dataset_rollout_normalization_actor_critic_and_bc_gradient(tmp_path):
         optimizer.step()
         assert torch.isfinite(loss)
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in base.encoder.parameters())
+    if state_skip:
+        assert base.encoder.state_projection.weight[:, -cfg.model.state_dim:].abs().sum() > 0
     for v in row.values():
         if v.dtype == torch.bool:
             v.logical_not_()

@@ -59,6 +59,17 @@ python train_offline.py
 架构、输入约定、四组消融与固定 100 seeds 对比见 [Object-Centric 运行说明](docs/OBJECT_CENTRIC.md)。
 历史全局预算方法见 [点云采样实验](docs/POINT_SAMPLING.md)。
 
+可单独测试融合输出直接拼接 robot state（保留 state token，不增加相对位置特征）：
+
+```bash
+python train_offline.py experiment=oc_points_state_skip \
+  env.observation.mode=object_centric env.observation.encoder_variant=points \
+  +env.observation.state_skip=true
+```
+
+默认关闭，旧 checkpoint 继续使用原结构。开启需新实验重训；评估命令、初始化和
+阶段交接说明见 [state 直接通路消融](docs/OBJECT_CENTRIC.md#单项消融融合输出直接拼接-robot-state)。
+
 ## 任务切换
 
 只需在 `configs/config.yaml` 的 defaults 中选择任务。环境 ID、默认演示路径、输出目录、各阶段输入权重路径同步变化。
