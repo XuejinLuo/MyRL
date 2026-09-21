@@ -41,6 +41,9 @@ class EmbodiedGenPolicy(nn.Module):
         num_train_steps: int = 100,         # 仅 Diffusion 需要
         encoder_variant: str = 'points',
         state_skip: bool = False,
+        relational_features: bool = False,
+        object_feature_dim: int = 23,
+        object_feature_hidden_dim: int = 64,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -53,7 +56,8 @@ class EmbodiedGenPolicy(nn.Module):
         # 1. 实例化 3D 编码器 (Encoder)
         # ====================================================================
         self.encoder = build_encoder(encoder_type, in_channels, cond_dim,
-                                     use_state, state_dim, encoder_variant, state_skip)
+                                     use_state, state_dim, encoder_variant, state_skip,
+                                     relational_features, object_feature_dim, object_feature_hidden_dim)
 
         # ====================================================================
         # 2. 实例化 骨干网络 (Backbone)

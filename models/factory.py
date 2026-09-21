@@ -21,7 +21,7 @@ def observation_encoder(cfg, actor, normalizer, device):
         validate_observation(obs, cfg)
         normalized = normalize_observation(obs, normalizer, bounds)
         tensors = {k: torch.as_tensor(v, device=device)[None] for k, v in normalized.items()}
-        if 'pc' in tensors:
+        if 'pc' in tensors and 'object_features' not in tensors:
             # Retain compatibility with the historical two-argument adapter.
             return actor.encode(tensors['pc'], tensors['state'])
         return actor.encode(tensors)

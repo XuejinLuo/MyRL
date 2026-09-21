@@ -41,7 +41,7 @@ class Policy_IDQL_Wrapper(nn.Module):
     def compute_loss(self, obs_dict, actions):
         # 解包字典，传入 policy
         return self.policy.compute_loss(
-            obs=obs_dict['pc'] if 'pc' in obs_dict else obs_dict,
+            obs=obs_dict['pc'] if 'pc' in obs_dict and 'object_features' not in obs_dict else obs_dict,
             actions=actions,
             state=obs_dict['state']
         )

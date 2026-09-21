@@ -6,7 +6,7 @@ from envs.maniskill_bridge import ManiSkillToRL100Wrapper
 from envs.pointcloud_wrapper import PointCloudObservationWrapper
 from envs.chunk_wrapper import ChunkActionWrapper
 from envs.object_centric_wrapper import ObjectCentricObservationWrapper
-from data.observations import observation_mode, sampling_config, validate_observation_config
+from data.observations import observation_mode, sampling_config, validate_observation_config, relational_enabled
 
 def make_env(cfg, primitive_wrapper=None, video=None):
     """ 创建并包装 ManiSkill 真实仿真环境 """
@@ -45,7 +45,8 @@ def make_env(cfg, primitive_wrapper=None, video=None):
             workspace_bounds=ws_bounds, use_color=cfg.env.use_color)
     else:
         env = PointCloudObservationWrapper(env, num_points=cfg.env.num_points,
-            workspace_bounds=ws_bounds, use_color=cfg.env.use_color, sampling=sampling)
+            workspace_bounds=ws_bounds, use_color=cfg.env.use_color, sampling=sampling,
+            relational_features=relational_enabled(cfg.env))
     
     if video is not None:
         from evaluation.video import EvalVideo

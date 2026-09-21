@@ -17,6 +17,7 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
         self.observation_space = gym.spaces.Dict({
             'xyz': gym.spaces.Box(-np.inf, np.inf, shape=(100000, 3), dtype=np.float32),
             'rgb': gym.spaces.Box(0, 1, shape=(100000, 3), dtype=np.float32),
+            'tcp_position': gym.spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
             'state': gym.spaces.Box(-np.inf, np.inf, shape=(state_dim,), dtype=np.float32)
         })
 
@@ -79,7 +80,8 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
         result = {
             'xyz': xyz, 
             'rgb': rgb, 
-            'state': state
+            'state': state,
+            'tcp_position': tcp_pose[:3].astype(np.float32)
         }
         if self.sampling_objects:
             from data.pointcloud import resolve_target_ids

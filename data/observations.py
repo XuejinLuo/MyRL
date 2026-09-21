@@ -21,20 +21,34 @@ def sampling_config(env):
                 objects=list((env.get('sampling') or {}).get('objects', [])))
 
 
+def relational_enabled(env):
+    flag = (env.get('observation') or {}).get('relational_features', False)
+    if not isinstance(flag, bool):
+        raise ValueError('env.observation.relational_features must be boolean')
+    if flag and observation_mode(env) != 'global_object_budget':
+        raise ValueError('relational_features requires global_object_budget')
+    return flag
+
+
 def validate_observation_config(env):
+    relational = relational_enabled(env)
+    if relational and len(sampling_config(env)['objects']) != 2:
+        raise ValueError('relational_features requires exactly two ordered sampling objects')
     if observation_mode(env) == 'object_centric':
         return validate_object_config(env['observation'])
     return validate_sampling(sampling_config(env), env['num_points'])
 
 
 def observation_fields(obs):
-    return (*OBJECT_FIELDS, 'state') if 'object_points' in obs else ('pc', 'state')
+    return ((*OBJECT_FIELDS, 'state') if 'object_points' in obs else
+            ('pc', 'state', 'object_features') if 'object_features' in obs else ('pc', 'state'))
 
 
 def episode_observation(obs):
     if 'object_points' in obs:
         return {k: obs[k] for k in (*OBJECT_FIELDS, 'state')}
-    return dict(pc=obs['point_cloud'], state=obs['state'])
+    return dict(pc=obs['point_cloud'], state=obs['state'],
+                **({'object_features': obs['object_features']} if 'object_features' in obs else {}))
 
 
 def normalize_observation(obs, normalizer, bounds):
@@ -44,6 +58,12 @@ def normalize_observation(obs, normalizer, bounds):
     result['state'] = normalizer.normalize(result['state'], 'state')
     if 'object_points' not in result:
         result['pc'] = normalizer.center_point_cloud(result['pc'], bounds)
+        if 'object_features' in result:
+            features = result['object_features']
+            center = np.asarray(bounds, dtype=np.float32).mean(0)
+            for i in range(2):
+                features[..., 3*i:3*i+3] = np.where(features[..., 21+i:22+i].astype(bool),
+                    features[..., 3*i:3*i+3] - center, 0.)
         return result
     center = np.asarray(bounds, dtype=np.float32).mean(0)
     result['object_centers'] = np.where(result['object_valid'][..., None],
@@ -55,6 +75,13 @@ def normalize_observation(obs, normalizer, bounds):
 
 
 def validate_observation(obs, cfg):
+    from data.object_features import validate_relational_features
+    if relational_enabled(cfg.env) != ('object_features' in obs):
+        raise ValueError('object_features presence does not match relational_features config')
+    if 'object_features' in obs:
+        validate_relational_features(obs['object_features'])
+        if np.shape(obs['object_features']) != (23,):
+            raise ValueError('object_features must have shape (23,)')
     if observation_mode(cfg.env) == 'object_centric':
         if 'pc' in obs or 'point_cloud' in obs:
             raise ValueError('Object-centric mode cannot contain a global cloud')
@@ -68,5 +95,6 @@ def validate_observation(obs, cfg):
 
 
 def batch_observation(batch, prefix=''):
-    fields = (*OBJECT_FIELDS, 'state') if prefix + 'object_points' in batch else ('pc', 'state')
+    fields = observation_fields({k.removeprefix(prefix): v for k, v in batch.items()
+                                 if k.startswith(prefix)})
     return {k: batch[prefix + k] for k in fields}
