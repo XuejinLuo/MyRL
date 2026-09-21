@@ -29,6 +29,11 @@ def validate_episode(ep):
     if t < 1:
         raise ValueError('Empty episode')
     obs_keys = observation_fields(ep)
+    if 'object_features' in ep:
+        from data.object_features import validate_relational_features
+        if 'object_points' in ep or np.shape(ep['object_features']) != (t+1, 23):
+            raise ValueError('Invalid global relational episode shape')
+        validate_relational_features(ep['object_features'])
     if 'object_points' in ep:
         if 'pc' in ep:
             raise ValueError('Mixed global/object-centric observation schema')

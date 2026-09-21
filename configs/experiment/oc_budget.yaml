@@ -1,0 +1,12 @@
+# @package _global_
+experiment: oc_budget
+env:
+  observation:
+    mode: global_object_budget
+    relational_features: false
+  num_points: 1024
+  sampling:
+    mode: object_budget
+    objects:
+      - {name: cubeA, h5_id: 18, num_points: 256}
+      - {name: cubeB, h5_id: 19, num_points: 256}

@@ -39,6 +39,18 @@ python train_online.py
 
 若跳过迭代阶段，修改 `stages.online.source_stage: offline`，再单独运行 `python train_online.py`。使用已有权重时，修改对应的 `initial_ckpt`；迭代阶段还需要匹配的 `stats_path` 与 `dataset.manifest`。
 
+## Object-budget + Relational 实验
+
+保留 global PointNeXt，在 object-budget 基线上增加 23 维可见物体几何关系：
+
+```bash
+python train_offline.py +experiment=oc_budget
+python train_offline.py +experiment=oc_budget_relational
+```
+
+输入定义、checkpoint 兼容性和固定 100 seeds 的 CPS/ODE 对比命令见
+[Relational 实验说明](docs/OBJECT_BUDGET_RELATIONAL.md)。
+
 ## StackCube Object-Centric 3D
 
 StackCube 默认采用 **GT segmentation → 独立物体点云 → object/context/state tokens → Flow Policy**。

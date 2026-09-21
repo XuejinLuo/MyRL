@@ -17,7 +17,7 @@ def comparison_protocol(config, normalizer, noise_level, min_std, allow_observat
     if allow_observation_variants:
         for key in ('sampling', 'observation', 'num_points', 'use_color'):
             env.pop(key, None)
-        for key in ('encoder_type', 'in_channels'):
+        for key in ('encoder_type', 'in_channels', 'object_feature_dim', 'object_feature_hidden_dim'):
             model.pop(key, None)
     return dict(env=env, model=model, normalizer=normalizer,
                 noise_level=noise_level, min_std=min_std)

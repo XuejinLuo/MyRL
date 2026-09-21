@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - oc_budget
+  - _self_
+experiment: oc_budget_relational
+env:
+  observation:
+    relational_features: true
+model:
+  object_feature_dim: 23
+  object_feature_hidden_dim: 64

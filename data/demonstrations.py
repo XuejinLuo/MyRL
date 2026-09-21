@@ -6,8 +6,9 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 from data.episodes import SCHEMA, digest, save_episode, validate_episode
 from data.pointcloud import preprocess_points
+from data.object_features import build_relational_features
 from data.object_centric import build_object_observation
-from data.observations import observation_mode, sampling_config, validate_observation_config
+from data.observations import observation_mode, sampling_config, validate_observation_config, relational_enabled
 from utils.experiment import write_json
 
 
@@ -16,6 +17,7 @@ def load_demonstrations(cfg):
     sampling = sampling_config(cfg.env)
     objects = validate_observation_config(cfg.env)
     structured = observation_mode(cfg.env) == 'object_centric'
+    relational = relational_enabled(cfg.env)
     if objects:
         print('[Point sampling] H5 targets: ' + ', '.join(
             f"{o['name']} id={o['h5_id']} budget={o.get('max_points', o.get('num_points'))}" for o in objects), flush=True)
@@ -62,6 +64,7 @@ def load_demonstrations(cfg):
             xyzw_frames = cloud['xyzw'][:stop+1]
             rgb_frames = cloud['rgb'][:stop+1] if 'rgb' in cloud else None
             seg_frames = cloud['segmentation'][:stop+1] if objects else None
+            tcp_frames = tcp[:stop+1]
             frames = []
             for i, xyzw in enumerate(xyzw_frames):
                 xyzw = xyzw.reshape(-1, 4)
@@ -72,11 +75,17 @@ def load_demonstrations(cfg):
                     frames.append(build_object_observation(xyzw[valid, :3], rgb, segmentation,
                         cfg.env.workspace_bounds, cfg.env.observation, cfg.env.use_color))
                 else:
-                    frames.append(dict(pc=preprocess_points(xyzw[valid, :3], rgb,
+                    frame = {}
+                    if relational:
+                        frame['object_features'] = build_relational_features(
+                            xyzw[valid, :3], segmentation, objects, tcp_frames[i, :3],
+                            cfg.env.workspace_bounds, rgb=rgb, use_color=cfg.env.use_color)
+                    frame['pc'] = preprocess_points(xyzw[valid, :3], rgb,
                         cfg.env.workspace_bounds, cfg.env.num_points, cfg.env.use_color,
-                        sampling=sampling, segmentation=segmentation)))
+                        sampling=sampling, segmentation=segmentation)
+                    frames.append(frame)
             ep = dict(**{k: np.stack([frame[k] for frame in frames]) for k in frames[0]},
-                state=np.concatenate([obs['agent']['qpos'][:stop+1], tcp[:stop+1]], axis=-1).astype(np.float32),
+                state=np.concatenate([obs['agent']['qpos'][:stop+1], tcp_frames], axis=-1).astype(np.float32),
                 action=actions[:stop], success=labels['success'][:stop].astype(bool),
                 terminated=labels['terminated'][:stop].astype(bool), truncated=np.zeros(stop, dtype=bool))
             ep['reward'] = ep['success'].astype(np.float32)

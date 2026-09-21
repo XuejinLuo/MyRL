@@ -20,6 +20,7 @@ class PointCloudObservationWrapper(gym.ObservationWrapper):
         workspace_bounds: Optional[np.ndarray] = None, 
         use_color: bool = False,
         sampling=None,
+        relational_features=False,
     ):
         """
         :param env: 原始 Gymnasium 环境
@@ -32,6 +33,7 @@ class PointCloudObservationWrapper(gym.ObservationWrapper):
         self.workspace_bounds = workspace_bounds
         self.use_color = use_color
         self.sampling = sampling
+        self.relational_features = relational_features
 
         # 校验原始环境是否包含我们需要的键
         assert isinstance(self.env.observation_space, spaces.Dict), "基础环境观测必须是 Dict 空间"
@@ -53,10 +55,24 @@ class PointCloudObservationWrapper(gym.ObservationWrapper):
             )
         })
 
+        if relational_features:
+            from data.observations import validate_observation_config
+            validate_observation_config(dict(num_points=num_points, sampling=sampling,
+                observation=dict(mode='global_object_budget', relational_features=True)))
+            self.observation_space.spaces['object_features'] = spaces.Box(
+                -np.inf, np.inf, shape=(23,), dtype=np.float32)
+
     def observation(self, obs):
         from data.pointcloud import preprocess_points
-        return {'point_cloud': preprocess_points(obs['xyz'], obs.get('rgb'),
-                    self.workspace_bounds, self.num_points, self.use_color,
-                    sampling=self.sampling, segmentation=obs.get('segmentation'),
-                    target_ids=obs.get('target_ids')),
-                'state': obs['state']}
+        result = {'state': obs['state']}
+        if self.relational_features:
+            from data.object_features import build_relational_features
+            result['object_features'] = build_relational_features(
+                obs['xyz'], obs.get('segmentation'), self.sampling['objects'],
+                obs['tcp_position'], self.workspace_bounds, target_ids=obs.get('target_ids'),
+                rgb=obs.get('rgb'), use_color=self.use_color)
+        result['point_cloud'] = preprocess_points(obs['xyz'], obs.get('rgb'),
+            self.workspace_bounds, self.num_points, self.use_color,
+            sampling=self.sampling, segmentation=obs.get('segmentation'),
+            target_ids=obs.get('target_ids'))
+        return result
