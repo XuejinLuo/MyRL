@@ -2,6 +2,10 @@
 
 点云 Flow Policy 的三个独立训练阶段：离线初始化 → 迭代离线 IDQL → 在线 PPO。
 
+已有 iterative 数据、希望固定 Actor 检查 Q 选动作是否有效：参见
+[Q 训练与单次采样 / 8 选 1 对照](docs/Q_SELECTION.md)。独立入口为
+`train_critic.py` 和 `evaluate_q_selection.py`。
+
 ## 日常运行
 
 在现有 ManiSkill / PyTorch 环境中，从仓库根目录运行。日常参数集中在 `configs/config.yaml`：

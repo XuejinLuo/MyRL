@@ -32,6 +32,18 @@ class RoundIDQL(EmbodiedIDQL):
             self.discount = previous
 
 
+def build_q(cfg):
+    return PrefixQ(CriticFeatureExtractor(cfg), TwinQNetwork(
+        state_dim=cfg.model.cond_dim, action_dim=cfg.model.action_dim,
+        chunk_size=cfg.env.exec_steps), cfg.env.exec_steps)
+
+
+def build_agent(cfg, base, device):
+    v = IDQL_VNet_Wrapper(CriticFeatureExtractor(cfg), VNetwork(cfg.model.cond_dim))
+    return RoundIDQL(Policy_IDQL_Wrapper(base), build_q(cfg), v, device=device,
+        **{k: cfg.algo[k] for k in ('tau', 'discount', 'beta', 'tau_target', 'actor_lr', 'critic_lr', 'use_bc_only')})
+
+
 def build_loader(dataset, cfg, device):
     # Never fork a parent that may already own CUDA/SAPIEN/Vulkan state.
     # Trajectories are resident in RAM: spawn copies them to each worker.
@@ -61,11 +73,7 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
         for parameter in base.encoder.parameters():
             parameter.grad = None
 
-    v = IDQL_VNet_Wrapper(CriticFeatureExtractor(cfg), VNetwork(cfg.model.cond_dim))
-    q = PrefixQ(CriticFeatureExtractor(cfg), TwinQNetwork(state_dim=cfg.model.cond_dim,
-                action_dim=cfg.model.action_dim, chunk_size=cfg.env.exec_steps), cfg.env.exec_steps)
-    agent = RoundIDQL(Policy_IDQL_Wrapper(base), q, v, device=device,
-        **{k: cfg.algo[k] for k in ('tau', 'discount', 'beta', 'tau_target', 'actor_lr', 'critic_lr', 'use_bc_only')})
+    agent = build_agent(cfg, base, device)
     ema = copy.deepcopy(base).eval().requires_grad_(False)
     best_score = selection_score(baseline) if baseline else None
     selected = None
