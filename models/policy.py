@@ -117,7 +117,7 @@ class EmbodiedGenPolicy(nn.Module):
     # [核心接口 2] BC / IDQL 训练
     # 与 algos/idql.py 完全对齐 (actor_loss = self.actor.compute_loss(filtered_states, filtered_actions))
     # ========================================================================
-    def compute_loss(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def compute_loss(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None, reduction: str = 'mean') -> torch.Tensor:
         """
         计算生成模型的训练 Loss (Vector Field MSE 或 Denoising MSE)
         支持 IDQL 传入过滤后的高质量样本直接求导。
@@ -127,7 +127,7 @@ class EmbodiedGenPolicy(nn.Module):
         if self.algo_type == "flow":
             # Flow Matching 直接利用你写好的 OTFlowMatching.compute_loss
             # 注意：我们将 self.backbone 传入，巧妙解耦
-            return self.scheduler.compute_loss(self.backbone, actions, cond)
+            return self.scheduler.compute_loss(self.backbone, actions, cond, reduction=reduction)
             
         elif self.algo_type == "diffusion":
             # DDPM/DDIM 标准加噪与 MSE 训练逻辑
@@ -144,6 +144,10 @@ class EmbodiedGenPolicy(nn.Module):
             pred = self.backbone(noisy_actions, timesteps, cond)
             
             # 假定 prediction_type == "epsilon" (预测噪声)
+            if reduction == 'none':
+                return (pred - noise).square().flatten(1).mean(1)
+            if reduction != 'mean':
+                raise ValueError('reduction must be mean or none')
             return F.mse_loss(pred, noise)
 
     # ========================================================================

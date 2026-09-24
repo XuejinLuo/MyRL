@@ -19,7 +19,7 @@ def log_metrics(directory, epoch, metrics, **context):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     row = dict(schema='myrl_metrics_v2', stage=context.pop('stage', 'unknown'),
-               round=context.pop('round', None), epoch=int(epoch),
+               round=context.pop('round', None), epoch=None if epoch is None else int(epoch),
                sampler=context.pop('sampler', None),
                checkpoint=context.pop('checkpoint', None),
                evaluation=context.pop('evaluation', None), **context, **metrics)
@@ -38,19 +38,21 @@ def selection_score(metrics):
     return metrics['Eval/Success_Rate'], metrics['Eval/Mean_Reward']
 
 
-def write_selection(directory, epoch, metrics, checkpoint, **context):
+def write_selection(directory, epoch, metrics, checkpoint, criterion=None, **context):
     write_json(Path(directory)/'selection.json', dict(schema='myrl_selection_v2',
         epoch=epoch, metrics=metrics, checkpoint=str(Path(checkpoint).resolve()),
-        weight_key='model_state_dict', criterion=['Eval/Success_Rate', 'Eval/Mean_Reward'],
+        weight_key='model_state_dict', criterion=criterion or ['Eval/Success_Rate', 'Eval/Mean_Reward'],
         **context))
 
 
 def evaluation_paths(cfg, directory, epoch, tag='validation', sampler=None):
     mode = sampler or cfg.eval.sampler
-    destination = Path(directory) / 'eval' / f'{tag}_ep{epoch:04d}_{mode}'
+    fixed = cfg.get('stage') == 'iterative' and cfg.get('updates_per_round') is not None
+    coordinate = f'step{epoch:07d}' if fixed else f'ep{epoch:04d}'
+    destination = Path(directory) / 'eval' / f'{tag}_{coordinate}_{mode}'
     video = cfg.get('video', {})
     every = int(video.get('every', 0))
-    record = every > 0 and (epoch % every == 0 or epoch == cfg.epochs)
+    record = every > 0 and (fixed or epoch % every == 0 or epoch == cfg.epochs)
     return destination, dict(directory=str(destination / 'videos'),
                             episodes=int(video.get('episodes', 5))) if record else None
 
@@ -64,6 +66,7 @@ def evaluate_base(cfg, base, normalizer, directory, epoch, tag='validation', see
     grads = [(p, p.requires_grad) for p in base.parameters()]
     device = next(base.parameters()).device
     destination, video = evaluation_paths(cfg, directory, epoch, tag)
+    fixed = cfg.get('stage') == 'iterative' and cfg.get('updates_per_round') is not None
     try:
         actor = FlowPPOPolicy(base, num_steps=cfg.model.num_inference_steps,
                               noise_level=cfg.get('noise_level', .7),
@@ -75,8 +78,10 @@ def evaluate_base(cfg, base, normalizer, directory, epoch, tag='validation', see
             cfg.model.num_inference_steps, output_dir=destination,
             metadata=dict(stage=cfg.get('stage', 'evaluation'),
                           round=Path(directory).name if Path(directory).name.startswith('round_') else None,
-                          split=tag, epoch=epoch, sampler=cfg.eval.sampler,
-                          checkpoint=str(checkpoint or Path(directory)/'checkpoints'/f'epoch_{epoch:04d}.pth'),
+                          split=tag, epoch=None if fixed else epoch,
+                          **(dict(update_step=epoch, budget_unit='updates') if fixed else {}),
+                          sampler=cfg.eval.sampler,
+                          checkpoint=str(checkpoint or Path(directory)/'checkpoints'/(f'step_{epoch:07d}.pth' if fixed else f'epoch_{epoch:04d}.pth')),
                           env=OmegaConf.to_container(cfg.env, resolve=True)))
     finally:
         for p, enabled in grads:

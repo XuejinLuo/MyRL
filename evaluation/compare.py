@@ -73,7 +73,7 @@ def run(settings):
         normalizer.stats = cp['normalizer']
         for sampler in options.samplers:
             cfg.eval.sampler = sampler
-            result = evaluate_base(cfg, base, normalizer, out/label, cp.get('epoch', 0),
+            result = evaluate_base(cfg, base, normalizer, out/label, cp.get('update_step', cp.get('epoch', 0)),
                                    tag='test', seeds=seeds, checkpoint=path)
             rows.append(dict(stage=label, sampler=sampler, checkpoint=str(path),
                              checkpoint_sha256=digest(path), **result))

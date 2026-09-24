@@ -54,7 +54,13 @@ def build_loader(dataset, cfg, device):
     return DataLoader(dataset, **options)
 
 
-def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, baseline=None, log_callback=None):
+def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, baseline=None, log_callback=None,
+                source_spec=None, sampling_seed=None):
+    if cfg.get('updates_per_round') is not None:
+        from workflows.iterative_updates import train_updates
+        return train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
+                             baseline, log_callback, source_spec,
+                             cfg.seed if sampling_seed is None else sampling_seed)
     device = torch.device(cfg.device)
     dataset = TrajectoryDataset(episodes, cfg, normalizer)
     if len(dataset) < cfg.batch_size:

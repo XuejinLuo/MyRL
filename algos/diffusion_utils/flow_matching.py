@@ -20,7 +20,7 @@ class OTFlowMatching:
     def compute_loss(self, 
                      model: nn.Module, 
                      x1: torch.Tensor, 
-                     cond: torch.Tensor) -> torch.Tensor:
+                     cond: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
         """
         计算 Flow Matching 的目标函数 (Vector Field MSE Loss)
         
@@ -55,8 +55,12 @@ class OTFlowMatching:
         vt = model(xt, t, cond)
 
         # 6. 计算 MSE Loss (匹配向量场)
-        loss = torch.mean((vt - ut) ** 2)
-        return loss
+        squared_error = (vt - ut) ** 2
+        if reduction == 'none':
+            return squared_error.flatten(1).mean(1)
+        if reduction != 'mean':
+            raise ValueError('reduction must be mean or none')
+        return torch.mean(squared_error)
 
     def sample(self, 
                model: nn.Module, 

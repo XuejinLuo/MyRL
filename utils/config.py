@@ -13,18 +13,19 @@ def validate_common(cfg):
         raise ValueError('The three-stage CPS/PPO workflow requires model.algo_type=flow')
     if not 1 <= cfg.env.exec_steps <= cfg.model.chunk_size:
         raise ValueError('Require 1 <= env.exec_steps <= model.chunk_size')
-    for key in ('epochs', 'batch_size', 'save_epoch'):
+    fixed = cfg.stage == 'iterative' and cfg.get('updates_per_round') is not None
+    for key in (('batch_size',) if fixed else ('epochs', 'batch_size', 'save_epoch')):
         if cfg[key] < 1:
             raise ValueError(f'{key} must be positive')
     if cfg.batch_size < 2 or cfg.num_workers < 0:
         raise ValueError('Require batch_size >= 2 and num_workers >= 0')
-    if cfg.eval.every < 1 or cfg.eval.sampler not in ('cps', 'ode'):
+    if (not fixed and cfg.eval.every < 1) or cfg.eval.sampler not in ('cps', 'ode'):
         raise ValueError('Invalid evaluation settings')
     if not cfg.eval.seeds or len(set(cfg.eval.seeds)) != len(cfg.eval.seeds):
         raise ValueError('Evaluation seeds must be nonempty and unique')
     if cfg.video.every < 0 or cfg.video.episodes < 0:
         raise ValueError('Video counts cannot be negative')
-    if cfg.video.every and cfg.video.every % cfg.eval.every:
+    if not fixed and cfg.video.every and cfg.video.every % cfg.eval.every:
         raise ValueError('video.every must be a multiple of eval.every (or zero)')
     if cfg.model.in_channels != (6 if cfg.env.use_color else 3):
         raise ValueError('model.in_channels must match env.use_color')
@@ -42,5 +43,5 @@ def validate_common(cfg):
     if cfg.stage in ('offline', 'iterative'):
         if not 0 < cfg.algo.discount <= 1 or not 0 < cfg.algo.tau < 1:
             raise ValueError('Invalid IDQL discount or expectile')
-        if not 0 <= cfg.ema_decay < 1 or not 0 <= cfg.critic_warmup_epochs < cfg.epochs:
+        if not 0 <= cfg.ema_decay < 1 or (not fixed and not 0 <= cfg.critic_warmup_epochs < cfg.epochs):
             raise ValueError('Invalid EMA decay or critic warmup')

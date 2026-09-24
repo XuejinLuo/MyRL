@@ -38,12 +38,13 @@ class Policy_IDQL_Wrapper(nn.Module):
     def __init__(self, policy):
         super().__init__()
         self.policy = policy
-    def compute_loss(self, obs_dict, actions):
+    def compute_loss(self, obs_dict, actions, reduction='mean'):
         # 解包字典，传入 policy
         return self.policy.compute_loss(
             obs=obs_dict['pc'] if 'pc' in obs_dict and 'object_features' not in obs_dict else obs_dict,
             actions=actions,
-            state=obs_dict['state']
+            state=obs_dict['state'],
+            **({'reduction': reduction} if reduction != 'mean' else {})
         )
     def parameters(self):
         return self.policy.parameters()
@@ -93,7 +94,7 @@ class EmbodiedIDQL(IDQL):
             "adv_for_actor": adv.detach()
         }
 
-    def update_actor(self, obs_dict, actions, adv=None):
+    def update_actor(self, obs_dict, actions, adv=None, return_details=False):
         """ 改造：在对样本进行 Reject Sampling 过滤时，正确切割字典 """
         with torch.no_grad():
             if adv is None:
@@ -124,15 +125,25 @@ class EmbodiedIDQL(IDQL):
         filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
         filtered_actions = actions[keep_mask]
         
-        actor_loss = self.actor.compute_loss(filtered_obs, filtered_actions)
+        if return_details:
+            sample_losses = self.actor.compute_loss(filtered_obs, filtered_actions, reduction='none')
+            if sample_losses.shape != (int(keep_mask.sum()),):
+                raise ValueError('Expected one Actor loss per retained sample')
+            actor_loss = sample_losses.mean()
+        else:
+            actor_loss = self.actor.compute_loss(filtered_obs, filtered_actions)
         
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
         
-        return {
+        metrics = {
             "loss/actor": actor_loss.item(), 
             "metrics/accept_ratio": keep_mask.float().mean().item(),
             "metrics/adv_mean": adv.mean().item()
         }
+        if return_details:
+            return metrics, dict(keep_mask=keep_mask.detach(), advantages=adv.detach().reshape(-1),
+                                 losses=sample_losses.detach())
+        return metrics
 

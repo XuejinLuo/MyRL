@@ -158,6 +158,19 @@ def test_three_stages_handoff_metrics_checkpoints_and_round_resume(tmp_path, mon
     cfg.stages.iterative.resume = True
     iterative.run(cfg)
     assert (Path(cfg.output)/'metrics.jsonl').read_bytes() == before
+    # Pre-update-budget runs remain resumable after upgrading the repository.
+    saved_path = Path(cfg.output)/'config.yaml'
+    legacy = OmegaConf.load(saved_path)
+    for key in ('collect', 'updates_per_round', 'critic_warmup_updates', 'eval_every_updates',
+                'save_every_updates', 'log_every_updates', 'actor_sampling'):
+        del legacy[key]
+    OmegaConf.save(legacy, saved_path)
+    iterative.run(cfg)
+    assert (Path(cfg.output)/'metrics.jsonl').read_bytes() == before
+    cfg.collect = False
+    with pytest.raises(ValueError, match='Resume configuration changed'):
+        iterative.run(cfg)
+    cfg.collect = True
     rows = compare.run(configs['online'])
     assert len(rows) == 6 and {r['sampler'] for r in rows} == {'cps', 'ode'}
 
