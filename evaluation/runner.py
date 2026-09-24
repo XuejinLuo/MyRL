@@ -56,6 +56,8 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
             for seed in seeds:
                 pbar.set_postfix(seed=int(seed), refresh=False)
                 seed_all(int(seed))
+                if hasattr(actor, 'reset_episode_diagnostics'):
+                    actor.reset_episode_diagnostics()
                 obs, _ = env.reset(seed=int(seed))
                 done, truncated, success, reward_sum = False, False, False, 0.
                 primitive_steps = 0
@@ -66,6 +68,8 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
                     if not np.isfinite(actions).all():
                         raise FloatingPointError('Nonfinite evaluation action')
                     obs, reward, done, truncated, info = env.step(normalizer.unnormalize(actions, 'action'))
+                    if hasattr(actor, 'record_execution'):
+                        actor.record_execution(info)
                     success = success or bool(info.get('success_any', info.get('success', False)))
                     reward_sum += float(reward)
                     primitive_steps += int(info.get("actual_steps", 1))
@@ -74,6 +78,8 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
                 rows.append(dict(seed=int(seed), success=int(success),
                     success_final=int(bool(info.get("success", False))),
                     episode_return=reward_sum, primitive_steps=primitive_steps))
+                if hasattr(actor, 'action_diagnostics'):
+                    rows[-1].update(actor.action_diagnostics(episode=True))
                 pbar.set_postfix(
                     seed=int(seed),
                     success_rate=f"{np.mean(successes):.1%}",
@@ -98,6 +104,8 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
     center = (p + z*z/(2*n))/(1+z*z/n)
     half = z*np.sqrt(p*(1-p)/n + z*z/(4*n*n))/(1+z*z/n)
     result['Eval/CI95_Low'], result['Eval/CI95_High'] = float(center-half), float(center+half)
+    if hasattr(actor, 'action_diagnostics'):
+        result.update(actor.action_diagnostics())
     if output_dir is not None:
         import csv
         from pathlib import Path

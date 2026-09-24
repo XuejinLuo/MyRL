@@ -107,18 +107,20 @@ def test_invalid_candidate_count(bad):
         QSelectionPolicy(CandidateActor(), nn.Identity(), norm(), bad)
 
 
-def test_nonfinite_q_is_rejected():
+@pytest.mark.parametrize('mode', ['legacy', 'consistent'])
+def test_nonfinite_q_is_rejected(mode):
     class BadQ(RecordingTwinQ):
         def forward(self, features, actions):
             q1, q2 = super().forward(features, actions)
             return q1 * float('nan'), q2
-    policy = QSelectionPolicy(CandidateActor(), PrefixQ(ScoringEncoder(), BadQ(), 1), norm(), 2)
+    policy = QSelectionPolicy(CandidateActor(), PrefixQ(ScoringEncoder(), BadQ(), 1), norm(), 2, action_mode=mode)
     policy.set_action_bounds(np.full((3, 1), -1.), np.full((3, 1), 1.))
     with pytest.raises(FloatingPointError, match='Q score'):
         policy.sample({'pc': torch.zeros(2, 4, 3), 'state': torch.zeros(2, 1)})
 
 
-def test_critic_training_checkpoint_reload_and_matched_comparison(tmp_path, monkeypatch):
+@pytest.mark.parametrize('ablation', [False, True])
+def test_critic_training_checkpoint_reload_and_matched_comparison(tmp_path, monkeypatch, ablation):
     from workflows import critic, offline_round
     from evaluation import q_selection
     cfg = config('offline', tmp_path)
@@ -180,20 +182,57 @@ def test_critic_training_checkpoint_reload_and_matched_comparison(tmp_path, monk
     with pytest.raises(FileExistsError):
         critic.run(cfg)
     settings = OmegaConf.create(dict(device='cpu', q_selection=dict(checkpoint=str(path),
-        output=str(tmp_path/'comparison'), candidates=[1, 8], sampler='cps', seed_start=4000, episodes=2)))
+        output=str(tmp_path/'comparison'), ablation=ablation, split='diagnostic',
+        candidates=[1, 8], sampler='cps', seed_start=4000, episodes=2)))
     def factory(cfg):
         return ChunkActionWrapper(ToyEnv(), cfg.model.chunk_size, cfg.env.exec_steps)
     monkeypatch.setitem(sys.modules, 'envs.factory', SimpleNamespace(make_env=factory))
+    policies = []
+    class CheckedPolicy(QSelectionPolicy):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            policies.append((self, copy.deepcopy(self.actor.state_dict()),
+                             copy.deepcopy(self.q.state_dict()), copy.deepcopy(self.normalizer.stats)))
+    monkeypatch.setattr(q_selection, 'QSelectionPolicy', CheckedPolicy)
+    checkpoint_digest = digest(path)
     results = q_selection.run(settings)
-    assert [r['candidates'] for r in results] == [1, 8]
+    assert digest(path) == checkpoint_digest
+    for policy, actor_before, q_before, stats_before in policies:
+        assert all(torch.equal(v, policy.actor.state_dict()[k]) for k, v in actor_before.items())
+        assert all(torch.equal(v, policy.q.state_dict()[k]) for k, v in q_before.items())
+        assert stats_before == policy.normalizer.stats
+    assert [r['candidates'] for r in results] == ([1, 1, 8] if ablation else [1, 8])
+    labels = ['legacy_single', 'consistent_single', 'consistent_q8'] if ablation else ['candidates_1', 'candidates_8']
+    assert [r['label'] for r in results] == labels
     summary = json.loads((tmp_path/'comparison/summary.json').read_text())
     assert summary['seeds'] == [4000, 4001]
-    assert len(summary['paired']) == 1
+    assert len(summary['paired']) == (2 if ablation else 1)
+    assert summary['paired'][-1]['baseline_label'] == ('consistent_single' if ablation else 'candidates_1')
+    assert summary['paired'][-1]['selected_label'] == labels[-1]
+    assert summary['protocol']['split'] == 'diagnostic'
+    assert summary['protocol']['checkpoint_sha256'] == checkpoint_digest
+    assert summary['protocol']['sampler_parameters']['noise_level'] == .4
+    assert len((tmp_path/'comparison/summary.csv').read_text().splitlines()) == len(labels) + 1
     assert summary['protocol']['actor_sha256'] == source_digest
-    for k in (1, 8):
-        report = json.loads((tmp_path/f'comparison/candidates_{k}/summary.json').read_text())
+    for row in results:
+        directory = tmp_path/'comparison'/row['label']
+        report = json.loads((directory/'summary.json').read_text())
         assert report['seeds'] == summary['seeds']
-        assert report['metadata']['candidates'] == k
+        assert report['metadata']['candidates'] == row['candidates']
+        assert report['metadata']['action_mode'] == row['action_mode']
+        assert report['metadata']['sampler_parameters'] == cp['sampler']
+        assert report['metadata']['env'] == cp['config']['env']
+        assert report['metadata']['model'] == cp['config']['model']
+        assert report['metadata']['normalizer'] == cp['normalizer']
+        assert row['Action/selected/coordinates'] == 6  # two 3-step episodes
+        assert row['Action/candidates/coordinates'] == 6 * row['candidates']
+        import csv
+        episode_rows = list(csv.DictReader((directory/'episodes.csv').open()))
+        assert all(int(r['Action/selected/coordinates']) == 3 for r in episode_rows)
+        if row['action_mode'] == 'consistent':
+            assert row['Action/selected/execution_to_score_max_abs'] < 2e-6
+    with pytest.raises(FileExistsError):
+        q_selection.run(settings)
     settings.q_selection.output = str(tmp_path/'invalid')
     for seed in (2000, 10000, 11000):
         settings.q_selection.seed_start = seed
@@ -206,6 +245,10 @@ def test_new_entrypoint_configs_compose():
     with initialize_config_dir(version_base=None, config_dir=str(Path(__file__).resolve().parents[1]/'configs')):
         for name in ('train_critic', 'evaluate_q_selection'):
             cfg = compose(config_name=name, overrides=['+experiment=oc_budget'])
+            if name == 'evaluate_q_selection':
+                assert cfg.q_selection.ablation
+                assert cfg.q_selection.split == 'diagnostic'
+                assert cfg.q_selection.output.endswith('q_selection_clipping_ablation')
             assert cfg.env.env_id == 'StackCube-v1'
             assert cfg.env.observation.mode == 'global_object_budget'
             OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
