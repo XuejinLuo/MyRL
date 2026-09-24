@@ -51,6 +51,16 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
     # FlowPPOPolicy evaluation adapter freezes the encoder at construction.
     # Re-enable it explicitly for offline updates.
     base.requires_grad_(True)
+    freeze_actor_encoder = (
+        cfg.get("stage") == "iterative"
+        and bool(cfg.get("freeze_actor_encoder", False))
+    )
+    if freeze_actor_encoder:
+        base.encoder.requires_grad_(False)
+        base.encoder.eval()
+        for parameter in base.encoder.parameters():
+            parameter.grad = None
+
     v = IDQL_VNet_Wrapper(CriticFeatureExtractor(cfg), VNetwork(cfg.model.cond_dim))
     q = PrefixQ(CriticFeatureExtractor(cfg), TwinQNetwork(state_dim=cfg.model.cond_dim,
                 action_dim=cfg.model.action_dim, chunk_size=cfg.env.exec_steps), cfg.env.exec_steps)
@@ -62,6 +72,8 @@ def train_round(cfg, base, normalizer, episodes, directory, evaluate, save, base
     directory = Path(directory)
     for epoch in range(1, cfg.epochs + 1):
         base.train()
+        if freeze_actor_encoder:
+            base.encoder.eval()
         agent.q_net.train()
         agent.v_net.train()
         agent.q_target.eval()

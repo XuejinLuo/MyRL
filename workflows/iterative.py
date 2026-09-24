@@ -152,6 +152,22 @@ def run_iterations(cfg, wandb_run=None):
             for ep_index in range(cfg.episodes_per_round):
                 seed = cfg.collect_seed_start + round_index*cfg.episodes_per_round + ep_index
                 path = rd/f'episode_{ep_index:06d}.npz'
+                # 一轮对照实验：复用已有 rollout，保留独立输出。
+                reuse_dir = cfg.get("reuse_collection_dir")
+                if reuse_dir:
+                    if cfg.rounds != 1:
+                        raise ValueError("reuse_collection_dir requires rounds=1")
+
+                    source_episode = (
+                        Path(hydra.utils.to_absolute_path(reuse_dir)) / path.name
+                    )
+                    if not source_episode.is_file():
+                        raise FileNotFoundError(source_episode)
+
+                    if not path.exists():
+                        shutil.copyfile(source_episode, path)
+                    elif digest(path) != digest(source_episode):
+                        raise ValueError(f"Reused episode differs: {path}")
                 if path.exists():
                     ep = load_episode(path)
                 else:
