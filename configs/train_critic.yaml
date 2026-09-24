@@ -1,0 +1,13 @@
+defaults:
+  - config
+  - algo: idql
+  - _self_
+stage: critic
+run_name: ${experiment}_critic
+output: ${paths.root}/critic
+initial_ckpt: ${paths.root}/iterative/checkpoints/best.pth
+manifest: ${paths.root}/iterative_expand600/round_000/manifest.json
+weight_key: auto
+epochs: 10
+batch_size: 64
+save_epoch: 5

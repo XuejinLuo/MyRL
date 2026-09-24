@@ -14,13 +14,21 @@ def build_base(cfg, device):
     return EmbodiedGenPolicy(**options).to(device)
 
 
-def observation_encoder(cfg, actor, normalizer, device):
+def observation_tensorizer(cfg, normalizer, device):
+    """Raw normalized observations for models with independent encoders."""
     bounds = np.asarray(cfg.env.workspace_bounds)
     def encode(obs):
         obs = episode_observation(obs)
         validate_observation(obs, cfg)
         normalized = normalize_observation(obs, normalizer, bounds)
-        tensors = {k: torch.as_tensor(v, device=device)[None] for k, v in normalized.items()}
+        return {k: torch.as_tensor(v, device=device)[None] for k, v in normalized.items()}
+    return encode
+
+
+def observation_encoder(cfg, actor, normalizer, device):
+    tensorize = observation_tensorizer(cfg, normalizer, device)
+    def encode(obs):
+        tensors = tensorize(obs)
         if 'pc' in tensors and 'object_features' not in tensors:
             # Retain compatibility with the historical two-argument adapter.
             return actor.encode(tensors['pc'], tensors['state'])

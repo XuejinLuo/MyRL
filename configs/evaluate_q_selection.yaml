@@ -1,0 +1,10 @@
+defaults:
+  - config
+  - _self_
+q_selection:
+  checkpoint: ${paths.root}/critic/checkpoints/last.pth
+  output: ${paths.root}/q_selection
+  candidates: [1, 8]
+  sampler: cps
+  seed_start: 4000
+  episodes: 100
