@@ -29,7 +29,7 @@ def preserve_rng():
 
 
 def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
-                    output_dir=None, metadata=None):
+                    output_dir=None, metadata=None, action_callback=None):
     """Same env factory/horizon/FP32 sampler as training; no extra action noise.
 
     Evaluation errors propagate rather than being reported as zero success.
@@ -67,6 +67,9 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
                         actions = actor.sample(features, num_steps=num_steps)[0].cpu().numpy()
                     if not np.isfinite(actions).all():
                         raise FloatingPointError('Nonfinite evaluation action')
+                    if action_callback is not None:
+                        with preserve_rng():
+                            action_callback(actions.copy())
                     obs, reward, done, truncated, info = env.step(normalizer.unnormalize(actions, 'action'))
                     if hasattr(actor, 'record_execution'):
                         actor.record_execution(info)
