@@ -28,6 +28,8 @@ class TrajectoryDataset(Dataset):
         lo = np.asarray(normalizer.stats['action']['min'])
         hi = np.asarray(normalizer.stats['action']['max'])
 
+        self.original_episode_count = len(episodes)
+        self.original_episode_indices = []
         kept = []
         rejected = []
 
@@ -57,6 +59,7 @@ class TrajectoryDataset(Dataset):
                 rejected.append((index, float(excess.max())))
             else:
                 kept.append(ep)
+                self.original_episode_indices.append(index)
 
         # Explicit policy for out-of-range episodes with frozen normalization.
         if (

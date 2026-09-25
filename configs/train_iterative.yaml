@@ -21,3 +21,15 @@ collect_sampler: ${stages.iterative.collect_sampler}
 resume: ${stages.iterative.resume}
 manifest: ${dataset.manifest}
 weight_key: auto
+
+# Opt-in fixed-budget experiments. Null preserves historical epoch training.
+collect: true
+updates_per_round: null
+critic_warmup_updates: 10000
+eval_every_updates: 2000
+save_every_updates: 2000
+log_every_updates: 1000
+actor_sampling:
+  mode: mixed
+  demo_fraction: 0.5
+  demo_sources: [demonstrations]
