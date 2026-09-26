@@ -94,7 +94,7 @@ class EmbodiedIDQL(IDQL):
             "adv_for_actor": adv.detach()
         }
 
-    def update_actor(self, obs_dict, actions, adv=None, return_details=False):
+    def update_actor(self, obs_dict, actions, adv=None, return_details=False, force_keep=None):
         """ 改造：在对样本进行 Reject Sampling 过滤时，正确切割字典 """
         with torch.no_grad():
             if adv is None:
@@ -120,6 +120,10 @@ class EmbodiedIDQL(IDQL):
                 # 安全校验：防止全部被拒绝导致 Loss 为 NaN
                 if keep_mask.sum() == 0:
                     keep_mask[torch.argmax(accept_prob)] = True
+            if force_keep is not None:
+                if force_keep.shape != keep_mask.shape or force_keep.dtype != torch.bool:
+                    raise ValueError('force_keep must be a boolean per-sample mask')
+                keep_mask |= force_keep
 
         # 使用 mask 过滤字典中的张量
         filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
@@ -146,4 +150,3 @@ class EmbodiedIDQL(IDQL):
             return metrics, dict(keep_mask=keep_mask.detach(), advantages=adv.detach().reshape(-1),
                                  losses=sample_losses.detach())
         return metrics
-

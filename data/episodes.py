@@ -55,6 +55,10 @@ def validate_episode(ep):
     ends = ep['terminated'].astype(bool) | ep['truncated'].astype(bool)
     if ends[:-1].any() or not ends[-1]:
         raise ValueError('Episode must end exactly once at its final transition')
+    if 'actor_eligible' in ep:
+        mask = np.asarray(ep['actor_eligible'])
+        if mask.shape != (t,) or mask.dtype != np.bool_:
+            raise ValueError('actor_eligible must be a boolean mask over primitive starts')
 
 
 def save_episode(path, ep):
@@ -64,7 +68,10 @@ def save_episode(path, ep):
         raise FileExistsError(path)
     tmp = path.with_suffix('.tmp')
     with tmp.open('wb') as f:
-        np.savez_compressed(f, **{k: ep[k] for k in (*observation_fields(ep), *TRANSITION_FIELDS)})
+        keys = (*observation_fields(ep), *TRANSITION_FIELDS)
+        if 'actor_eligible' in ep:
+            keys += ('actor_eligible',)
+        np.savez_compressed(f, **{k: ep[k] for k in keys})
     tmp.replace(path)
 
 

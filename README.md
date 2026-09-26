@@ -6,6 +6,10 @@
 [Q 训练与单次采样 / 8 选 1 对照](docs/Q_SELECTION.md)。独立入口为
 `train_critic.py` 和 `evaluate_q_selection.py`。
 
+希望在空抓/推偏后人工接管、补充恢复数据：参见
+[鼠标/键盘接管、审核清洗与 iterative 训练](docs/HUMAN_CORRECTIONS.md)。
+入口是 `python -m tools.collection.human_takeover`；无需遥操作手柄，保留腕部相机输入。
+
 ## 日常运行
 
 在现有 ManiSkill / PyTorch 环境中，从仓库根目录运行。日常参数集中在 `configs/config.yaml`：
