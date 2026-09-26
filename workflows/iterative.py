@@ -112,9 +112,11 @@ def run_iterations(cfg, wandb_run=None):
     base = build_base(cfg, device)
     actor = FlowPPOPolicy(base, num_steps=cfg.model.num_inference_steps,
             noise_level=cfg.noise_level, min_std=cfg.min_std, eval_mode=cfg.eval.sampler)
+    correction_training_seeds = set()
 
     def load(path):
         cp = torch.load(path, map_location=device, weights_only=True)
+        correction_training_seeds.update(cp.get('correction_training_seeds', []))
         if 'normalizer' in cp and cp['normalizer'] != normalizer.stats:
             raise ValueError('Checkpoint and frozen normalizer disagree')
         if 'config' in cp:
@@ -135,11 +137,17 @@ def run_iterations(cfg, wandb_run=None):
         torch.save(dict(model_state_dict=base.state_dict(), normalizer=normalizer.stats,
                         config=frozen, epoch=None if fixed else epoch, metrics=metrics,
                         **(dict(update_step=epoch, budget_unit='updates') if fixed else {}),
+                        correction_training_seeds=sorted(correction_training_seeds),
                         dataset_manifest=state['manifest']), path)
 
     for round_index in range(state['next_round'], cfg.rounds):
         load(state['checkpoint'])
         episodes, spec = load_sources(state['manifest'])
+        correction_training_seeds.update(int(item['seed']) for src in spec['sources']
+                            if src.get('role') == 'human_correction' for item in src['episodes'])
+        from data.corrections import held_out_seeds
+        if correction_training_seeds & held_out_seeds(frozen):
+            raise ValueError('Human correction seeds overlap validation/test seeds')
         if fixed:
             recorded = {int(item['seed']) for src in spec['sources'] for item in src['episodes']
                         if item.get('seed') is not None}

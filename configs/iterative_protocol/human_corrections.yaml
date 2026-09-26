@@ -1,0 +1,30 @@
+# @package _global_
+# Reviewed successful human chunks receive unconditional BC supervision.
+# Other Actor sources retain the configured BC/IDQL rule; Critic sees all kept transitions.
+collect: false
+rounds: 1
+initial_ckpt: ${paths.root}/iterative/checkpoints/best.pth
+stats_path: ${paths.root}/iterative/checkpoints/dataset_stats.json
+manifest: ${paths.root}/human_replay_01/manifest.json
+output: ${paths.root}/iterative_human_corrections
+batch_size: 64
+updates_per_round: 20000
+critic_warmup_updates: 10000
+eval_every_updates: 2000
+save_every_updates: 2000
+log_every_updates: 1000
+actor_sampling:
+  mode: demo_success_correction
+  correction_fraction: 0.25
+  demo_fraction: 0.5
+  demo_sources: [demonstrations]
+algo:
+  actor_lr: 1e-5
+  critic_lr: 3e-4
+  use_bc_only: false
+eval:
+  sampler: cps
+  seeds: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034, 2035, 2036, 2037, 2038, 2039, 2040, 2041, 2042, 2043, 2044, 2045, 2046, 2047, 2048, 2049]
+video:
+  every: 0
+  episodes: 0

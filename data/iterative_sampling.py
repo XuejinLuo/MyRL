@@ -5,17 +5,17 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
-GROUPS = ('demo', 'rollout_success', 'rollout_failure')
+GROUPS = ('demo', 'rollout_success', 'rollout_failure', 'correction')
 
 
 def validate_update_config(cfg):
     total = cfg.get('updates_per_round')
     mode = cfg.get('actor_sampling', {}).get('mode', 'mixed')
-    if mode not in ('mixed', 'demo_success'):
-        raise ValueError('actor_sampling.mode must be mixed or demo_success')
+    if mode not in ('mixed', 'demo_success', 'demo_success_correction'):
+        raise ValueError('Unknown actor_sampling.mode')
     if total is None:
         if mode != 'mixed':
-            raise ValueError('demo_success requires updates_per_round')
+            raise ValueError('Source-balanced Actor sampling requires updates_per_round')
         return
     if cfg.stage != 'iterative':
         raise ValueError('Fixed update budgets are only supported for iterative')
@@ -35,6 +35,12 @@ def validate_update_config(cfg):
         raise ValueError('batch_size * demo_fraction must be an integer with both groups nonempty')
     if not sampling.demo_sources or any(not isinstance(x, str) or not x for x in sampling.demo_sources):
         raise ValueError('Explicit nonempty demo_sources names are required')
+    if mode == 'demo_success_correction':
+        correction = sampling.get('correction_fraction', .25)
+        if isinstance(correction, bool) or not isinstance(correction, (int, float)) or not 0 < correction < 1-fraction:
+            raise ValueError('Require positive demo, success and correction fractions')
+        if not math.isclose(cfg.batch_size*correction, round(cfg.batch_size*correction), abs_tol=1e-8) or round(cfg.batch_size*correction) < 1:
+            raise ValueError('batch_size * correction_fraction must be a positive integer')
 
 
 class SourceDataset(Dataset):
@@ -51,16 +57,32 @@ class SourceDataset(Dataset):
         if len(original_sources) != dataset.original_episode_count:
             raise ValueError('Manifest/episode alignment differs')
         self.source_ids = [original_sources[i] for i in dataset.original_episode_indices]
-        self.group_ids = [0 if names[source] in demo_sources else (1 if ep['success'].any() else 2)
+        self.group_ids = [3 if 'actor_eligible' in ep else
+                          0 if names[source] in demo_sources else (1 if ep['success'].any() else 2)
                           for source, ep in zip(self.source_ids, dataset.episodes)]
         self.offsets = np.cumsum([0] + [len(ep['action']) for ep in dataset.episodes])
+        self.correction_starts = {}
+        for i, ep in enumerate(dataset.episodes):
+            if 'actor_eligible' in ep:
+                if sources[self.source_ids[i]].get('role') != 'human_correction':
+                    raise ValueError('Correction episode requires human_correction source role')
+                if sources[self.source_ids[i]].get('chunk_size') != dataset.chunk_size:
+                    raise ValueError('Correction chunk_size changed; prepare data again')
+                starts = np.flatnonzero(ep['actor_eligible'])
+                if np.any(starts + dataset.chunk_size > len(ep['action'])):
+                    raise ValueError('Correction chunk crosses episode end')
+                if len(starts):
+                    self.correction_starts[i] = starts + self.offsets[i]
+            elif sources[self.source_ids[i]].get('role') == 'human_correction':
+                raise ValueError('Human correction episode is missing actor_eligible')
         self.report = dict(
             groups={name: dict(episodes=0, transitions=0) for name in GROUPS},
-            sources={f'source_{i:03d}': dict(name=name, role='demo' if name in demo_sources else 'rollout',
+            sources={f'source_{i:03d}': dict(name=name, role=sources[i].get('role', 'demo' if name in demo_sources else 'rollout'),
                       episodes=0, transitions=0, success_episodes=0) for i, name in enumerate(names)},
             input_episodes=dataset.original_episode_count,
             excluded_episode_indices=sorted(set(range(dataset.original_episode_count)) -
                                              set(dataset.original_episode_indices)))
+        self.report['correction_actor_starts'] = sum(map(len, self.correction_starts.values()))
         for ep, source, group in zip(dataset.episodes, self.source_ids, self.group_ids):
             for summary in (self.report['groups'][GROUPS[group]], self.report['sources'][f'source_{source:03d}']):
                 summary['episodes'] += 1
@@ -83,16 +105,23 @@ class FixedBatches(Sampler):
     Critic/mixed sampling is uniform over all transitions with replacement.
     Actor RNG is independent, so filtering Actor pools cannot change critic indices.
     """
-    def __init__(self, dataset, batch_size, updates, seed, mode='mixed', demo_fraction=.5):
+    def __init__(self, dataset, batch_size, updates, seed, mode='mixed', demo_fraction=.5, correction_fraction=.25):
         self.dataset, self.batch_size, self.updates = dataset, batch_size, updates
         self.seed, self.mode = seed, mode
-        if mode not in ('mixed', 'demo_success'):
+        if mode not in ('mixed', 'demo_success', 'demo_success_correction'):
             raise ValueError('Unknown sampling mode')
         self.quota = round(batch_size * demo_fraction)
         self.pools = [np.flatnonzero(np.asarray(dataset.group_ids) == i) for i in (0, 1)]
-        if mode == 'demo_success' and any(len(pool) == 0 for pool in self.pools):
+        if mode != 'mixed' and any(len(pool) == 0 for pool in self.pools):
             raise ValueError('demo_success requires kept demonstrations and successful rollout episodes; '
                              'no silent fallback to failures')
+        self.counts = [self.quota, batch_size-self.quota]
+        if mode == 'demo_success_correction':
+            correction_quota = round(batch_size*correction_fraction)
+            self.counts = [self.quota, batch_size-self.quota-correction_quota, correction_quota]
+            self.pools.append(np.asarray(list(dataset.correction_starts), dtype=int))
+            if not len(self.pools[-1]) or min(self.counts) < 1:
+                raise ValueError('Need approved full-length correction chunks and nonempty quotas')
 
     def __len__(self):
         return self.updates
@@ -104,10 +133,11 @@ class FixedBatches(Sampler):
                 yield rng.integers(len(self.dataset), size=self.batch_size).tolist()
                 continue
             batch = []
-            for pool, count in zip(self.pools, (self.quota, self.batch_size-self.quota)):
+            for group, (pool, count) in enumerate(zip(self.pools, self.counts)):
                 episodes = rng.choice(pool, size=count, replace=True)
                 for episode in episodes:
-                    batch.append(int(rng.integers(self.dataset.offsets[episode], self.dataset.offsets[episode+1])))
+                    batch.append(int(rng.choice(self.dataset.correction_starts[episode])) if group == 2 else
+                                 int(rng.integers(self.dataset.offsets[episode], self.dataset.offsets[episode+1])))
             rng.shuffle(batch)
             yield batch
 

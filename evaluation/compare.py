@@ -54,6 +54,8 @@ def run(settings):
         protocol = current
         if set(seeds) & set(cfg.eval.seeds):
             raise ValueError('Test seeds overlap checkpoint-selection seeds')
+        if set(seeds) & set(cp.get('correction_training_seeds', [])):
+            raise ValueError('Test seeds overlap human correction training seeds')
         collection_cfg = cfg.get('stages', {}).get('iterative', cfg)
         if 'collect_seed_start' in collection_cfg:
             collection = range(collection_cfg.collect_seed_start,

@@ -35,6 +35,11 @@ class TrajectoryDataset(Dataset):
 
         for index, ep in enumerate(episodes):
             validate_episode(ep)
+            if 'actor_eligible' in ep and (
+                cfg.get('stage') != 'iterative' or cfg.get('updates_per_round') is None
+                or cfg.get('actor_sampling', {}).get('mode') != 'demo_success_correction'
+            ):
+                raise ValueError('Correction data requires fixed-budget demo_success_correction sampling')
             validate_observation({k: ep[k][0] for k in observation_fields(ep)}, cfg)
             if 'object_points' in ep:
                 from data.object_centric import validate_object_arrays

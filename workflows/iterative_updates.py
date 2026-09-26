@@ -15,7 +15,8 @@ from utils.experiment import log_metrics, write_json, write_selection, evaluatio
 
 
 def loader(dataset, cfg, updates, seed, mode):
-    sampler = FixedBatches(dataset, cfg.batch_size, updates, seed, mode, cfg.actor_sampling.demo_fraction)
+    sampler = FixedBatches(dataset, cfg.batch_size, updates, seed, mode, cfg.actor_sampling.demo_fraction,
+                           cfg.actor_sampling.get('correction_fraction', .25))
     kwargs = dict(batch_sampler=sampler, num_workers=cfg.num_workers,
                   pin_memory=torch.device(cfg.device).type == 'cuda',
                   generator=torch.Generator().manual_seed(seed))
@@ -52,14 +53,15 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
     critic_loader = loader(dataset, cfg, total, sampling_seed + 1001, 'mixed')
     mode = cfg.actor_sampling.mode
     actor_loader = (loader(dataset, cfg, total-warmup, sampling_seed + 2001, mode)
-                    if mode == 'demo_success' else None)
+                    if mode != 'mixed' else None)
     write_json(directory/'sampling.json', dict(**dataset.report, budget_unit='updates',
         critic_updates=total, actor_updates=total-warmup, critic_warmup_updates=warmup,
         batch_size=cfg.batch_size, actor_mode=mode, demo_fraction=cfg.actor_sampling.demo_fraction,
+        correction_fraction=cfg.actor_sampling.get('correction_fraction', .25) if mode == 'demo_success_correction' else 0.,
         demo_sources=list(cfg.actor_sampling.demo_sources),
         critic_sampling='all kept transitions, uniform with replacement',
         actor_sampling=('same batch as critic' if mode == 'mixed' else
-                        'fixed demo/success-rollout quota; uniform episode then uniform time'),
+                        'fixed group quotas; uniform episode then eligible start; correction chunks never cross takeover boundaries'),
         success_definition='any primitive step reports success',
         critic_seed=sampling_seed+1001, actor_seed=sampling_seed+2001,
         selection_criterion=['Eval/Success_Rate'],
@@ -99,7 +101,8 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
                            if actor_iterator is not None else batch)
             obs, actions = batch_observation(actor_batch), actor_batch['action_chunk']
             adv = actor_advantage(agent, obs, actions)
-            actor_metrics, details = agent.update_actor(obs, actions, adv=adv, return_details=True)
+            actor_metrics, details = agent.update_actor(obs, actions, adv=adv, return_details=True,
+                force_keep=(actor_batch['sampling_group'] == 3) if mode == 'demo_success_correction' else None)
             metrics.update(actor_metrics)
             for stats in (interval, cumulative):
                 stats.add('Actor', actor_batch, details)
