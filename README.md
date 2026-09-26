@@ -9,6 +9,8 @@
 希望在空抓/推偏后人工接管、补充恢复数据：参见
 [鼠标/键盘接管、审核清洗与 iterative 训练](docs/HUMAN_CORRECTIONS.md)。
 入口是 `python -m tools.collection.human_takeover`；无需遥操作手柄，保留腕部相机输入。
+默认使用[官方 SAPIEN 拖拽界面](docs/SAPIEN_DRAG_TAKEOVER.md)：H 接管，拖动目标，N 执行，G 开合夹爪。
+原 XYZ 按钮界面可用 `--ui buttons`。
 
 ## 日常运行
 

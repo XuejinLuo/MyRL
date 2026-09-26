@@ -1,4 +1,4 @@
-"""Collect StackCube corrective demonstrations with keyboard/buttons, no hand controller."""
+"""Collect StackCube corrections with SAPIEN drag targets or keyboard/buttons."""
 import argparse
 import json
 from importlib.metadata import version, PackageNotFoundError
@@ -46,19 +46,23 @@ def parse_args():
     p.add_argument('--auto-pause', action='store_true', help='Pause once per sustained hint type per episode')
     p.add_argument('--policy-delay-ms', type=int, default=100, help='Wall-clock delay between primitive steps')
     p.add_argument('--no-video', action='store_true')
+    p.add_argument('--ui', choices=['sapien', 'buttons'], default='sapien')
     return p.parse_args()
 
 
 class CollectorUI:
-    def __init__(self, root, args, cfg, actor, encode, normalizer, output):
-        import tkinter as tk
-        from tkinter import ttk
-        self.tk, self.ttk, self.root = tk, ttk, root
+    def init_session(self, args, cfg, actor, encode, normalizer, output):
         self.args, self.cfg, self.actor, self.encode = args, cfg, actor, encode
         self.normalizer, self.output = normalizer, output
         self.index, self.active, self.running = -1, False, False
         self.env, self.writer, self.events_handle = None, None, None
         self.notice, self.review = '', dict(schema='myrl_human_review_v1', episodes=[])
+
+    def __init__(self, root, args, cfg, actor, encode, normalizer, output):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk, self.ttk, self.root = tk, ttk, root
+        self.init_session(args, cfg, actor, encode, normalizer, output)
         root.title('MyRL — Human corrective collection')
         self.image_label = ttk.Label(root)
         self.image_label.pack()
@@ -250,8 +254,8 @@ class CollectorUI:
         if self.control.done:
             self.finish()
 
-    def draw(self, record=False):
-        from PIL import Image, ImageDraw, ImageTk
+    def render_panel(self):
+        from PIL import Image, ImageDraw
         with preserve_rng():
             frames = [('Overview (operator only)', rgb_image(self.env.render()))]
             # Same configured cameras as policy; never replace the wrist stream with overview.
@@ -271,8 +275,17 @@ class CollectorUI:
             draw.text((i*384+5, 5), name, fill='white')
         draw.text((5, 395), f'seed={self.seed} step={self.control.steps} source={self.control.mode} '
                   f'hints={",".join(self.control.hints)}', fill='white')
+        return panel
+
+    def draw(self, record=False):
+        from PIL import ImageTk
+        panel = self.render_panel()
         self.photo = ImageTk.PhotoImage(panel)
         self.image_label.configure(image=self.photo)
+        self.record_panel(panel, record)
+        self.refresh_status()
+
+    def record_panel(self, panel, record):
         if record and self.writer is not None:
             try:
                 self.writer.append_data(np.asarray(panel))
@@ -282,7 +295,6 @@ class CollectorUI:
                     self.writer.close()
                 finally:
                     self.writer = None
-        self.refresh_status()
 
     def refresh_status(self):
         if hasattr(self, 'control'):
@@ -315,18 +327,18 @@ class CollectorUI:
                 segments=[dict(s, decision='pending') for s in c.segments]))
             write_json(self.output/'review.json', self.review)
         self.active = False
-        self.close_resources()
+        self.close_resources(close_env=False)
         self.notice = 'Saved for review (not yet expert data). Click Next seed or close window.'
         self.refresh_status()
 
-    def close_resources(self):
+    def close_resources(self, close_env=True):
         if self.events_handle:
             self.events_handle.close()
             self.events_handle = None
         if self.writer:
             self.writer.close()
             self.writer = None
-        if self.env:
+        if self.env and close_env:
             self.env.close()
             self.env = None
 
@@ -340,7 +352,6 @@ class CollectorUI:
 
 
 def run(args):
-    import tkinter as tk
     if args.episodes < 1 or args.policy_delay_ms < 0:
         raise ValueError('Invalid episode count/delay')
     output = Path(args.output).expanduser().resolve()
@@ -365,33 +376,44 @@ def run(args):
                          min_std=cfg.get('min_std', cfg.algo.get('min_std', .0067)), eval_mode=args.sampler)
     actor.eval()
     encode = observation_encoder(cfg, actor, normalizer, args.device)
-    # Fail before creating an output directory when no desktop/Tk is available.
-    root = tk.Tk()
+    root = None
+    if args.ui == 'buttons':
+        import tkinter as tk
+        root = tk.Tk()
+    else:
+        # Fail before creating an output directory if official planning dependencies are missing.
+        from tools.collection.sapien_takeover import SapienCollector
+        from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver
     output.mkdir(parents=True)
     packages = {}
-    for package in ('mani_skill', 'sapien', 'torch', 'Pillow'):
+    for package in ('mani_skill', 'sapien', 'mplib', 'torch', 'Pillow'):
         try:
             packages[package] = version(package)
         except PackageNotFoundError:
             packages[package] = None
     write_json(output/'session.json', dict(schema='myrl_human_session_v1', config=config,
         checkpoint=str(checkpoint), checkpoint_sha256=digest(checkpoint), normalizer=cp['normalizer'],
-        sampler=args.sampler, versions=packages, seeds=sorted(seeds), excluded_seeds=args.exclude_seeds,
+        sampler=args.sampler, ui=args.ui, versions=packages, seeds=sorted(seeds), excluded_seeds=args.exclude_seeds,
         weight_key='ema_model_state_dict' if 'ema_model_state_dict' in cp else 'model_state_dict',
         intervention_success_is_not_autonomous_evaluation=True))
     write_json(output/'review.json', dict(schema='myrl_human_review_v1', episodes=[]))
     ui = None
     try:
-        ui = CollectorUI(root, args, cfg, actor, encode, normalizer, output)
+        ui = (CollectorUI(root, args, cfg, actor, encode, normalizer, output) if root is not None else
+              SapienCollector(args, cfg, actor, encode, normalizer, output))
         ui.next_episode()
-        root.mainloop()
+        if root is not None:
+            root.mainloop()
+        else:
+            ui.loop()
     finally:
         if ui is not None:
             ui.close_resources()
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass  # Window was already closed by the operator.
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass  # Window was already closed by the operator.
     print(f'Collected session: {output}; review.json must be approved before import.')
 
 
