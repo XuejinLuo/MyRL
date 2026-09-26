@@ -9,4 +9,6 @@ checkpoints/
 *.sh
 *.npz
 *.json
+*.zip
+demos/
 data/iterative_pullcube_v1
