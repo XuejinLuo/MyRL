@@ -1,5 +1,9 @@
 # 鼠标/键盘人工接管与纠正数据
 
+**默认界面已更新为官方 SAPIEN 拖拽式接管**：参见
+[拖目标、按 N 执行的完整操作说明](SAPIEN_DRAG_TAKEOVER.md)。本页的 XYZ 按钮操作通过 `--ui buttons` 使用，
+数据审核、清洗和训练规则对两种界面通用。
+
 这是 iterative 的**采集 → 审核 → 固定数据训练**扩展。采集独立运行，不在优化器更新过程中等人操作。
 现有 offline / online 默认行为不变；不需要遥操作手柄，不需要重新生成原有专家演示。
 目前只支持 StackCube-v1、panda_wristcam、physx_cpu、pd_ee_delta_pose 和非 temporal-ensembling 执行。
@@ -34,6 +38,7 @@ python -m pip install pillow imageio imageio-ffmpeg
 
 ```bash
 python -m tools.collection.human_takeover \
+  --ui buttons \
   --checkpoint outputs/StackCube-v1/oc_budget/iterative/checkpoints/best.pth \
   --seed-start 12000 --episodes 10 \
   --output outputs/StackCube-v1/oc_budget/human_session_01 \
