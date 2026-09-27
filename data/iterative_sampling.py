@@ -1,5 +1,6 @@
 """Source-aware fixed-budget sampling; no trajectory arrays or rewards are edited."""
 import math
+from collections import Counter
 
 import numpy as np
 import torch
@@ -27,6 +28,15 @@ def validate_update_config(cfg):
     if isinstance(warmup, bool) or not isinstance(warmup, int) or not 0 <= warmup < total:
         raise ValueError('Require 0 <= critic_warmup_updates < updates_per_round')
     sampling = cfg.actor_sampling
+    if sampling.get('correction_sampling', 'episode') not in ('episode', 'uniform_start'):
+        raise ValueError('Unknown correction_sampling')
+    if sampling.get('correction_label_mode', 'full_chunk') not in ('full_chunk', 'masked'):
+        raise ValueError('Unknown correction_label_mode')
+    if sampling.get('correction_label_mode', 'full_chunk') == 'masked' and cfg.model.algo_type != 'flow':
+        raise ValueError('Masked correction supervision requires model.algo_type=flow')
+    early = cfg.get('eval_actor_updates', [])
+    if any(type(n) is not int or n < 1 or n > total-warmup for n in early) or len(set(early)) != len(early):
+        raise ValueError('eval_actor_updates must contain unique positive Actor update counts within budget')
     fraction = sampling.demo_fraction
     if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 < fraction < 1:
         raise ValueError('demo_fraction must be strictly between 0 and 1')
@@ -62,19 +72,42 @@ class SourceDataset(Dataset):
                           for source, ep in zip(self.source_ids, dataset.episodes)]
         self.offsets = np.cumsum([0] + [len(ep['action']) for ep in dataset.episodes])
         self.correction_starts = {}
+        self.correction_episodes = {}
+        original_items = [item for source in sources for item in source['episodes']]
         for i, ep in enumerate(dataset.episodes):
             if 'actor_eligible' in ep:
                 if sources[self.source_ids[i]].get('role') != 'human_correction':
                     raise ValueError('Correction episode requires human_correction source role')
                 if sources[self.source_ids[i]].get('chunk_size') != dataset.chunk_size:
                     raise ValueError('Correction chunk_size changed; prepare data again')
+                source = sources[self.source_ids[i]]
+                label_mode = source.get('actor_label_mode', 'full_chunk')
+                schema = source.get('actor_label_schema')
+                if schema not in (None, 'myrl_actor_labels_v2'):
+                    raise ValueError('Unsupported actor label schema')
+                if label_mode != dataset.correction_label_mode:
+                    raise ValueError('Correction label mode differs from config; select matching data or re-export')
+                if (schema is not None or label_mode == 'masked') and 'actor_valid_length' not in ep:
+                    raise ValueError('Versioned correction labels require actor_valid_length')
                 starts = np.flatnonzero(ep['actor_eligible'])
-                if np.any(starts + dataset.chunk_size > len(ep['action'])):
+                lengths = (ep['actor_valid_length'][starts] if 'actor_valid_length' in ep
+                           else np.full(len(starts), dataset.chunk_size))
+                if (np.any(lengths > dataset.chunk_size) or np.any(lengths < source.get('min_valid_length', 1))
+                        or (label_mode == 'full_chunk' and np.any(lengths != dataset.chunk_size))):
+                    raise ValueError('Correction valid lengths disagree with label mode/chunk_size')
+                if np.any(starts + lengths > len(ep['action'])):
                     raise ValueError('Correction chunk crosses episode end')
+                item = original_items[dataset.original_episode_indices[i]]
+                self.correction_episodes[str(i)] = dict(seed=item.get('seed'), source_id=self.source_ids[i],
+                    actor_starts=len(starts), label_mode=label_mode,
+                    full_chunk_starts=int((lengths == dataset.chunk_size).sum()),
+                    partial_chunk_starts=int((lengths < dataset.chunk_size).sum()))
                 if len(starts):
                     self.correction_starts[i] = starts + self.offsets[i]
             elif sources[self.source_ids[i]].get('role') == 'human_correction':
                 raise ValueError('Human correction episode is missing actor_eligible')
+        self.correction_pool = (np.concatenate(list(self.correction_starts.values()))
+                                if self.correction_starts else np.empty(0, dtype=np.int64))
         self.report = dict(
             groups={name: dict(episodes=0, transitions=0) for name in GROUPS},
             sources={f'source_{i:03d}': dict(name=name, role=sources[i].get('role', 'demo' if name in demo_sources else 'rollout'),
@@ -83,6 +116,8 @@ class SourceDataset(Dataset):
             excluded_episode_indices=sorted(set(range(dataset.original_episode_count)) -
                                              set(dataset.original_episode_indices)))
         self.report['correction_actor_starts'] = sum(map(len, self.correction_starts.values()))
+        self.report['correction_actor_episodes'] = len(self.correction_starts)
+        self.report['correction_episodes'] = self.correction_episodes
         for ep, source, group in zip(dataset.episodes, self.source_ids, self.group_ids):
             for summary in (self.report['groups'][GROUPS[group]], self.report['sources'][f'source_{source:03d}']):
                 summary['episodes'] += 1
@@ -94,20 +129,26 @@ class SourceDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.dataset[index]
-        episode, _ = self.dataset.indices[index]
+        episode, start = self.dataset.indices[index]
         return dict(row, sampling_source=torch.tensor(self.source_ids[episode]),
-                    sampling_group=torch.tensor(self.group_ids[episode]))
+                    sampling_group=torch.tensor(self.group_ids[episode]),
+                    sampling_episode=torch.tensor(episode), sampling_start=torch.tensor(start))
 
 
 class FixedBatches(Sampler):
-    """Local RNG; exact source quotas, then uniform episode and uniform time.
+    """Local RNG; exact quotas, unchanged demo/rollout episode/time sampling.
 
     Critic/mixed sampling is uniform over all transitions with replacement.
     Actor RNG is independent, so filtering Actor pools cannot change critic indices.
+    Correction sampling explicitly selects legacy episode or uniform-start mass.
     """
-    def __init__(self, dataset, batch_size, updates, seed, mode='mixed', demo_fraction=.5, correction_fraction=.25):
+    def __init__(self, dataset, batch_size, updates, seed, mode='mixed', demo_fraction=.5,
+                 correction_fraction=.25, correction_sampling='episode'):
         self.dataset, self.batch_size, self.updates = dataset, batch_size, updates
         self.seed, self.mode = seed, mode
+        if correction_sampling not in ('episode', 'uniform_start'):
+            raise ValueError('Unknown correction_sampling')
+        self.correction_sampling = correction_sampling
         if mode not in ('mixed', 'demo_success', 'demo_success_correction'):
             raise ValueError('Unknown sampling mode')
         self.quota = round(batch_size * demo_fraction)
@@ -121,7 +162,7 @@ class FixedBatches(Sampler):
             self.counts = [self.quota, batch_size-self.quota-correction_quota, correction_quota]
             self.pools.append(np.asarray(list(dataset.correction_starts), dtype=int))
             if not len(self.pools[-1]) or min(self.counts) < 1:
-                raise ValueError('Need approved full-length correction chunks and nonempty quotas')
+                raise ValueError('Need approved correction starts and nonempty quotas')
 
     def __len__(self):
         return self.updates
@@ -134,6 +175,9 @@ class FixedBatches(Sampler):
                 continue
             batch = []
             for group, (pool, count) in enumerate(zip(self.pools, self.counts)):
+                if group == 2 and self.correction_sampling == 'uniform_start':
+                    batch.extend(rng.choice(self.dataset.correction_pool, size=count, replace=True).tolist())
+                    continue
                 episodes = rng.choice(pool, size=count, replace=True)
                 for episode in episodes:
                     batch.append(int(rng.choice(self.dataset.correction_starts[episode])) if group == 2 else
@@ -148,6 +192,9 @@ class SamplingMetrics:
         self.labels = list(GROUPS) + [f'source_{i:03d}' for i in range(source_count)]
         self.values = {role: {label: dict(sampled=0, kept=0, advantage_sum=0., loss_sum=0.)
                              for label in self.labels} for role in ('Actor', 'Critic')}
+        self.advantage_counts = Counter()
+        self.correction_visits = {}
+        self.valid_lengths = Counter()
 
     def add(self, role, batch, details=None):
         groups = batch['sampling_group'].detach().cpu()
@@ -155,13 +202,24 @@ class SamplingMetrics:
         keep = details['keep_mask'].detach().cpu() if details else torch.ones(len(groups), dtype=torch.bool)
         advantages = details['advantages'].detach().cpu() if details else None
         losses = details['losses'].detach().cpu() if details else None
+        advantage_valid = (details.get('advantage_valid', torch.ones_like(keep)).detach().cpu()
+                           if details else None)
+        if role == 'Actor' and 'sampling_episode' in batch:
+            correction = batch['sampling_group'] == 3
+            for episode, start, length in zip(batch['sampling_episode'][correction].cpu().tolist(),
+                    batch['sampling_start'][correction].cpu().tolist(),
+                    batch['actor_mask'][correction].sum(1).cpu().tolist()
+                    if 'actor_mask' in batch else []):
+                self.correction_visits.setdefault(str(episode), Counter())[start] += 1
+                self.valid_lengths[int(length)] += 1
         for label in self.labels:
             mask = (groups == GROUPS.index(label)) if label in GROUPS else (sources == int(label[7:]))
             row = self.values[role][label]
             row['sampled'] += int(mask.sum())
             row['kept'] += int((mask & keep).sum())
             if details:
-                row['advantage_sum'] += float(advantages[mask].sum())
+                row['advantage_sum'] += float(advantages[mask & advantage_valid].sum())
+                self.advantage_counts[label] += int((mask & advantage_valid).sum())
                 row['loss_sum'] += float(losses[mask[keep]].sum())
 
     def report(self):
@@ -173,6 +231,19 @@ class SamplingMetrics:
                 if role == 'Actor':
                     result[prefix+'kept'] = row['kept']
                     result[prefix+'keep_fraction'] = row['kept']/row['sampled'] if row['sampled'] else None
-                    result[prefix+'advantage_mean'] = row['advantage_sum']/row['sampled'] if row['sampled'] else None
+                    count = self.advantage_counts[label]
+                    result[prefix+'advantage_samples'] = count
+                    result[prefix+'advantage_mean'] = row['advantage_sum']/count if count else None
                     result[prefix+'loss_mean'] = row['loss_sum']/row['kept'] if row['kept'] else None
         return result
+
+    def correction_report(self, episodes):
+        rows = {}
+        for episode, metadata in episodes.items():
+            visits = self.correction_visits.get(episode, Counter())
+            rows[episode] = dict(**metadata, sampled=sum(visits.values()),
+                unique_starts=len(visits), max_start_repeats=max(visits.values(), default=0),
+                start_counts={str(k): v for k, v in sorted(visits.items())})
+        total = sum(self.valid_lengths.values())
+        return dict(episodes=rows, valid_length_histogram={str(k): v for k, v in sorted(self.valid_lengths.items())},
+                    valid_length_mean=sum(k*v for k, v in self.valid_lengths.items())/total if total else None)

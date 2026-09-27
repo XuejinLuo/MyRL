@@ -80,9 +80,12 @@ def run_iterations(cfg, wandb_run=None):
         # Fill only historical defaults; changed settings must still fail below.
         defaults = dict(collect=True, updates_per_round=None, critic_warmup_updates=10000,
                         eval_every_updates=2000, save_every_updates=2000, log_every_updates=1000,
+                        eval_actor_updates=[],
                         actor_sampling=dict(mode='mixed', demo_fraction=.5, demo_sources=['demonstrations']))
         for key, value in defaults.items():
             old.setdefault(key, value)
+        old['actor_sampling'].setdefault('correction_sampling', 'episode')
+        old['actor_sampling'].setdefault('correction_label_mode', 'full_chunk')
         old['resume'] = frozen['resume']
         old['stages']['iterative']['resume'] = frozen['stages']['iterative']['resume']
         if old != frozen:
@@ -136,7 +139,8 @@ def run_iterations(cfg, wandb_run=None):
     def save(path, epoch, metrics):
         torch.save(dict(model_state_dict=base.state_dict(), normalizer=normalizer.stats,
                         config=frozen, epoch=None if fixed else epoch, metrics=metrics,
-                        **(dict(update_step=epoch, budget_unit='updates') if fixed else {}),
+                        **(dict(update_step=epoch, actor_update_step=max(0, epoch-cfg.critic_warmup_updates),
+                                budget_unit='updates') if fixed else {}),
                         correction_training_seeds=sorted(correction_training_seeds),
                         dataset_manifest=state['manifest']), path)
 
@@ -174,10 +178,10 @@ def run_iterations(cfg, wandb_run=None):
         save(rd/'checkpoints'/'best.pth', 0, baseline)
         write_selection(rd, None if fixed else 0, baseline, rd/'checkpoints'/'best.pth',
                         stage='iterative', round=rd.name, **selection_options,
-                        **(dict(update_step=0) if fixed else {}))
+                        **(dict(update_step=0, actor_update_step=0) if fixed else {}))
         for destination in (rd, output):
             log_metrics(destination, None if fixed else 0, baseline, stage='iterative', round=rd.name, sampler=cfg.eval.sampler,
-                        **(dict(update_step=0, budget_unit='updates') if fixed else {}),
+                        **(dict(update_step=0, actor_update_step=0, budget_unit='updates') if fixed else {}),
                         checkpoint=str(rd/'checkpoints'/f'{coordinate}.pth'),
                         evaluation=str(evaluation_paths(cfg, rd, 0)[0]))
         write_json(rd/'baseline.json', baseline)
@@ -279,6 +283,7 @@ def run_iterations(cfg, wandb_run=None):
     shutil.copyfile(final, output/'checkpoints'/'last.pth')
     write_selection(output, selected_cp.get('epoch', -1), selected_cp.get('metrics', {}), final,
         stage='iterative', source=state['checkpoint'], source_sha256=state['checkpoint_sha256'],
-        **selection_options, **(dict(update_step=selected_cp['update_step']) if fixed else {}))
+        **selection_options, **(dict(update_step=selected_cp['update_step'],
+            actor_update_step=selected_cp.get('actor_update_step', max(0, selected_cp['update_step']-cfg.critic_warmup_updates))) if fixed else {}))
     normalizer.save(str(output/'checkpoints'/'dataset_stats.json'))
     print(f'Selected policy: {final}', flush=True)

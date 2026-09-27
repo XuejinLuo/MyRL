@@ -13,8 +13,13 @@ critic_warmup_updates: 10000
 eval_every_updates: 2000
 save_every_updates: 2000
 log_every_updates: 1000
+eval_actor_updates: [250, 500, 1000, 2000]
 actor_sampling:
   mode: demo_success_correction
+  # A: old full chunks, uniform starts. B: re-export and select masked explicitly.
+  # Set correction_sampling=episode and eval_actor_updates=[] for legacy behavior.
+  correction_sampling: uniform_start
+  correction_label_mode: full_chunk
   correction_fraction: 0.25
   demo_fraction: 0.5
   demo_sources: [demonstrations]

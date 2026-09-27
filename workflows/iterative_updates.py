@@ -16,7 +16,8 @@ from utils.experiment import log_metrics, write_json, write_selection, evaluatio
 
 def loader(dataset, cfg, updates, seed, mode):
     sampler = FixedBatches(dataset, cfg.batch_size, updates, seed, mode, cfg.actor_sampling.demo_fraction,
-                           cfg.actor_sampling.get('correction_fraction', .25))
+                           cfg.actor_sampling.get('correction_fraction', .25),
+                           cfg.actor_sampling.get('correction_sampling', 'episode'))
     kwargs = dict(batch_sampler=sampler, num_workers=cfg.num_workers,
                   pin_memory=torch.device(cfg.device).type == 'cuda',
                   generator=torch.Generator().manual_seed(seed))
@@ -26,13 +27,20 @@ def loader(dataset, cfg, updates, seed, mode):
 
 
 @torch.no_grad()
-def actor_advantage(agent, obs, actions):
+def actor_advantage(agent, obs, actions, valid=None):
     # Both fixed-budget arms use the same post-critic-update inference rule.
     # No extra BatchNorm updates or gradients from the Actor's sampling stream.
     modes = [(m, m.training) for net in (agent.q_target, agent.v_net) for m in net.modules()]
     try:
         agent.q_target.eval()
         agent.v_net.eval()
+        if valid is not None:
+            result = actions.new_zeros((len(actions), 1))
+            if valid.any():
+                sub_obs = {k: v[valid] for k, v in obs.items()}
+                q1, q2 = agent.q_target(sub_obs, actions[valid])
+                result[valid] = torch.minimum(q1, q2) - agent.v_net(sub_obs)
+            return result
         q1, q2 = agent.q_target(obs, actions)
         return torch.minimum(q1, q2) - agent.v_net(obs)
     finally:
@@ -54,18 +62,22 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
     mode = cfg.actor_sampling.mode
     actor_loader = (loader(dataset, cfg, total-warmup, sampling_seed + 2001, mode)
                     if mode != 'mixed' else None)
-    write_json(directory/'sampling.json', dict(**dataset.report, budget_unit='updates',
+    sampling_report = dict(**dataset.report, budget_unit='updates',
         critic_updates=total, actor_updates=total-warmup, critic_warmup_updates=warmup,
         batch_size=cfg.batch_size, actor_mode=mode, demo_fraction=cfg.actor_sampling.demo_fraction,
+        correction_sampling=cfg.actor_sampling.get('correction_sampling', 'episode'),
+        correction_label_mode=cfg.actor_sampling.get('correction_label_mode', 'full_chunk'),
+        eval_actor_updates=list(cfg.get('eval_actor_updates', [])),
         correction_fraction=cfg.actor_sampling.get('correction_fraction', .25) if mode == 'demo_success_correction' else 0.,
         demo_sources=list(cfg.actor_sampling.demo_sources),
         critic_sampling='all kept transitions, uniform with replacement',
         actor_sampling=('same batch as critic' if mode == 'mixed' else
-                        'fixed group quotas; uniform episode then eligible start; correction chunks never cross takeover boundaries'),
+                        'fixed group quotas; demo/success: uniform episode then time; correction: explicit correction_sampling'),
         success_definition='any primitive step reports success',
         critic_seed=sampling_seed+1001, actor_seed=sampling_seed+2001,
         selection_criterion=['Eval/Success_Rate'],
-        loss_definition='mean of retained per-sample Flow losses from the actual training forward pass'))
+        loss_definition='mean of retained per-sample Flow losses, normalized by valid action dimensions')
+    write_json(directory/'sampling.json', sampling_report)
     base.requires_grad_(True)
     freeze = bool(cfg.get('freeze_actor_encoder', False))
     if freeze:
@@ -100,8 +112,10 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
             actor_batch = ({k: v.to(device) for k, v in next(actor_iterator).items()}
                            if actor_iterator is not None else batch)
             obs, actions = batch_observation(actor_batch), actor_batch['action_chunk']
-            adv = actor_advantage(agent, obs, actions)
-            actor_metrics, details = agent.update_actor(obs, actions, adv=adv, return_details=True,
+            action_mask = actor_batch.get('actor_mask') if cfg.actor_sampling.get('correction_label_mode', 'full_chunk') == 'masked' else None
+            adv = actor_advantage(agent, obs, actions, valid=action_mask.all(1) if action_mask is not None else None)
+            actor_metrics, details = agent.update_actor(obs, actor_batch.get('actor_actions', actions),
+                adv=adv, return_details=True, **({'action_mask': action_mask} if action_mask is not None else {}),
                 force_keep=(actor_batch['sampling_group'] == 3) if mode == 'demo_success_correction' else None)
             metrics.update(actor_metrics)
             for stats in (interval, cumulative):
@@ -119,7 +133,8 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
                 a.copy_(b)
         for key, value in metrics.items():
             sums[key] = sums.get(key, 0.) + value
-        evaluate_now = step > warmup and (step % cfg.eval_every_updates == 0 or step == total)
+        evaluate_now = step > warmup and (actor_total in cfg.get('eval_actor_updates', [])
+                                          or step % cfg.eval_every_updates == 0 or step == total)
         save_now = step > warmup and (step % cfg.save_every_updates == 0 or step == total)
         log_now = step % cfg.log_every_updates == 0 or step == warmup or step == total
         if not (evaluate_now or save_now or log_now):
@@ -151,11 +166,12 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
                     best, selected = result['Eval/Success_Rate'], str(candidate)
                     save(directory/'checkpoints'/'best.pth', step, result)
                     write_selection(directory, None, result, directory/'checkpoints'/'best.pth',
-                        stage=cfg.stage, update_step=step, budget_unit='updates', criterion=['Eval/Success_Rate'])
+                        stage=cfg.stage, update_step=step, actor_update_step=actor_total,
+                        budget_unit='updates', criterion=['Eval/Success_Rate'])
             finally:
                 base.load_state_dict(raw)
         context = dict(stage=cfg.stage, sampler=cfg.eval.sampler, round=directory.name,
-                       update_step=step, budget_unit='updates',
+                       update_step=step, actor_update_step=actor_total, budget_unit='updates',
                        checkpoint=str(candidate) if evaluate_now or save_now else None,
                        evaluation=str(evaluation_paths(cfg, directory, step)[0]) if result else None)
         for destination in (directory, directory.parent):
@@ -163,6 +179,9 @@ def train_updates(cfg, base, normalizer, episodes, directory, evaluate, save,
         if log_callback:
             log_callback(row, step)
         print(dict(update_step=step, **row), flush=True)
+        write_json(directory/'sampling.json', dict(sampling_report, completed_critic_updates=step,
+            completed_actor_updates=actor_total, actual_counts=cumulative.report(),
+            correction_audit=cumulative.correction_report(dataset.correction_episodes)))
         interval = SamplingMetrics(len(source_spec['sources']))
         sums, critic_count, actor_count = {}, 0, 0
         started = perf_counter()

@@ -1,5 +1,8 @@
 # 鼠标/键盘人工接管与纠正数据
 
+已有人工 session 的采样修复、短段 masked 标签与 A/B 对照命令：参见
+[人工纠正监督修复与实验指南](MASKED_CORRECTIONS.md)。无需重新采集。
+
 **默认界面已更新为官方 SAPIEN 拖拽式接管**：参见
 [拖目标、按 N 执行的完整操作说明](SAPIEN_DRAG_TAKEOVER.md)。本页的 XYZ 按钮操作通过 `--ui buttons` 使用，
 数据审核、清洗和训练规则对两种界面通用。
@@ -155,12 +158,13 @@ python -m tools.prepare_corrections \
 3. 排除重复数据与 checkpoint 中已声明的验证/测试种子；训练时再次对本次评估种子检查。
 4. 只有**最终任务成功 + 人工明确接受**的段可供 Actor。没救成功但数据有效可保留给 Critic。
    这是保守起点，会漏掉“抓取已恢复、后来堆叠失败”的局部有效片段，暂不自动将其标为专家。
-5. Actor 只取完全在一个接受段里的完整 chunk（当前 H=16）。长度 <16 的段不提供 Actor 样本；
-   尾部不足 16 步的位置不 padding，不跨回模型段/被拒绝段，也不拼接不连续状态。
+5. 默认 `--label-mode full_chunk` 只取同一接受段内完整 chunk（H=16）；短段和尾部无 Actor 样本。
+   `--label-mode masked` 允许至少 1 步的真实人工标签；未知未来位置不参与监督，
+   不跨回模型段/被拒绝段，也不拼接不连续状态。训练时需显式设置 `actor_sampling.correction_label_mode=masked`。
 6. 不删除轨迹中间的等待/坏动作后重新连边；Critic 的完整真实时间顺序、奖励、结束条件不变。
 
 导入输出 `cleaning_report.json` 和独立 `manifest.json`，不会修改原 manifest/原始轨迹。
-若没有合格的完整纠正 chunk，会报错停止，而不是悄悄退回普通 replay。
+若没有符合所选标签模式的纠正起点，会报错停止。
 
 ## 5. 接入 iterative 训练
 
@@ -174,11 +178,13 @@ python train_iterative.py +experiment=oc_budget \
 
 - 固定预算：20,000 次 Critic 更新，前 10,000 次 warmup，10,000 次 Actor 更新。
 - batch=64：Actor 32 原始 demonstrations + 16 原有成功 rollout + 16 审核通过的纠正 chunk。
-  组内先均匀选 episode，再选合格起点；三组都必须有数据，不静默从失败动作补足。
+  原示范/成功 rollout 先均匀选 episode 再选起点；人工组默认均匀抽所有合格起点。
+  `actor_sampling.correction_sampling=episode` 可复测旧规则；三组都必须有数据。
 - 原示范/成功 rollout 保留已有 IDQL 筛选；**审核通过的人工纠正不被 Q/V 的低分拒绝**。
   `algo.use_bc_only=true` 可让全部三组都用 BC，其他预算不变。
 - Critic 均匀采样所有保留轨迹，包括模型失败前缀、人工纠正与失败恢复；奖励仍是每步真实 success。
 - `sampling.json`、metrics 中单独报告 `Actor/correction/{sampled,kept,...}`，检查纠正确实被学习。
+- 默认增加 Actor 第 250、500、1000、2000 次更新后的验证；仍按验证 success 严格提升选择 best。
 - 纠正来源不会自动当成普通成功 rollout 或普通 demonstration；即使该局最后成功也不能泄漏错误前缀给 Actor。
 - `actor_eligible` 与 chunk_size 绑定；改 chunk_size 必须重新准备数据。旧 epoch/mixed 训练拒绝此类数据，防止误用。
 - 验证成功率没有严格提升时保留原 best；不会因为人为救成功的采集成功率高就替换 best。
