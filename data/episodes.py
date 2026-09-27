@@ -59,6 +59,13 @@ def validate_episode(ep):
         mask = np.asarray(ep['actor_eligible'])
         if mask.shape != (t,) or mask.dtype != np.bool_:
             raise ValueError('actor_eligible must be a boolean mask over primitive starts')
+    if 'actor_valid_length' in ep:
+        lengths = np.asarray(ep['actor_valid_length'])
+        if (lengths.shape != (t,) or not np.issubdtype(lengths.dtype, np.integer)
+                or np.any(lengths < 0) or np.any(lengths > t-np.arange(t))
+                or 'actor_eligible' not in ep
+                or not np.array_equal(lengths > 0, ep['actor_eligible'])):
+            raise ValueError('Invalid actor_valid_length or inconsistent actor_eligible')
 
 
 def save_episode(path, ep):
@@ -71,6 +78,8 @@ def save_episode(path, ep):
         keys = (*observation_fields(ep), *TRANSITION_FIELDS)
         if 'actor_eligible' in ep:
             keys += ('actor_eligible',)
+        if 'actor_valid_length' in ep:
+            keys += ('actor_valid_length',)
         np.savez_compressed(f, **{k: ep[k] for k in keys})
     tmp.replace(path)
 

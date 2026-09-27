@@ -124,8 +124,9 @@ def test_source_metrics_account_for_rejection_and_sample_weighted_loss():
 
 
 class LossTinyPolicy(TinyPolicy):
-    def compute_loss(self, obs, actions, state, reduction='mean'):
-        return self.scheduler.compute_loss(self.backbone, actions, self._get_condition(obs, state), reduction=reduction)
+    def compute_loss(self, obs, actions, state, reduction='mean', action_mask=None):
+        return self.scheduler.compute_loss(self.backbone, actions, self._get_condition(obs, state),
+                                           reduction=reduction, action_mask=action_mask)
 
 
 @pytest.mark.parametrize('bc', [False, True])
@@ -241,6 +242,12 @@ def test_replay_only_actual_training_exact_budget_artifacts_and_resume(tmp_path,
         iterative.run(cfg)
     before = (root/'metrics.jsonl').read_bytes()
     cfg.resume = True
+    # Older fixed-budget configs have no masked-supervision options.
+    saved_config = OmegaConf.load(root/'config.yaml')
+    del saved_config['eval_actor_updates']
+    del saved_config.actor_sampling['correction_sampling']
+    del saved_config.actor_sampling['correction_label_mode']
+    OmegaConf.save(saved_config, root/'config.yaml')
     iterative.run(cfg)
     assert (root/'metrics.jsonl').read_bytes() == before
     assert all(digest(p) == hashes[p] for p in hashes)

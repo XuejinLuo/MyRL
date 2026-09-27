@@ -29,7 +29,10 @@ critic_warmup_updates: 10000
 eval_every_updates: 2000
 save_every_updates: 2000
 log_every_updates: 1000
+eval_actor_updates: []
 actor_sampling:
   mode: mixed
+  correction_sampling: episode
+  correction_label_mode: full_chunk
   demo_fraction: 0.5
   demo_sources: [demonstrations]

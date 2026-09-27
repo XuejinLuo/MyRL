@@ -11,6 +11,7 @@
 入口是 `python -m tools.collection.human_takeover`；无需遥操作手柄，保留腕部相机输入。
 默认使用[官方 SAPIEN 拖拽界面](docs/SAPIEN_DRAG_TAKEOVER.md)：H 接管，拖动目标，N 执行，G 开合夹爪。
 原 XYZ 按钮界面可用 `--ui buttons`。
+已有纠正数据可直接运行[均匀起点采样与短段掩码监督 A/B 对照](docs/MASKED_CORRECTIONS.md)。
 
 ## 日常运行
 

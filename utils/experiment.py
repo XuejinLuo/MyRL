@@ -79,7 +79,8 @@ def evaluate_base(cfg, base, normalizer, directory, epoch, tag='validation', see
             metadata=dict(stage=cfg.get('stage', 'evaluation'),
                           round=Path(directory).name if Path(directory).name.startswith('round_') else None,
                           split=tag, epoch=None if fixed else epoch,
-                          **(dict(update_step=epoch, budget_unit='updates') if fixed else {}),
+                          **(dict(update_step=epoch, actor_update_step=max(0, epoch-cfg.critic_warmup_updates),
+                                  budget_unit='updates') if fixed else {}),
                           sampler=cfg.eval.sampler,
                           checkpoint=str(checkpoint or Path(directory)/'checkpoints'/(f'step_{epoch:07d}.pth' if fixed else f'epoch_{epoch:04d}.pth')),
                           env=OmegaConf.to_container(cfg.env, resolve=True)))

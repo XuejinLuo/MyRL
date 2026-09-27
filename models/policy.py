@@ -117,7 +117,7 @@ class EmbodiedGenPolicy(nn.Module):
     # [核心接口 2] BC / IDQL 训练
     # 与 algos/idql.py 完全对齐 (actor_loss = self.actor.compute_loss(filtered_states, filtered_actions))
     # ========================================================================
-    def compute_loss(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None, reduction: str = 'mean') -> torch.Tensor:
+    def compute_loss(self, obs: torch.Tensor, actions: torch.Tensor, state: Optional[torch.Tensor] = None, reduction: str = 'mean', action_mask=None) -> torch.Tensor:
         """
         计算生成模型的训练 Loss (Vector Field MSE 或 Denoising MSE)
         支持 IDQL 传入过滤后的高质量样本直接求导。
@@ -127,9 +127,11 @@ class EmbodiedGenPolicy(nn.Module):
         if self.algo_type == "flow":
             # Flow Matching 直接利用你写好的 OTFlowMatching.compute_loss
             # 注意：我们将 self.backbone 传入，巧妙解耦
-            return self.scheduler.compute_loss(self.backbone, actions, cond, reduction=reduction)
+            return self.scheduler.compute_loss(self.backbone, actions, cond, reduction=reduction, action_mask=action_mask)
             
         elif self.algo_type == "diffusion":
+            if action_mask is not None:
+                raise ValueError('Masked correction supervision currently requires algo_type=flow')
             # DDPM/DDIM 标准加噪与 MSE 训练逻辑
             B = actions.shape[0]
             device = actions.device

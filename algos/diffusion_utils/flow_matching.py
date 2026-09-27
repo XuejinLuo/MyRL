@@ -20,7 +20,7 @@ class OTFlowMatching:
     def compute_loss(self, 
                      model: nn.Module, 
                      x1: torch.Tensor, 
-                     cond: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
+                     cond: torch.Tensor, reduction: str = 'mean', action_mask=None) -> torch.Tensor:
         """
         计算 Flow Matching 的目标函数 (Vector Field MSE Loss)
         
@@ -31,6 +31,13 @@ class OTFlowMatching:
         """
         B = x1.shape[0]
         device = x1.device
+        if action_mask is not None:
+            if (action_mask.dtype != torch.bool or action_mask.shape != x1.shape[:2]
+                    or not action_mask.any(dim=1).all()):
+                raise ValueError('action_mask must be boolean [B,H] with a valid step per sample')
+            mask = action_mask.unsqueeze(-1)
+            # Remove unknown targets BEFORE interpolation and temporal mixing.
+            x1 = torch.where(mask, x1, torch.zeros_like(x1))
 
         # 1. 采样初始噪声 x0 ~ N(0, I)
         x0 = torch.randn_like(x1)
@@ -47,6 +54,11 @@ class OTFlowMatching:
         # 数学公式: x_t = (1 - (1 - sigma_min)*t) * x0 + t * x1
         # 求导: d(x_t)/dt = x1 - (1 - sigma_min) * x0
         xt = (1 - (1 - self.sigma_min) * t_expand) * x0 + t_expand * x1
+        if action_mask is not None:
+            # Unknown future tokens contain only the sampled prior noise, never
+            # policy actions, repeated tails or fabricated expert targets. This
+            # keeps checkpoint/inference interfaces unchanged, including attention.
+            xt = torch.where(mask, xt, x0)
 
         # 4. 计算真实的目标向量场 (Target Vector Field)
         ut = x1 - (1 - self.sigma_min) * x0
@@ -56,6 +68,14 @@ class OTFlowMatching:
 
         # 6. 计算 MSE Loss (匹配向量场)
         squared_error = (vt - ut) ** 2
+        if action_mask is not None:
+            sample_loss = torch.where(mask, squared_error, 0.).sum(dim=(1, 2)) / (
+                action_mask.sum(1) * x1.shape[-1])
+            if reduction == 'none':
+                return sample_loss
+            if reduction != 'mean':
+                raise ValueError('reduction must be mean or none')
+            return sample_loss.mean()
         if reduction == 'none':
             return squared_error.flatten(1).mean(1)
         if reduction != 'mean':

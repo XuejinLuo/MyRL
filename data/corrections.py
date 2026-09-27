@@ -16,9 +16,19 @@ def held_out_seeds(config):
 
 def eligible_starts(length, segments, chunk_size, final_success):
     """Only full approved human chunks; never pad or bridge a control switch."""
+    return actor_valid_lengths(length, segments, chunk_size, final_success) > 0
+
+
+def actor_valid_lengths(length, segments, chunk_size, final_success,
+                        label_mode='full_chunk', min_valid_length=1):
+    """Versioned Actor labels; the intact primitive trajectory stays unchanged."""
     if chunk_size < 1:
         raise ValueError('Invalid chunk_size')
-    result = np.zeros(length, dtype=bool)
+    if label_mode not in ('full_chunk', 'masked'):
+        raise ValueError('Unknown correction label_mode')
+    if type(min_valid_length) is not int or not 1 <= min_valid_length <= chunk_size:
+        raise ValueError('min_valid_length must be in [1, chunk_size]')
+    result = np.zeros(length, dtype=np.int64)
     previous_end = 0
     for segment in segments:
         start, stop = segment['start'], segment['stop']
@@ -31,7 +41,9 @@ def eligible_starts(length, segments, chunk_size, final_success):
         if decision == 'pending':
             raise ValueError('Human segment still pending review')
         if decision == 'accept' and final_success:
-            result[start:max(start, stop-chunk_size+1)] = True
+            lengths = np.minimum(chunk_size, stop - np.arange(start, stop))
+            minimum = chunk_size if label_mode == 'full_chunk' else min_valid_length
+            result[start:stop] = np.where(lengths >= minimum, lengths, 0)
     return result
 
 
@@ -41,7 +53,7 @@ def metadata_file(session, item):
     return session_file(session, item.get('metadata', str(Path(item['path']).with_suffix('.json'))))
 
 
-def prepare(base_manifest, session, stats_path, output):
+def prepare(base_manifest, session, stats_path, output, label_mode='full_chunk', min_valid_length=1):
     """Validate everything before exporting new immutable episodes/manifest."""
     base_manifest, session = Path(base_manifest).resolve(), Path(session).resolve()
     output = Path(output).resolve()
@@ -51,6 +63,8 @@ def prepare(base_manifest, session, stats_path, output):
     provenance = json.loads((session/'session.json').read_text())
     review = json.loads((session/'review.json').read_text())
     config = provenance['config']
+    chunk_size = config['model']['chunk_size']
+    actor_valid_lengths(0, [], chunk_size, False, label_mode, min_valid_length)
     if provenance.get('schema') != 'myrl_human_session_v1' or review.get('schema') != 'myrl_human_review_v1':
         raise ValueError('Unsupported correction session/review')
     if spec['schema'] not in (SCHEMA, LEGACY_SCHEMA) or spec['reward_mode'] != 'success':
@@ -100,7 +114,9 @@ def prepare(base_manifest, session, stats_path, output):
         disposition = item['decision']
         if disposition not in ('keep', 'critic_only', 'drop'):
             raise ValueError(f'{path.name}: episode still pending review')
-        row = dict(seed=seed, path=str(path), decision=disposition, actor_starts=0)
+        row = dict(seed=seed, path=str(path), decision=disposition, actor_starts=0,
+                   accepted_human_steps=0, full_chunk_starts=0, partial_chunk_starts=0,
+                   excluded_starts=0, valid_length_histogram={}, reason='dropped' if disposition == 'drop' else None)
         report.append(row)
         if disposition == 'drop':
             continue
@@ -116,15 +132,29 @@ def prepare(base_manifest, session, stats_path, output):
         validate_observation({k: ep[k][0] for k in observation_fields(ep)}, cfg)
         success = bool(ep['success'][-1])
         segments = item['segments'] if disposition == 'keep' else [dict(s, decision='reject') for s in item['segments']]
-        mask = eligible_starts(len(ep['action']), segments, config['model']['chunk_size'], success)
+        lengths = actor_valid_lengths(len(ep['action']), segments, chunk_size, success,
+                                      label_mode, min_valid_length)
+        mask = lengths > 0
         ep['actor_eligible'] = mask
+        ep['actor_valid_length'] = lengths
+        accepted_steps = sum(s['stop']-s['start'] for s in segments if s['decision'] == 'accept') if success else 0
+        values, counts = np.unique(lengths[mask], return_counts=True)
         row.update(steps=len(ep['action']), final_success=success, actor_starts=int(mask.sum()),
+                   accepted_human_steps=accepted_steps,
+                   full_chunk_starts=int((lengths == chunk_size).sum()),
+                   partial_chunk_starts=int(((lengths > 0) & (lengths < chunk_size)).sum()),
+                   excluded_starts=accepted_steps-int(mask.sum()),
+                   valid_length_histogram={str(v): int(c) for v, c in zip(values, counts)},
                    reason=None if success else 'failed recovery: critic only, even if human labels accepted')
         row['segments'] = [dict(id=s['id'], length=s['stop']-s['start'], decision=s['decision'],
             actor_starts=int(mask[s['start']:s['stop']].sum()),
+            excluded_tail_starts=(s['stop']-s['start']-int(mask[s['start']:s['stop']].sum())
+                if success and disposition == 'keep' and s['decision'] == 'accept' else 0),
+            tail_rule='full_chunk_required' if label_mode == 'full_chunk' else 'min_valid_length',
             reason=('failed_recovery' if not success else 'critic_only' if disposition == 'critic_only'
-                    else 'rejected' if s['decision'] != 'accept' else 'shorter_than_chunk'
-                    if s['stop']-s['start'] < config['model']['chunk_size'] else 'accepted'))
+                    else 'rejected' if s['decision'] != 'accept' else 'shorter_than_minimum'
+                    if s['stop']-s['start'] < (chunk_size if label_mode == 'full_chunk' else min_valid_length)
+                    else 'accepted'))
             for s in item['segments']]
         if item['sha256'] in seen or item['sha256'] in seen_raw:
             raise ValueError('Duplicate raw correction trajectory')
@@ -132,12 +162,14 @@ def prepare(base_manifest, session, stats_path, output):
         seen_raw.add(item['sha256'])
         cleaned.append((ep, item, metadata))
     if not sum(r['actor_starts'] for r in report):
-        raise ValueError('No approved full-length successful correction chunks; inspect review/segment lengths')
+        raise ValueError('No approved successful correction labels; inspect review/segment lengths')
     name = 'human_corrections_' + session.name
     if name in [s['name'] for s in spec['sources']]:
         raise ValueError('Session source already imported')
     output.mkdir(parents=True)
     source = dict(name=name, role='human_correction', chunk_size=config['model']['chunk_size'],
+                  actor_label_schema='myrl_actor_labels_v2', actor_label_mode=label_mode,
+                  min_valid_length=chunk_size if label_mode == 'full_chunk' else min_valid_length,
                   screening_seeds=provenance.get('screening_seeds', []),
                   session=str(session), session_sha256=digest(session/'session.json'),
                   review_sha256=digest(session/'review.json'), episodes=[])
@@ -151,6 +183,11 @@ def prepare(base_manifest, session, stats_path, output):
     write_json(output/'manifest.json', spec)
     write_json(output/'cleaning_report.json', dict(episodes=report,
         actor_starts=sum(r['actor_starts'] for r in report),
+        actor_episodes=sum(r['actor_starts'] > 0 for r in report),
+        actor_label_schema='myrl_actor_labels_v2', actor_label_mode=label_mode,
+        min_valid_length=source['min_valid_length'],
+        **{key: sum(r[key] for r in report) for key in
+           ('accepted_human_steps', 'full_chunk_starts', 'partial_chunk_starts', 'excluded_starts')},
         policy='intact transitions for critic; approved, final-success human chunks for actor',
         base_manifest_sha256=digest(base_manifest), normalizer_sha256=digest(stats_path)))
     write_json(output/'review.json', review)

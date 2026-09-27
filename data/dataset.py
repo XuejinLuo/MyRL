@@ -10,6 +10,8 @@ class TrajectoryDataset(Dataset):
     def __init__(self, episodes, cfg, normalizer):
         # Resolve config once in the main process.
         self.chunk_size = int(cfg.model.chunk_size)
+        self.correction_label_mode = cfg.get('actor_sampling', {}).get('correction_label_mode', 'full_chunk')
+        self.has_corrections = any('actor_eligible' in ep for ep in episodes)
         self.exec_steps = int(cfg.env.exec_steps)
         self.discount = float(cfg.algo.discount)
         self.workspace_bounds = np.asarray(
@@ -122,6 +124,13 @@ class TrajectoryDataset(Dataset):
         row['action_chunk'] = norm.normalize(
             row['action_chunk'], 'action'
         )
+        if self.has_corrections:
+            ep = self.episodes[e]
+            length = (int(ep['actor_valid_length'][t]) if 'actor_valid_length' in ep else
+                      self.chunk_size if 'actor_eligible' not in ep or ep['actor_eligible'][t] else 0)
+            row['actor_mask'] = np.arange(self.chunk_size) < length
+            # Separate storage, in normalized coordinates. Never alter the Critic chunk.
+            row['actor_actions'] = np.where(row['actor_mask'][:, None], row['action_chunk'], 0.)
 
         return {
             k: torch.as_tensor(

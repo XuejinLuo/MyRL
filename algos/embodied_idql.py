@@ -38,12 +38,13 @@ class Policy_IDQL_Wrapper(nn.Module):
     def __init__(self, policy):
         super().__init__()
         self.policy = policy
-    def compute_loss(self, obs_dict, actions, reduction='mean'):
+    def compute_loss(self, obs_dict, actions, reduction='mean', action_mask=None):
         # 解包字典，传入 policy
         return self.policy.compute_loss(
             obs=obs_dict['pc'] if 'pc' in obs_dict and 'object_features' not in obs_dict else obs_dict,
             actions=actions,
             state=obs_dict['state'],
+            **({'action_mask': action_mask} if action_mask is not None else {}),
             **({'reduction': reduction} if reduction != 'mean' else {})
         )
     def parameters(self):
@@ -94,48 +95,67 @@ class EmbodiedIDQL(IDQL):
             "adv_for_actor": adv.detach()
         }
 
-    def update_actor(self, obs_dict, actions, adv=None, return_details=False, force_keep=None):
+    def update_actor(self, obs_dict, actions, adv=None, return_details=False, force_keep=None,
+                     action_mask=None):
         """ 改造：在对样本进行 Reject Sampling 过滤时，正确切割字典 """
         with torch.no_grad():
+            batch_size = actions.shape[0]
+            forced = (torch.zeros(batch_size, dtype=torch.bool, device=actions.device)
+                      if force_keep is None else force_keep)
+            if forced.shape != (batch_size,) or forced.dtype != torch.bool:
+                raise ValueError('force_keep must be a boolean per-sample mask')
+            partial = torch.zeros_like(forced)
+            if action_mask is not None:
+                if (action_mask.dtype != torch.bool or action_mask.shape != actions.shape[:2]
+                        or not action_mask.any(1).all()):
+                    raise ValueError('action_mask must be boolean [B,H] with a valid step per sample')
+                partial = ~action_mask.all(1)
+                if (partial & ~forced).any():
+                    raise ValueError('Partial correction labels require force_keep')
+            advantage_valid = ~partial
             if adv is None:
-                v = self.v_net(obs_dict)
-                q1, q2 = self.q_target(obs_dict, actions)
-                q = torch.minimum(q1, q2)
-                adv = q - v
-            adv_stable = adv - adv.max() 
-            weights = torch.exp(self.beta * adv_stable)
-            accept_prob = (weights / weights.max()).squeeze(-1)
-            
+                adv = actions.new_zeros((batch_size, 1))
+                if advantage_valid.any():
+                    q_obs = {k: v[advantage_valid] for k, v in obs_dict.items()}
+                    v = self.v_net(q_obs)
+                    q1, q2 = self.q_target(q_obs, actions[advantage_valid])
+                    adv[advantage_valid] = torch.minimum(q1, q2) - v
+            adv = adv.reshape(-1, 1)
+            if adv.shape[0] != batch_size or not torch.isfinite(adv[advantage_valid]).all():
+                raise ValueError('Invalid per-sample advantage')
+            # Partial labels have no Q meaning; do not let placeholders affect
+            # the rejection normalizer, metrics, or any other sample's probability.
+            adv = torch.where(advantage_valid[:, None], adv, 0.)
             if self.use_bc_only:
                 # 纯 BC 模式：所有样本强制设为 True，跳过过滤
                 keep_mask = torch.ones(actions.shape[0], dtype=torch.bool, device=actions.device)
             else:
                 # IDQL 模式：计算优势权重并进行拒绝采样 (Reject Sampling)
-                adv_stable = adv - adv.max() 
-                weights = torch.exp(self.beta * adv_stable)
-                accept_prob = (weights / weights.max()).squeeze(-1)
+                accept_prob = actions.new_zeros(batch_size)
+                if advantage_valid.any():
+                    values = adv[advantage_valid]
+                    weights = torch.exp(self.beta * (values - values.max()))
+                    accept_prob[advantage_valid] = (weights / weights.max()).squeeze(-1)
                 
                 random_u = torch.rand_like(accept_prob)
                 keep_mask = random_u < accept_prob
                 # 安全校验：防止全部被拒绝导致 Loss 为 NaN
-                if keep_mask.sum() == 0:
+                if keep_mask.sum() == 0 and advantage_valid.any():
                     keep_mask[torch.argmax(accept_prob)] = True
-            if force_keep is not None:
-                if force_keep.shape != keep_mask.shape or force_keep.dtype != torch.bool:
-                    raise ValueError('force_keep must be a boolean per-sample mask')
-                keep_mask |= force_keep
+            keep_mask |= forced
 
         # 使用 mask 过滤字典中的张量
         filtered_obs = {k: v_tensor[keep_mask] for k, v_tensor in obs_dict.items()}
         filtered_actions = actions[keep_mask]
+        mask_options = {} if action_mask is None else {'action_mask': action_mask[keep_mask]}
         
         if return_details:
-            sample_losses = self.actor.compute_loss(filtered_obs, filtered_actions, reduction='none')
+            sample_losses = self.actor.compute_loss(filtered_obs, filtered_actions, reduction='none', **mask_options)
             if sample_losses.shape != (int(keep_mask.sum()),):
                 raise ValueError('Expected one Actor loss per retained sample')
             actor_loss = sample_losses.mean()
         else:
-            actor_loss = self.actor.compute_loss(filtered_obs, filtered_actions)
+            actor_loss = self.actor.compute_loss(filtered_obs, filtered_actions, **mask_options)
         
         self.actor_opt.zero_grad()
         actor_loss.backward()
@@ -144,9 +164,10 @@ class EmbodiedIDQL(IDQL):
         metrics = {
             "loss/actor": actor_loss.item(), 
             "metrics/accept_ratio": keep_mask.float().mean().item(),
-            "metrics/adv_mean": adv.mean().item()
+            "metrics/adv_mean": adv[advantage_valid].mean().item() if advantage_valid.any() else 0.
         }
         if return_details:
             return metrics, dict(keep_mask=keep_mask.detach(), advantages=adv.detach().reshape(-1),
+                                 advantage_valid=advantage_valid.detach(),
                                  losses=sample_losses.detach())
         return metrics

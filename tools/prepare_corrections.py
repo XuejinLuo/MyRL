@@ -43,10 +43,14 @@ def main():
     parser.add_argument('--stats', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--review', action='store_true', help='Interactive terminal review before export')
+    parser.add_argument('--label-mode', choices=('full_chunk', 'masked'), default='full_chunk')
+    parser.add_argument('--min-valid-length', type=int, default=1,
+                        help='Minimum supervised steps in masked mode; recorded in the export')
     args = parser.parse_args()
     if args.review:
         review_session(args.session)
-    print(prepare(args.base_manifest, args.session, args.stats, args.output))
+    print(prepare(args.base_manifest, args.session, args.stats, args.output,
+                  args.label_mode, args.min_valid_length))
 
 
 if __name__ == '__main__':
