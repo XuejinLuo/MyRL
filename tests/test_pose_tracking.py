@@ -17,7 +17,8 @@ def rotate(q, v):
 
 
 @pytest.mark.parametrize('rotation_sign', [-1., 1.])
-def test_controller_inverse_obeys_installed_rotation_sign_and_rotated_root(rotation_sign):
+@pytest.mark.parametrize('position_cap,rotation_cap', [(.005,.03), (.02,.1)])
+def test_controller_inverse_obeys_installed_rotation_sign_and_rotated_root(rotation_sign, position_cap, rotation_cap):
     root = rotation([0, 0, 1], .8)
     current = np.r_[.1, .2, .3, rotation([1, 0, 0], 1.2)]
     def predict(action):
@@ -27,11 +28,20 @@ def test_controller_inverse_obeys_installed_rotation_sign_and_rotated_root(rotat
         world_q = quaternion_product(quaternion_product(root, local_q), root*np.array([1,-1,-1,-1]))
         return np.r_[current[:3]+rotate(root, action[:3]*.1), quaternion_product(world_q, current[3:])]
     target = np.r_[current[:3]+[.04, -.02, .01], quaternion_product(rotation([0, 1, 0], .2), current[3:])]
-    action = bounded_controller_action(predict, current, target, np.full(6, -1.), np.ones(6))
+    action = bounded_controller_action(predict, current, target, np.full(6, -1.), np.ones(6), position_cap, rotation_cap)
     expected = pose_error(target, current)
-    expected[:3] *= .005/np.linalg.norm(expected[:3])
-    expected[3:] *= .03/np.linalg.norm(expected[3:])
-    np.testing.assert_allclose(pose_error(predict(action), current), expected, atol=2e-6)
+    expected[:3] *= position_cap/np.linalg.norm(expected[:3])
+    expected[3:] *= rotation_cap/np.linalg.norm(expected[3:])
+    actual = pose_error(predict(action), current)
+    np.testing.assert_allclose(actual[:3], expected[:3], atol=2e-6)
+    if rotation_cap < .1:
+        np.testing.assert_allclose(actual[3:], expected[3:], atol=2e-6)
+    else:
+        # At the unit-ball limit, Euler components for a .1-rad world-axis
+        # target can require norm >1. Respect saturation, retaining direction.
+        magnitude = np.linalg.norm(actual[3:])
+        assert .99*rotation_cap <= magnitude <= rotation_cap+1e-6
+        np.testing.assert_allclose(actual[3:]/magnitude, expected[3:]/rotation_cap, atol=2e-4)
     assert np.linalg.norm(action[3:]) <= 1.
 
 
@@ -209,3 +219,41 @@ def test_finish_saves_review_but_keeps_viewer_environment_until_next_episode(tmp
     assert json.loads((tmp_path/'review.json').read_text())['episodes'][0]['segments'][0]['decision'] == 'pending'
     ui.close_resources()
     assert closes == ['events','writer','env'] and ui.env is None
+
+
+def test_dense_path_lookahead_reduces_primitive_count_without_relaxing_final_tolerance():
+    origin = np.array([0., 0, 0, 1, 0, 0, 0])
+    path = [origin + np.r_[x, np.zeros(6)] for x in np.linspace(0, .1, 101)]
+    counts = []
+    for cap in (.005, .02):
+        current = origin.copy()
+        tracker = WaypointTracker(path, lookahead_position=cap)
+        def convert(target):
+            # Translation-only ideal controller for counting path tracking steps.
+            delta = target[:3]-current[:3]
+            return delta*min(1., cap/max(np.linalg.norm(delta), 1e-12))
+        while (delta := tracker.action(current, convert)) is not None:
+            current[:3] += delta
+        assert tracker.status == 'reached'
+        assert np.linalg.norm(current[:3]-path[-1][:3]) < .002
+        counts.append(tracker.steps)
+    assert counts[1] < counts[0]/2
+
+
+def test_lookahead_does_not_skip_a_large_excursion_returning_near_start():
+    current = np.array([0., 0, 0, 1, 0, 0, 0])
+    a, b, c = current.copy(), current.copy(), current.copy()
+    a[0], b[0], c[0] = .01, .2, .015
+    tracker = WaypointTracker([a,b,c], lookahead_position=.02)
+    np.testing.assert_array_equal(tracker.action(current, lambda target: target), a)
+
+
+def test_speed_switch_cancels_path_and_uses_configured_normal_caps():
+    ui = SapienCollector.__new__(SapienCollector)
+    ui.args = SimpleNamespace(human_position_step=.015, human_rotation_step=.08)
+    ui.tracker, ui.gripper_steps, ui.fine = object(), 4, False
+    ui._message = lambda _: None
+    assert ui.motion_limits() == (.015,.08)
+    ui.toggle_speed()
+    assert ui.tracker is None and ui.gripper_steps == 0
+    assert ui.motion_limits() == (.005,.03)

@@ -23,6 +23,9 @@
 
 ## 启动
 
+**只想处理失败场景，建议先看[无人值守筛选 → 失败重放接管 → 混合训练指南](FAILURE_FOCUSED_TAKEOVER.md)。**
+下面仍是逐条观察的手动入口。
+
 先合并本 PR，在你已能运行官方 `interactive_panda` 的同一个 Python 环境里执行。
 此模式依赖 SAPIEN 与 ManiSkill motion planning（MPlib），不需要 Tk 图形窗口。
 若官方命令能运行，通常已经具备这些依赖；遇到缺失依赖按 ManiSkill 官方 motion planning 安装说明处理。
@@ -49,7 +52,10 @@ python -m tools.collection.human_takeover \
 |---|---|
 | P | 运行模型／交还控制权 |
 | H | 人工接管，选择并将目标重置到当前机械臂手部位置 |
+| Transform → Translate / Rotate | 分别显示平移箭头 / 旋转环；在 Local / World 中选择坐标轴 |
 | 鼠标拖拽 | 调整目标位置和姿态，只移动预览，不实际执行 |
+| Transform → Rotation | 直接输入三个角度（度），按 Enter 更新预览，再 N 执行 |
+| V | 普通 / 精细速度切换，取消当前路径；重新按 N 执行 |
 | N | 规划并执行当前拖拽目标 |
 | G | 切换开合夹爪，执行 10 个 primitive steps |
 | Space | 暂停并取消剩余规划路径/夹爪动作；在下一 primitive 边界停止 |
@@ -58,7 +64,8 @@ python -m tools.collection.human_takeover \
 | Q / 关闭窗口 | 保存当前有效轨迹并退出 |
 
 鼠标选择了其他对象时，N 会拒绝执行；再按 H 重新选择机械臂手部。
-H 会重置拖拽目标，因此先 H，再拖动，再 N。P / H / Space 都会取消未执行的人工路径。
+H 会重置拖拽目标，因此先 H，再在 Transform 面板选 Translate 或 Rotate，再拖动，再 N。
+只看到 XYZ 箭头时点 **Rotate**，不要按 H 来切换旋转；H 会把已调好的目标重置。P / H / Space 都会取消未执行的人工路径。
 官方 Control 面板可选择相机查看腕部画面；输出视频保留三个视角。
 如果使用官方 Control 的 Pause，程序会把它转为采集暂停；建议使用 MyRL 面板或 Space。
 按 N 后后台一次只执行一个 primitive step，界面继续响应，随时可以暂停或交还控制权。
@@ -81,11 +88,14 @@ H 会重置拖拽目标，因此先 H，再拖动，再 N。P / H / Space 都会
 - 目标离当前 TCP 超过 40 cm、规划失败或路径达到 150 个规划点时，不执行；调整为更近的子目标。
 - 每次跟踪限制最多 150 个真实控制步，达到任务终止条件会立即停止。
 - TCP 持续约 1 秒几乎不移动会中止当前路径；应退开、改变目标，避免持续顶压。
-- 到达判据为位置误差 <2 mm、旋转误差 <0.015 rad；这只是路径完成判据，不是任务 success。
+- 默认普通模式每步目标位移上限 20 mm、旋转上限 0.1 rad；合并邻近的密集规划点，避免逐点停靠。
+  V 切换为精细模式（不超过 5 mm / 0.03 rad），适合接近方块时微调；实际动作仍受冻结动作范围限制。
+- 最终目标到达判据为位置误差 <2 mm、旋转误差 <0.015 rad；中间点采用有限前瞻，不要求逐个停稳。
+  这只是路径完成判据，不是任务 success。
 - 运行时根据已安装控制器的纯动作→目标位姿计算，检查并转换旋转方向/缩放，不硬编码版本相关符号。
 - 目标 ghost、相机线框和坐标轴可能影响渲染。每次真实环境 step、相机/点云采集前移除它们，
   同时恢复实体不透明度；只在面向操作者的 Viewer 渲染时重建。不会把目标虚影当成策略输入。
-- `seed_*.targets.jsonl` 额外记录每次 N 的目标、规划方式和路径长度；原 actions/state/events/review 格式不变。
+- `traces/seed_*.targets.jsonl` 额外记录每次 N 的目标、规划方式和路径长度；实际 actions/state 语义保持；视频在 videos/，轨迹在 episodes/，元数据在 metadata/，事件在 traces/。
 - 自动失败提示仍只是启发式；不会自动指定恢复目标。人工接管成功率不能当成无人干预模型成功率。
 
 ## 审核、导入与训练
@@ -122,3 +132,5 @@ CPU 测试覆盖控制器旋转符号和旋转基坐标、动作限幅、规划 
 - [interactive_panda.py](https://github.com/mani-skill/ManiSkill/blob/main/mani_skill/examples/teleoperation/interactive_panda.py)
 - [motionplanner.py](https://github.com/mani-skill/ManiSkill/blob/main/mani_skill/examples/motionplanning/panda/motionplanner.py)
 - [SAPIEN TransformWindow](https://github.com/haosulab/SAPIEN/blob/master/python/py_package/utils/viewer/transform_window.py)
+
+旋转面板的官方实现参考：[SAPIEN renderer Gizmo](https://github.com/haosulab/sapien-vulkan-2/blob/master/src/ui/gizmo.cpp)。

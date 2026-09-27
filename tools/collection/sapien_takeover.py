@@ -58,11 +58,14 @@ def make_panel(owner):
     class Panel(Plugin):
         def get_ui_windows(self):
             if not hasattr(self, 'window'):
-                self.window = R.UIWindow().Label('MyRL takeover').Pos(420, 10).Size(450, 330)
+                self.window = R.UIWindow().Label('MyRL takeover').Pos(420, 10).Size(490, 440)
                 self.window.append(R.UIDisplayText().Bind(lambda: owner.status_text))
+                self.window.append(R.UIDisplayText().Bind(lambda:
+                    'Rotate: H -> Transform panel -> Rotate -> drag rings -> N.\n'
+                    'Rotation fields use degrees; Enter commits preview. Local/World selects axes.'))
                 for label, command in [('Run policy [P]', 'policy'), ('Pause/cancel [Space]', 'pause'),
                     ('Take over / select hand [H]', 'human'), ('Execute dragged target [N]', 'execute'),
-                    ('Toggle gripper [G]', 'gripper'), ('Finish/save [F]', 'finish'),
+                    ('Toggle gripper [G]', 'gripper'), ('Normal / fine speed [V]', 'speed'), ('Finish/save [F]', 'finish'),
                     ('Save + next seed [C]', 'next'), ('Save + quit [Q]', 'quit')]:
                     self.window.append(R.UIButton().Label(label).Callback(
                         lambda _, cmd=command: owner.commands.append(cmd)))
@@ -86,6 +89,7 @@ class SapienCollector(CollectorUI):
         self.quitting, self.faulted = False, False
         self.status_text, self.last_print = '', None
         self.planner, self.physical_state = None, None
+        self.fine = False
 
     def _init_viewer(self):
         from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver
@@ -135,7 +139,7 @@ class SapienCollector(CollectorUI):
             panel = self.render_panel()
             self.record_panel(panel, record)
         self.physical_state = copy_state(self.env.unwrapped.get_state_dict())
-        if self.viewer is None:
+        if self.viewer is None and not self.replaying:
             self._init_viewer()
         self.refresh_status()
 
@@ -144,10 +148,10 @@ class SapienCollector(CollectorUI):
             raise RuntimeError('Viewer changed simulator state without an action; this episode is excluded. '
                                'Use N/G, never teleport or external joint/state editors.')
 
-    def advance(self, action=None):
+    def advance(self, action=None, *, policy_action=None):
         self._assert_unchanged()
         with clean_render_scene(self.viewer, self.transform):
-            super().advance(action)
+            super().advance(action, policy_action=policy_action)
 
     def cancel_motion(self):
         self.tracker, self.gripper_steps = None, 0
@@ -161,7 +165,7 @@ class SapienCollector(CollectorUI):
         super().takeover()
         if self.active:
             self.select_hand()
-            self._message('Drag the ghost hand position/rotation, then N. G toggles gripper. P returns to policy.')
+            self._message('Transform: Translate for arrows, Rotate for rings; drag then N. G gripper; V fine/normal; P policy.')
 
     def run_policy(self):
         self.cancel_motion()
@@ -208,14 +212,30 @@ class SapienCollector(CollectorUI):
             tcp = raw.agent.robot.pose.sp * self.pin.get_link_pose(self.arm.ee_link.index)
             waypoints.append(np.r_[tcp.p, tcp.q])
         waypoints.append(target_vector)
+        position_step, rotation_step = self.motion_limits()
         self.tracker = WaypointTracker(waypoints, max_steps=150,
-                                      stall_steps=max(1, int(raw.control_freq)))
+            stall_steps=max(1, int(raw.control_freq)),
+            lookahead_position=position_step, lookahead_rotation=rotation_step)
         request = dict(step=self.control.steps, target_world=target_vector.tolist(),
                        planner='PandaArmMotionPlanningSolver.move_to_pose_with_screw(dry_run=True)',
-                       waypoints=len(waypoints), execution='closed-loop pd_ee_delta_pose')
-        with self.path.with_suffix('.targets.jsonl').open('a', encoding='utf-8') as f:
+                       waypoints=len(waypoints), execution='closed-loop pd_ee_delta_pose',
+                       position_step=position_step, rotation_step=rotation_step, fine=getattr(self, 'fine', False))
+        with getattr(self, 'targets_path', self.path.with_suffix('.targets.jsonl')).open('a', encoding='utf-8') as f:
             f.write(json.dumps(request)+'\n')
         self._message('Following planned TCP path. Space cancels at the next primitive boundary.')
+
+    def motion_limits(self):
+        args = getattr(self, 'args', None)
+        position = getattr(args, 'human_position_step', .02)
+        rotation = getattr(args, 'human_rotation_step', .1)
+        if getattr(self, 'fine', False):
+            position, rotation = min(position, .005), min(rotation, .03)
+        return position, rotation
+
+    def toggle_speed(self):
+        self.cancel_motion()
+        self.fine = not self.fine
+        self._message('Fine speed: drag then N again.' if self.fine else 'Normal speed: drag then N again.')
 
     def convert_target(self, target):
         arm = self.arm
@@ -228,7 +248,7 @@ class SapienCollector(CollectorUI):
                 predicted = arm.root_link.pose * arm.compute_target_pose(current_base, delta)
             return pose(predicted)
         action = bounded_controller_action(predict, current_world, target,
-                                           self.control.low[:6], self.control.high[:6])
+                                           self.control.low[:6], self.control.high[:6], *self.motion_limits())
         return np.r_[action, self.control.gripper].astype(np.float32)
 
     def toggle_gripper(self):
@@ -259,8 +279,10 @@ class SapienCollector(CollectorUI):
         if not hasattr(self, 'control'):
             return
         c = self.control
+        position_step, rotation_step = self.motion_limits()
         self.status_text = (f'Seed {self.seed}, step {c.steps}/{self.cfg.env.max_episode_steps}, {c.mode}\n'
             f'Success: {bool(c.info.get("success", False))}; hints: {", ".join(c.hints) or "none"}\n'
+            f"Human speed: {'fine' if getattr(self, 'fine', False) else 'normal'}; max {position_step*1000:g} mm / {np.degrees(rotation_step):.1f} deg per step\n"
             f'{self.notice}')
         if getattr(self, 'video_error', None):
             self.status_text += '\nVIDEO ERROR: '+self.video_error
@@ -292,9 +314,9 @@ class SapienCollector(CollectorUI):
     def loop(self):
         last_step = 0.
         keymap = {'p': 'policy', 'h': 'human', 'n': 'execute', 'g': 'gripper',
-                  'space': 'pause', 'f': 'finish', 'c': 'next', 'q': 'quit'}
+                  'v': 'speed', 'space': 'pause', 'f': 'finish', 'c': 'next', 'q': 'quit'}
         callbacks = dict(policy=self.run_policy, human=self.takeover, execute=self.execute_target,
-                         gripper=self.toggle_gripper, pause=self.pause, finish=self.finish)
+                         gripper=self.toggle_gripper, speed=self.toggle_speed, pause=self.pause, finish=self.finish)
         while not self.quitting:
             if self.viewer is None or self.viewer.closed:
                 if self.active:

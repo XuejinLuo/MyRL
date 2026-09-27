@@ -214,6 +214,10 @@ def test_actual_iterative_training_corrective_supervision_and_no_failed_actor(tm
     cfg = fixed_config(tmp_path, 'demo_success_correction')
     prepare_inputs(cfg, tmp_path)
     session = raw_session(cfg, tmp_path)
+    provenance_path = session/'session.json'
+    provenance = json.loads(provenance_path.read_text())
+    provenance['screening_seeds'] = [12000, 12001]
+    write_json(provenance_path, provenance)
     cfg.manifest = str(prepare(cfg.manifest, session, cfg.stats_path, tmp_path/'cleaned'))
     cfg.output = str(tmp_path/'trained')
     monkeypatch.setattr(iterative, 'build_base', lambda cfg, device: LossTinyPolicy().to(device))
@@ -230,15 +234,15 @@ def test_actual_iterative_training_corrective_supervision_and_no_failed_actor(tm
     assert last['Cumulative/Critic/rollout_failure/sampled'] > 0
     assert json.loads((Path(cfg.output)/'selection.json').read_text())['update_step'] == 0
     checkpoint = Path(cfg.output)/'checkpoints/best.pth'
-    assert torch.load(checkpoint, weights_only=True)['correction_training_seeds'] == [12000]
+    assert torch.load(checkpoint, weights_only=True)['correction_training_seeds'] == [12000, 12001]
     from evaluation import compare
     cfg.comparison.checkpoints = dict(after=str(checkpoint))
-    cfg.comparison.seed_start = 12000
+    cfg.comparison.seed_start = 12001
     cfg.comparison.output = str(tmp_path/'invalid_comparison')
     with pytest.raises(ValueError, match='human correction training seeds'):
         compare.run(cfg)
     cfg.comparison.seed_start = 13000
-    cfg.eval.seeds = [12000]
+    cfg.eval.seeds = [12001]
     cfg.output = str(tmp_path/'leaked')
     with pytest.raises(ValueError, match='Human correction seeds overlap'):
         iterative.run(cfg)
@@ -264,3 +268,24 @@ def test_human_preset_composes_and_validates():
         assert not cfg.collect
         assert cfg.env.control_mode == 'pd_ee_delta_pose'
         OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+
+
+def test_organized_session_import_and_metadata_path_guard(tmp_path):
+    cfg = fixed_config(tmp_path, 'demo_success_correction')
+    prepare_inputs(cfg, tmp_path)
+    session = raw_session(cfg, tmp_path)
+    (session/'episodes').mkdir()
+    (session/'metadata').mkdir()
+    (session/'seed_12000.npz').rename(session/'episodes'/'seed_12000.npz')
+    (session/'seed_12000.json').rename(session/'metadata'/'seed_12000.json')
+    review_path = session/'review.json'
+    review = json.loads(review_path.read_text())
+    review['episodes'][0].update(path='episodes/seed_12000.npz', metadata='metadata/seed_12000.json')
+    write_json(review_path, review)
+    manifest = prepare(cfg.manifest, session, cfg.stats_path, tmp_path/'cleaned_nested')
+    episodes, spec = load_sources(manifest)
+    assert episodes[-1]['actor_eligible'].sum() == 3
+    review['episodes'][0]['metadata'] = '../outside.json'
+    write_json(review_path, review)
+    with pytest.raises(ValueError, match='leaves'):
+        prepare(cfg.manifest, session, cfg.stats_path, tmp_path/'invalid_nested')

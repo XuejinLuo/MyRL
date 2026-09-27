@@ -59,7 +59,8 @@ def bounded_controller_action(predict, current, target, low, high, position_step
 
 class WaypointTracker:
     """Closed-loop finite path execution; every call returns at most one action."""
-    def __init__(self, waypoints, max_steps=150, stall_steps=20):
+    def __init__(self, waypoints, max_steps=150, stall_steps=20,
+                 lookahead_position=.02, lookahead_rotation=.1):
         self.waypoints = deque(np.asarray(p, float).copy() for p in waypoints)
         if not self.waypoints or max_steps < 1 or stall_steps < 1:
             raise ValueError('Empty path or invalid tracking budget')
@@ -67,6 +68,9 @@ class WaypointTracker:
             pose_error(p, p)
         self.max_steps, self.stall_steps = max_steps, stall_steps
         self.steps, self.stalled, self.previous = 0, 0, None
+        if lookahead_position <= 0 or lookahead_rotation <= 0:
+            raise ValueError('Lookahead must be positive')
+        self.lookahead_position, self.lookahead_rotation = lookahead_position, lookahead_rotation
         self.status = 'tracking'
 
     def action(self, current, convert):
@@ -90,4 +94,17 @@ class WaypointTracker:
                 return None
         self.previous = np.array(current, copy=True)
         self.steps += 1
+        # Retain the final goal's strict tolerance, but do not stop at every
+        # dense planner sample. Advance only along consecutive nearby waypoints;
+        # cap cumulative path distance/rotation so a loop cannot be shortcut.
+        first_error = pose_error(self.waypoints[0], current)
+        position, rotation = np.linalg.norm(first_error[:3]), np.linalg.norm(first_error[3:])
+        while len(self.waypoints) > 1:
+            delta = pose_error(self.waypoints[1], self.waypoints[0])
+            next_position = position + np.linalg.norm(delta[:3])
+            next_rotation = rotation + np.linalg.norm(delta[3:])
+            if next_position > self.lookahead_position or next_rotation > self.lookahead_rotation:
+                break
+            position, rotation = next_position, next_rotation
+            self.waypoints.popleft()
         return convert(self.waypoints[0])

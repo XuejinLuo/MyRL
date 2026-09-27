@@ -145,6 +145,8 @@ def run_iterations(cfg, wandb_run=None):
         episodes, spec = load_sources(state['manifest'])
         correction_training_seeds.update(int(item['seed']) for src in spec['sources']
                             if src.get('role') == 'human_correction' for item in src['episodes'])
+        correction_training_seeds.update(int(seed) for src in spec['sources']
+                            if src.get('role') == 'human_correction' for seed in src.get('screening_seeds', []))
         from data.corrections import held_out_seeds
         if correction_training_seeds & held_out_seeds(frozen):
             raise ValueError('Human correction seeds overlap validation/test seeds')

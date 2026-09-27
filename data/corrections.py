@@ -35,6 +35,12 @@ def eligible_starts(length, segments, chunk_size, final_success):
     return result
 
 
+def metadata_file(session, item):
+    # Legacy flat sessions remain readable without moving or re-hashing files.
+    from workflows.failure_queue import session_file
+    return session_file(session, item.get('metadata', str(Path(item['path']).with_suffix('.json'))))
+
+
 def prepare(base_manifest, session, stats_path, output):
     """Validate everything before exporting new immutable episodes/manifest."""
     base_manifest, session = Path(base_manifest).resolve(), Path(session).resolve()
@@ -54,6 +60,8 @@ def prepare(base_manifest, session, stats_path, output):
     if json.loads(Path(stats_path).read_text()) != provenance['normalizer']:
         raise ValueError('Use the frozen normalizer from the collection checkpoint')
     forbidden = held_out_seeds(config) | set(provenance.get('excluded_seeds', []))
+    if set(provenance.get('screening_seeds', [])) & forbidden:
+        raise ValueError('Screening seeds overlap validation/test seeds')
     bounds = provenance['normalizer']['action']
     lo, hi = np.asarray(bounds['min']), np.asarray(bounds['max'])
     seen, seen_raw = set(), set()
@@ -75,7 +83,7 @@ def prepare(base_manifest, session, stats_path, output):
         path = (session/item['path']).resolve()
         if not path.is_relative_to(session):
             raise ValueError('Episode path leaves session directory')
-        metadata_path = path.with_suffix('.json')
+        metadata_path = metadata_file(session, item)
         if digest(path) != item['sha256'] or digest(metadata_path) != item['metadata_sha256']:
             raise ValueError('Raw episode/metadata changed after collection')
         metadata = json.loads(metadata_path.read_text())
@@ -130,6 +138,7 @@ def prepare(base_manifest, session, stats_path, output):
         raise ValueError('Session source already imported')
     output.mkdir(parents=True)
     source = dict(name=name, role='human_correction', chunk_size=config['model']['chunk_size'],
+                  screening_seeds=provenance.get('screening_seeds', []),
                   session=str(session), session_sha256=digest(session/'session.json'),
                   review_sha256=digest(session/'review.json'), episodes=[])
     for i, (ep, item, meta) in enumerate(cleaned):
