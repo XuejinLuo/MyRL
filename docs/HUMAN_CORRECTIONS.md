@@ -74,7 +74,7 @@ Actor 仍使用 checkpoint 中的原始点云预处理、state、相机/机器�
 | T | 保持当前夹爪指令，推进仿真让夹爪/接触稳定 |
 | F | 保存并结束当前条；再点 Next seed |
 
-这是**按钮/键盘增量控制**，本 PR 未实现 3D 鼠标拖拽目标或运动规划接管。
+本节描述 `--ui buttons`；官方 3D 拖拽接管请用 `--ui sapien`，参见上方链接。
 移动前先按 H。按一下只执行选定的 1/5/10/20 个 primitive steps，等待操作时不会自动录入零动作。
 键盘长按不是连续遥操作，请按下后松开或点击按钮。
 
@@ -87,7 +87,7 @@ Actor 仍使用 checkpoint 中的原始点云预处理、state、相机/机器�
 夹爪通常需要多步才完全开合，可选择 10/20 步执行 G/B，或者用 T 等待。
 这些动作有实际动力学意义，清洗时不会因为位移小就删除。不要录入大量无意义的 T。
 暂停不消耗 horizon，人工执行会消耗；沿用 checkpoint 的 300 步等任务时限，不偷偷延长训练任务。
-若时间不足，保存为失败/截断，再用新场景采集更早的纠正。
+若时间不足，保存为失败/截断。建议使用[先筛选失败、再提前接管](FAILURE_FOCUSED_TAKEOVER.md)流程，在原 horizon 内预留恢复步数。
 
 例：空抓后，H → G 张开 → E 抬起 → 调整 X/Y 和角度 → Q 下降 → B 闭合 → T 稳定 → E 抬升。
 恢复后可继续人工堆叠，也可以 P 让模型完成。每次控制权切换都会分开标记。
@@ -115,11 +115,13 @@ Actor 仍使用 checkpoint 中的原始点云预处理、state、相机/机器�
 每个 session 包含：
 
 - `session.json`：checkpoint 哈希、冻结 config/normalizer、软件版本、种子和 sampler。
-- `seed_*.npz`：T 个真实执行动作、稀疏 success 奖励和终止标记；T+1 个真实点云/state。
-- `seed_*.events.jsonl`：每步 policy/human 来源、人工段编号、请求/执行动作、接触诊断和提示。
-- `seed_*.json`：人工段的 `[start, stop)`、结束原因、最终 success、可选诊断/录像错误。
-- `seed_*.mp4`：总览 + 相机画面 + 步号/来源；第 0 帧是 reset，第 k+1 帧对应第 k 步后。
-- `review.json`：默认所有数据待审核。未经审核不会进入训练。
+- `episodes/seed_*.npz`：T 个真实执行动作、稀疏 success 奖励和终止标记；T+1 个真实点云/state。
+- `traces/seed_*.events.jsonl`：每步 policy/human 来源、人工段编号、请求/执行动作、接触诊断和提示。
+- `metadata/seed_*.json`：人工段的 `[start, stop)`、结束原因、最终 success、可选诊断/录像错误。
+- `videos/seed_*.mp4`：总览 + 相机画面 + 步号/来源；第 0 帧是 reset，第 k+1 帧对应第 k 步后。
+- `review.json`：默认所有数据待审核，记录轨迹/元数据相对路径。未经审核不会进入训练。
+
+旧版平铺目录仍可直接审核和导入，不必手动搬移文件。
 
 F 提前结束时将最后一步标为 `truncated=True`，不会伪造成功或 terminated；Q/V 从真实最终观测 bootstrap。
 发生仿真/观测异常时暂停并写 error.json，该条不导出成有效数据；已完成条目仍保留，可重开新 session。

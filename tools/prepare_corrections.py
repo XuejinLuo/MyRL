@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 
-from data.corrections import prepare
+from data.corrections import prepare, metadata_file
 from utils.experiment import write_json
 
 
@@ -12,9 +12,12 @@ def review_session(session):
     review = json.loads(path.read_text())
     print('Watch the session videos before accepting. k=keep, c=critic only, d=drop.')
     for item in review['episodes']:
-        metadata = json.loads((Path(session)/item['path']).with_suffix('.json').read_text())
+        metadata = json.loads(metadata_file(session, item).read_text())
+        video = metadata.get('video')
+        if video and not Path(video).is_absolute():
+            video = str(Path(session).resolve()/video)
         print(f"\n{item['path']} | final_success={metadata['final_success']} | "
-              f"end={metadata['end_reason']} | video={metadata.get('video')}")
+              f"end={metadata['end_reason']} | video={video}")
         print('Suspected types:', metadata.get('failure_hints', []))
         choices = {'k': 'keep', 'c': 'critic_only', 'd': 'drop'}
         answer = input(f"Episode [{item['decision']}] k/c/d (Enter keeps decision): ").strip().lower()

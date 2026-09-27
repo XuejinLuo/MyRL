@@ -185,3 +185,8 @@ CPU 测试包含三个阶段的真实优化器更新、小型模拟环境、权�
 两个离线阶段新增 `Time/Train_Seconds`（包含数据加载、传输和更新）、`Time/Eval_Seconds`、`Time/Artifact_Seconds`（权重切换/保存/恢复）与 `Train/Samples_Per_Second`。GPU 在 epoch 计时边界同步；epoch 总耗时不包含末尾日志写入。BC/IDQL、batch size、数据量和采样接受率不同时，不能只按 GPU 占用率比较速度。
 
 已有输出不会被覆盖；崩溃后重跑需使用新的 `experiment`。当前 offline checkpoint 没有优化器状态，不支持从崩溃 epoch 精确续训；保留已保存的权重用于评估或后续阶段。
+
+### 失败场景人工纠正
+
+支持先无人值守筛选失败，再用官方 SAPIEN 拖拽界面重放、接管，审核后混合原示范与成功 rollout 训练。
+详见[失败筛选到混合训练完整指南](docs/FAILURE_FOCUSED_TAKEOVER.md)和[拖拽操作说明](docs/SAPIEN_DRAG_TAKEOVER.md)。

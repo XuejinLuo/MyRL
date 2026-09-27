@@ -80,10 +80,19 @@ class TakeoverController:
             self.segment = None
             self.mode = mode
 
-    def advance(self, human_action=None):
+    def advance(self, human_action=None, *, policy_action=None):
         if self.done or self.mode == 'paused':
             return False
-        if self.mode == 'policy':
+        if policy_action is not None and self.mode != 'policy':
+            raise ValueError('Recorded policy actions require policy mode')
+        if policy_action is not None:
+            if human_action is not None:
+                raise ValueError('Cannot mix human and policy replay actions')
+            requested = np.asarray(policy_action, dtype=np.float32)
+            if requested.shape != (7,) or not np.isfinite(requested).all() or (requested < self.low-1e-6).any() or (requested > self.high+1e-6).any():
+                raise ValueError('Invalid recorded policy action')
+            self.queue.clear()
+        elif self.mode == 'policy':
             if human_action is not None:
                 raise ValueError('Switch to human before issuing human actions')
             if not self.queue:
@@ -112,7 +121,7 @@ class TakeoverController:
         self.events.append(dict(step=self.steps, source=self.mode,
             segment_id=self.segment['id'] if self.mode == 'human' else None,
             requested_action=requested.tolist(), executed_action=action.tolist(),
-            clipped=bool(np.any(requested != action)), hints=self.hints, before=self.before, after=after))
+            clipped=bool(np.any(requested != action)), replayed_policy=policy_action is not None, hints=self.hints, before=self.before, after=after))
         self.steps += 1
         if self.mode == 'human':
             self.segment['stop'] = self.steps

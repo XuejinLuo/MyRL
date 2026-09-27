@@ -47,6 +47,15 @@ def parse_args():
     p.add_argument('--policy-delay-ms', type=int, default=100, help='Wall-clock delay between primitive steps')
     p.add_argument('--no-video', action='store_true')
     p.add_argument('--ui', choices=['sapien', 'buttons'], default='sapien')
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--screen-only', action='store_true', help='Unattended policy screening; save failed-seed queue, no GUI')
+    mode.add_argument('--failure-queue', help='Replay failed episodes from a screen-only failure_queue.json')
+    p.add_argument('--queue-start', type=int, default=0, help='Index into failures list; --episodes limits count')
+    p.add_argument('--recovery-reserve', type=int, default=180, help='Screening: minimum steps left for recovery within original horizon')
+    p.add_argument('--rewind-steps', type=int, default=20, help='Screening: pause this many steps before first sustained hint')
+    p.add_argument('--takeover-step', type=int, help='Screening: explicit prefix length, still subject to recovery reserve')
+    p.add_argument('--human-position-step', type=float, default=.02, help='SAPIEN: maximum desired TCP translation per primitive, metres')
+    p.add_argument('--human-rotation-step', type=float, default=.1, help='SAPIEN: maximum desired TCP rotation per primitive, radians')
     return p.parse_args()
 
 
@@ -57,6 +66,8 @@ class CollectorUI:
         self.index, self.active, self.running = -1, False, False
         self.env, self.writer, self.events_handle = None, None, None
         self.notice, self.review = '', dict(schema='myrl_human_review_v1', episodes=[])
+        self.replaying = False
+        self.failure_entries = getattr(args, 'failure_entries', [])
 
     def __init__(self, root, args, cfg, actor, encode, normalizer, output):
         import tkinter as tk
@@ -152,7 +163,8 @@ class CollectorUI:
             self.refresh_status()
             return
         from envs.factory import make_env
-        self.seed = self.args.seed_start+self.index
+        self.failure_entry = self.failure_entries[self.index] if self.failure_entries else None
+        self.seed = self.failure_entry['seed'] if self.failure_entry else self.args.seed_start+self.index
         seed_all(self.seed)
         holder = []
         def wrap(env):
@@ -181,18 +193,53 @@ class CollectorUI:
         self.telemetry.initial_height = self.control.before['cubeA_pose_world'][2]
         self.active, self.running = True, False
         self.warned, self.notice = set(), 'Paused. P runs policy; H takes over.'
-        self.path = self.output/f'seed_{self.seed}.npz'
-        self.events_handle = self.path.with_suffix('.events.jsonl').open('w', encoding='utf-8')
+        self.start_recording()
+        self.replaying = self.failure_entry is not None
+        self.draw(record=True)
+        if self.failure_entry is not None:
+            self.replay_prefix()
+
+    def start_recording(self):
+        for name in ('episodes', 'metadata', 'videos', 'traces'):
+            (self.output/name).mkdir(exist_ok=True)
+        stem = f'seed_{self.seed}'
+        self.path = self.output/'episodes'/f'{stem}.npz'
+        self.metadata_path = self.output/'metadata'/f'{stem}.json'
+        self.targets_path = self.output/'traces'/f'{stem}.targets.jsonl'
+        self.events_path = self.output/'traces'/f'{stem}.events.jsonl'
+        self.events_handle = self.events_path.open('w', encoding='utf-8')
         self.video_path, self.video_error = None, None
         if not self.args.no_video:
             try:
                 import imageio.v2 as imageio
-                self.video_path = str(self.path.with_suffix('.mp4'))
-                self.writer = imageio.get_writer(self.video_path, fps=int(raw.control_freq))
+                video = self.output/'videos'/f'{stem}.mp4'
+                self.video_path = str(video.relative_to(self.output))
+                self.writer = imageio.get_writer(str(video), fps=int(self.env.unwrapped.control_freq))
             except Exception as exc:
                 self.video_error = str(exc)
                 self.writer = None
-        self.draw(record=True)
+
+    def replay_prefix(self):
+        from workflows.failure_queue import check_replay_state, session_file
+        entry = self.failure_entry
+        path = session_file(Path(self.args.failure_queue).resolve().parent, entry['path'])
+        if digest(path) != entry['sha256']:
+            raise ValueError('Failure trace changed before replay')
+        print(f"Replaying failed seed {self.seed} to step {entry['takeover_step']} automatically...", flush=True)
+        with np.load(path, allow_pickle=False) as data:
+            check_replay_state(self.env.unwrapped.get_state_dict(), entry['state_schema'], data['states'][0], 0)
+            self.control.switch('policy')
+            for i in range(entry['takeover_step']):
+                self.advance(policy_action=data['actions'][i])
+                check_replay_state(self.env.unwrapped.get_state_dict(), entry['state_schema'], data['states'][i+1], i+1)
+                if self.control.done:
+                    raise ValueError('Replay ended before takeover; episode excluded')
+        self.replaying = False
+        self.draw(record=False)
+        self.takeover()
+        self.notice = f"Failed-seed replay verified. Human takeover at step {self.control.steps}; " + self.notice
+        print('\a'+self.notice, flush=True)
+        self.refresh_status()
 
     def run_policy(self):
         if self.active:
@@ -239,19 +286,19 @@ class CollectorUI:
                 break
             self.advance(action)
 
-    def advance(self, action=None):
-        if not self.control.advance(action):
+    def advance(self, action=None, *, policy_action=None):
+        if not self.control.advance(action, policy_action=policy_action):
             return
         self.events_handle.write(json.dumps(self.control.events[-1], allow_nan=False)+'\n')
         self.events_handle.flush()
-        if self.control.mode == 'policy' and self.args.auto_pause:
+        if self.control.mode == 'policy' and self.args.auto_pause and not self.replaying:
             new = set(self.control.hints)-self.warned
             if new:
                 self.warned.update(new)
                 self.pause()
                 self.notice = 'Sustained hint: '+', '.join(sorted(new))+'. H take over, P continue; not a definitive diagnosis.'
         self.draw(record=True)
-        if self.control.done:
+        if self.control.done and not self.replaying:
             self.finish()
 
     def render_panel(self):
@@ -321,9 +368,13 @@ class CollectorUI:
                         failure_hints=sorted({h for e in c.events for h in e['hints']}),
                         diagnostic_errors=self.telemetry.errors, video=self.video_path,
                         video_error=self.video_error)
-            write_json(self.path.with_suffix('.json'), meta)
-            self.review['episodes'].append(dict(path=self.path.name, sha256=digest(self.path),
-                metadata_sha256=digest(self.path.with_suffix('.json')), decision='pending',
+            meta.update(failure_screen=getattr(self, 'failure_entry', None),
+                        events=str(self.events_path.relative_to(self.output)) if hasattr(self, 'events_path') else None)
+            metadata_path = getattr(self, 'metadata_path', self.path.with_suffix('.json'))
+            write_json(metadata_path, meta)
+            self.review['episodes'].append(dict(path=str(self.path.relative_to(self.output)),
+                metadata=str(metadata_path.relative_to(self.output)), sha256=digest(self.path),
+                metadata_sha256=digest(metadata_path), decision='pending',
                 segments=[dict(s, decision='pending') for s in c.segments]))
             write_json(self.output/'review.json', self.review)
         self.active = False
@@ -352,8 +403,8 @@ class CollectorUI:
 
 
 def run(args):
-    if args.episodes < 1 or args.policy_delay_ms < 0:
-        raise ValueError('Invalid episode count/delay')
+    if args.episodes < 1 or args.policy_delay_ms < 0 or args.queue_start < 0 or args.rewind_steps < 0 or not 0 < args.human_position_step <= .05 or not 0 < args.human_rotation_step <= .2:
+        raise ValueError('Require positive episodes, nonnegative delay/queue-start/rewind, position step in (0, .05], rotation step in (0, .2]')
     output = Path(args.output).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f'{output}: use a new output directory')
@@ -364,8 +415,19 @@ def run(args):
     if cfg.env.env_id != 'StackCube-v1' or cfg.env.control_mode != 'pd_ee_delta_pose' or cfg.model.action_dim != 7:
         raise ValueError('Collector supports StackCube-v1 / Panda / pd_ee_delta_pose only')
     seeds = set(range(args.seed_start, args.seed_start+args.episodes))
-    if seeds & (held_out_seeds(config) | set(args.exclude_seeds)):
+    if not args.failure_queue and seeds & (held_out_seeds(config) | set(args.exclude_seeds)):
         raise ValueError('Collection seeds overlap evaluation/excluded seeds')
+    checkpoint_sha = digest(checkpoint)
+    failure_queue = None
+    if args.failure_queue:
+        from workflows.failure_queue import load_queue
+        failure_queue = load_queue(args.failure_queue, checkpoint_sha, config, cp['normalizer'], args.sampler,
+                                   held_out_seeds(config) | set(args.exclude_seeds))
+        args.failure_entries = failure_queue['failures'][args.queue_start:args.queue_start+args.episodes]
+        if not args.failure_entries:
+            raise ValueError('No failures in requested queue range; nothing to supervise')
+        args.episodes = len(args.failure_entries)
+        seeds = {item['seed'] for item in args.failure_entries}
     cfg.device = args.device
     normalizer = MinMaxNormalizer()
     normalizer.stats = cp['normalizer']
@@ -377,7 +439,9 @@ def run(args):
     actor.eval()
     encode = observation_encoder(cfg, actor, normalizer, args.device)
     root = None
-    if args.ui == 'buttons':
+    if args.screen_only:
+        from tools.collection.failure_screen import FailureScreen
+    elif args.ui == 'buttons':
         import tkinter as tk
         root = tk.Tk()
     else:
@@ -391,14 +455,22 @@ def run(args):
             packages[package] = version(package)
         except PackageNotFoundError:
             packages[package] = None
-    write_json(output/'session.json', dict(schema='myrl_human_session_v1', config=config,
-        checkpoint=str(checkpoint), checkpoint_sha256=digest(checkpoint), normalizer=cp['normalizer'],
+    provenance = dict(schema='myrl_human_session_v1', config=config,
+        checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_sha, normalizer=cp['normalizer'],
         sampler=args.sampler, ui=args.ui, versions=packages, seeds=sorted(seeds), excluded_seeds=args.exclude_seeds,
         weight_key='ema_model_state_dict' if 'ema_model_state_dict' in cp else 'model_state_dict',
-        intervention_success_is_not_autonomous_evaluation=True))
+        screening_seeds=failure_queue['seeds'] if failure_queue else [],
+        failure_queue_sha256=digest(args.failure_queue) if args.failure_queue else None,
+        human_position_step=args.human_position_step, human_rotation_step=args.human_rotation_step,
+        intervention_success_is_not_autonomous_evaluation=True)
+    write_json(output/'session.json', provenance)
     write_json(output/'review.json', dict(schema='myrl_human_review_v1', episodes=[]))
     ui = None
     try:
+        if args.screen_only:
+            ui = FailureScreen(args, cfg, actor, encode, normalizer, output)
+            ui.scan(provenance)
+            return
         ui = (CollectorUI(root, args, cfg, actor, encode, normalizer, output) if root is not None else
               SapienCollector(args, cfg, actor, encode, normalizer, output))
         ui.next_episode()
