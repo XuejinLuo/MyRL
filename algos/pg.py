@@ -14,20 +14,30 @@ class PPORatioDiverged(FloatingPointError):
 
 @torch.no_grad()
 def compute_gae(rewards, values, next_values, terminated, dones, lengths,
-                gamma=0.99, gae_lambda=0.95):
+                gamma=0.99, gae_lambda=0.95, *, bootstrap_mask=None, trace_mask=None):
     if not all(x.shape == rewards.shape for x in (values, next_values, terminated, dones, lengths)):
         raise ValueError('GAE inputs must have identical shapes')
     if len(rewards) == 0 or torch.any(lengths < 1):
         raise ValueError('Empty rollout or invalid chunk lengths')
+    bootstrap_mask = 1 - terminated if bootstrap_mask is None else bootstrap_mask
+    trace_mask = 1 - dones if trace_mask is None else trace_mask
+    for mask in (bootstrap_mask, trace_mask):
+        if mask.shape != rewards.shape or not torch.all((mask == 0) | (mask == 1)):
+            raise ValueError('GAE masks must be binary and match rewards')
     adv = torch.zeros_like(rewards)
     carry = torch.zeros_like(rewards[0])
     for t in reversed(range(len(rewards))):
         discount = gamma ** lengths[t]
-        delta = rewards[t] + discount * (1 - terminated[t]) * next_values[t] - values[t]
+        delta = rewards[t] + discount * bootstrap_mask[t] * next_values[t] - values[t]
         # gamma is per primitive step; lambda is per decision, as in RL-100.
-        carry = delta + discount * gae_lambda * (1 - dones[t]) * carry
+        carry = delta + discount * gae_lambda * trace_mask[t] * carry
         adv[t] = carry
     return adv, adv + values
+
+
+def normalize_advantages(advantages):
+    advantages = advantages.detach()
+    return (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-5)
 
 
 def sum_event_logprob(logprob, prefix_steps=None):
@@ -108,15 +118,14 @@ class FlowPPO:
                    'ppo/stop_kl': 0., 'ppo/max_abs_log_ratio': 0.,
                    'ppo/update_version': 2,
                    'ppo/replay_logprob_error': self.verify_rollout(batch, batch_size) if verify else 0.}
-        advantages = advantages.detach()
-        advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-5)
+        advantages = normalize_advantages(advantages)
         records, value_losses = [], []
         step_kls = [[] for _ in range(num_steps)]
         stop_actor = not actor_enabled
         for _ in range(epochs):
             for idx in torch.randperm(len(returns), device=returns.device).split(batch_size):
                 old_values = batch['values'][idx] if actor_enabled else None
-                value_losses.append(self.update_critic(batch['features'][idx], returns[idx], old_values))
+                value_losses.append(self.update_critic(batch.get('critic_features', batch['features'])[idx], returns[idx], old_values))
                 if stop_actor:
                     continue
                 self.actor_optimizer.zero_grad(set_to_none=True)

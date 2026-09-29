@@ -8,7 +8,7 @@ from envs.chunk_wrapper import ChunkActionWrapper
 from envs.object_centric_wrapper import ObjectCentricObservationWrapper
 from data.observations import observation_mode, sampling_config, validate_observation_config, relational_enabled
 
-def make_env(cfg, primitive_wrapper=None, video=None):
+def make_env(cfg, primitive_wrapper=None, video=None, reward_mode=None):
     """ 创建并包装 ManiSkill 真实仿真环境 """
 
     objects = validate_observation_config(cfg.env)
@@ -27,7 +27,8 @@ def make_env(cfg, primitive_wrapper=None, video=None):
         obs_mode=obs_mode,
         control_mode=control_mode,
         render_mode=render_mode,
-        max_episode_steps=cfg.env.get("max_episode_steps", 300)
+        max_episode_steps=cfg.env.get("max_episode_steps", 300),
+        **({'reward_mode': reward_mode} if reward_mode is not None else {})
     )
     
     # 2. 接入 ManiSkill 数据适配器 (转换为 {'xyz', 'rgb', 'state'})
@@ -64,5 +65,4 @@ def make_env(cfg, primitive_wrapper=None, video=None):
     )
     
     return env
-
 

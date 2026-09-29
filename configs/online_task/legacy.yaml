@@ -1,0 +1,8 @@
+# Historical dense-reward behavior and checkpoint selection.
+reward_mode: env
+success_reward: 1.0
+end_on_success: false
+timeout_semantics: continuing_bootstrap
+critic_use_remaining_time: false
+environment_reward_mode: null  # preserve installed default; actual mode recorded at runtime
+selection: success_then_env_reward

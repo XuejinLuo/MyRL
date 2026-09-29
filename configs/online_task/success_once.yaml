@@ -1,0 +1,7 @@
+reward_mode: success_once
+success_reward: 1.0
+end_on_success: true
+timeout_semantics: finite_horizon
+critic_use_remaining_time: true
+environment_reward_mode: null  # raw diagnostic reward; runtime mode persisted separately
+selection: success_only

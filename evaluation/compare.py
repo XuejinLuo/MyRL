@@ -34,12 +34,13 @@ def run(settings):
     if out.exists():
         raise FileExistsError(f'{out}: select a new comparison.output')
     # Preflight every input before producing a partially comparable report.
-    inputs, protocol, observation_protocols = [], None, {}
+    inputs, protocol, observation_protocols, training_protocols = [], None, {}, {}
     for label, checkpoint in options.checkpoints.items():
         if Path(label).name != label or label in ('.', '..'):
             raise ValueError('Comparison labels must be simple directory names')
         path = Path(checkpoint).expanduser().resolve()
         cp = torch.load(path, map_location='cpu', weights_only=True)
+        training_protocols[label] = cp.get('online_protocol')
         if 'config' not in cp or 'normalizer' not in cp:
             raise ValueError(f'{path}: requires embedded config and normalizer')
         cfg = OmegaConf.create(cp['config'])
@@ -81,6 +82,8 @@ def run(settings):
                              checkpoint_sha256=digest(path), **result))
         del base, cp
     write_json(out/'summary.json', dict(protocol=protocol, observations=observation_protocols,
+                                       training_protocols=training_protocols,
+                                       benchmark_reward_adapter='none',
                                        test_seeds=seeds, results=rows))
     with (out/'summary.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))

@@ -2,6 +2,7 @@
 steps_per_epoch: 2048  # chunk decisions; actual primitive steps logged separately
 update_epochs: 1
 critic_warmup_epochs: 5  # adaptation: old actor-only checkpoint has no compatible V
+critic_warmup_update_epochs: null  # null preserves update_epochs; only applies with Actor frozen
 actor_lr: 1.0e-7
 critic_lr: 3.0e-4
 clip_ratio: 0.2
