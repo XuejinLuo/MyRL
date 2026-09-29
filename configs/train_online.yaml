@@ -2,6 +2,7 @@
 defaults:
   - config
   - algo: pg
+  - online_task: legacy
   - _self_
 stage: online
 run_name: ${experiment}_online
@@ -13,3 +14,9 @@ save_epoch: ${stages.online.save_every}
 resume: ${stages.online.resume}
 eval_only: false
 quiet: false
+online_diagnostics:
+  enabled: true  # false disables optional phase stats / traces, not episode summaries
+  value_before_after: true
+  task_phase_stats: true
+  trace_max_episodes: 20
+  trace_max_steps_per_episode: 300

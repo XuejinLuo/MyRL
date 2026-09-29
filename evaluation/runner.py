@@ -52,6 +52,8 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
         try:
             seed_all(int(seeds[0]))
             env = make_env()
+            runtime_environment = dict(environment_class=f'{type(env.unwrapped).__module__}.{type(env.unwrapped).__name__}',
+                                       actual_reward_mode=getattr(env.unwrapped, 'reward_mode', None))
             actor.eval()
             for seed in seeds:
                 pbar.set_postfix(seed=int(seed), refresh=False)
@@ -121,5 +123,6 @@ def evaluate_policy(make_env, actor, encode, normalizer, seeds, num_steps,
             writer.writerows(rows)
         write_json(directory/'summary.json', dict(schema='myrl_eval_v1',
             success_definition='any primitive step reports success',
+            runtime_environment=runtime_environment,
             seeds=[int(s) for s in seeds], metadata=metadata or {}, **result))
     return result
