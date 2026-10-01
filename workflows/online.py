@@ -15,7 +15,8 @@ from algos.pg import FlowPPO, normalize_advantages
 from utils.normalizer import MinMaxNormalizer
 from utils.experiment import evaluation_paths, log_metrics, write_selection, selection_score
 from evaluation.runner import evaluate_policy, seed_all
-from models.checkpoint import FORMAT, policy_weights, make_actor, payload
+from models.checkpoint import (FORMAT, policy_weights, make_actor, payload,
+                               load_checkpoint, checkpoint_primitives)
 from envs.online_task import task_protocol, check_resume_protocol, wrap_training_env
 from utils.online_diagnostics import value_metrics
 from envs.online_vector import SingleOnlineEnv, GPUOnlineEnv
@@ -33,7 +34,7 @@ def online_selection_score(result, protocol):
 def atomic_checkpoint(state, path):
     """An interrupted write must not destroy the previous resumable checkpoint."""
     temporary = path + '.tmp'
-    torch.save(state, temporary)
+    torch.save(checkpoint_primitives(state), temporary)
     os.replace(temporary, path)
 
 
@@ -119,7 +120,7 @@ def run(cfg, env_factory=None):
     if not source:
         raise ValueError('Set stages.online.initial_ckpt to an existing checkpoint')
     source = hydra.utils.to_absolute_path(source)
-    checkpoint = torch.load(source, map_location=device, weights_only=True)
+    checkpoint = load_checkpoint(source, map_location=device)
     if cfg.resume and (checkpoint.get('format') != FORMAT or not all(k in checkpoint for k in ('critic', 'actor_optimizer', 'critic_optimizer', 'total_env_steps'))):
         raise ValueError('resume requires an online epoch_*.pth or last.pth with optimizer state; best.pth is for initialization/evaluation')
     if cfg.resume:

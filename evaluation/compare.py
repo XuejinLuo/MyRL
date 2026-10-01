@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 from models.factory import build_base
-from models.checkpoint import policy_weights
+from models.checkpoint import policy_weights, load_checkpoint
 from utils.normalizer import MinMaxNormalizer
 from utils.experiment import evaluate_base, write_json
 from data.episodes import digest
@@ -39,7 +39,7 @@ def run(settings):
         if Path(label).name != label or label in ('.', '..'):
             raise ValueError('Comparison labels must be simple directory names')
         path = Path(checkpoint).expanduser().resolve()
-        cp = torch.load(path, map_location='cpu', weights_only=True)
+        cp = load_checkpoint(path, map_location='cpu')
         training_protocols[label] = cp.get('online_protocol')
         if 'config' not in cp or 'normalizer' not in cp:
             raise ValueError(f'{path}: requires embedded config and normalizer')
@@ -68,7 +68,7 @@ def run(settings):
     OmegaConf.save(settings, out/'config.yaml', resolve=True)
     rows = []
     for label, path, cfg in inputs:
-        cp = torch.load(path, map_location=settings.device, weights_only=True)
+        cp = load_checkpoint(path, map_location=settings.device)
         cfg.video = dict(every=1 if settings.video.episodes else 0, episodes=settings.video.episodes)
         base = build_base(cfg, settings.device)
         base.load_state_dict(policy_weights(cp), strict=True)

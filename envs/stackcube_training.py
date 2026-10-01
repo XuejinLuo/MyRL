@@ -37,5 +37,5 @@ def stackcube_state(env):
 def shaped_reward(success, before, after, terminal, protocol):
     """Terminal potential is zero at BOTH success and the finite task deadline."""
     terminal_potential = 0. if terminal else after
-    return (float(success) * protocol['success_reward']
-            + protocol['potential_scale'] * (protocol['gamma'] * terminal_potential - before))
+    return float(float(success) * protocol['success_reward']
+                 + protocol['potential_scale'] * (protocol['gamma'] * terminal_potential - before))
