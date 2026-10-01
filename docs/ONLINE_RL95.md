@@ -77,6 +77,12 @@ CPU 单环境替代路径可设 `online_rollout.backend=cpu online_rollout.num_e
 
 ## 4. 继续训练到累计 1000 万步
 
+如果旧版报 `Unsupported global: numpy.core.multiarray.scalar`，这是 PR #18 将 NumPy
+奖励标量写进 checkpoint 导致的序列化兼容问题。更新到包含修复的代码后直接重跑续训命令，
+会在 `weights_only=True` 下兼容读取旧数值标量，并将后续保存的指标转换为 Python 原生类型。
+无需重新训练 100 万步或覆盖原 checkpoint；模型、Critic、优化器和累计步数保持恢复。
+OpenGL 的 `No OpenGL_accelerate module loaded` 信息不是这个异常的原因。
+
 ```bash
 python train_online.py --config-name train_online_rl \
   stages.online.resume=outputs/StackCube-v1/oc_budget/online_rl01/checkpoints/last.pth \

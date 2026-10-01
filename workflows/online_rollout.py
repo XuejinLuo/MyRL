@@ -54,7 +54,7 @@ class OnlineCollector:
                 masks.append(boundary_masks(bool(terms[i]), bool(truncs[i]), self.protocol))
                 decisions.append(self.diagnostics[i].record(info['online_transitions'], values[i].item(), reward, epoch))
                 counts['raw'] += sum(e['raw_reward'] for e in info['online_transitions'])
-                counts['training'] += sum(e['training_reward'] for e in info['online_transitions'])
+                counts['training'] += float(sum(e['training_reward'] for e in info['online_transitions']))
                 counts['clipped'] += int((np.abs(raw[i, :lengths[i]]) > 1.1).sum())
                 counts['actions'] += raw[i, :lengths[i]].size
                 self.episode_success[i] |= bool(info.get('success_any', info.get('success', False)))
