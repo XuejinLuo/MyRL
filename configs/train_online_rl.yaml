@@ -1,0 +1,53 @@
+# Complete online RL profile. Actor initialization remains compatible with oc_budget.
+defaults:
+  - train_online
+  - override online_task: stackcube_rl
+  - _self_
+experiment: oc_budget
+output: ${paths.root}/online_rl01
+env:
+  observation:
+    mode: global_object_budget
+    relational_features: false
+  sampling:
+    mode: object_budget
+    objects:
+      - {name: cubeA, h5_id: 18, num_points: 256}
+      - {name: cubeB, h5_id: 19, num_points: 256}
+online_rollout:
+  backend: gpu
+  num_envs: 32
+online_training:
+  total_env_steps: 1000000
+  eval_every_env_steps: 100000
+  target_success_rate: 0.95
+  keep_epoch_checkpoints: false
+stages:
+  online:
+    epochs: 100000  # secondary safety cap; environment-step budget ends the run
+    save_every: 10
+algo:
+  steps_per_epoch: 128  # per environment: 4096 chunk decisions for 32 environments
+  update_epochs: 4
+  critic_warmup_epochs: 5
+  critic_warmup_update_epochs: 8
+  actor_lr: 1.0e-7
+  critic_lr: 3.0e-4
+  gamma: 1.0
+  gae_lambda: 0.95
+  value_clip: null
+eval:
+  seeds: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
+          2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019,
+          2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028, 2029,
+          2030, 2031, 2032, 2033, 2034, 2035, 2036, 2037, 2038, 2039,
+          2040, 2041, 2042, 2043, 2044, 2045, 2046, 2047, 2048, 2049,
+          2050, 2051, 2052, 2053, 2054, 2055, 2056, 2057, 2058, 2059,
+          2060, 2061, 2062, 2063, 2064, 2065, 2066, 2067, 2068, 2069,
+          2070, 2071, 2072, 2073, 2074, 2075, 2076, 2077, 2078, 2079,
+          2080, 2081, 2082, 2083, 2084, 2085, 2086, 2087, 2088, 2089,
+          2090, 2091, 2092, 2093, 2094, 2095, 2096, 2097, 2098, 2099]
+video:
+  episodes: 0
+online_diagnostics:
+  trace_max_episodes: 1

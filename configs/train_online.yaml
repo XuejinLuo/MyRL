@@ -14,6 +14,14 @@ save_epoch: ${stages.online.save_every}
 resume: ${stages.online.resume}
 eval_only: false
 quiet: false
+online_rollout:
+  backend: cpu
+  num_envs: 1
+online_training:
+  total_env_steps: null  # absolute total including warmup and resumed steps
+  eval_every_env_steps: null  # null preserves epoch-based evaluation
+  target_success_rate: 0.95  # reporting target, never a guarantee or automatic stop
+  keep_epoch_checkpoints: true
 online_diagnostics:
   enabled: true  # false disables optional phase stats / traces, not episode summaries
   value_before_after: true

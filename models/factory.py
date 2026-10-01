@@ -34,3 +34,15 @@ def observation_encoder(cfg, actor, normalizer, device):
             return actor.encode(tensors['pc'], tensors['state'])
         return actor.encode(tensors)
     return encode
+
+
+def batched_observation_encoder(cfg, actor, normalizer, device):
+    """Batch visual inference while retaining the exact single-observation transforms."""
+    tensorize = observation_tensorizer(cfg, normalizer, device)
+    def encode(observations):
+        rows = [tensorize(obs) for obs in observations]
+        tensors = {k: torch.cat([row[k] for row in rows], dim=0) for k in rows[0]}
+        if 'pc' in tensors and 'object_features' not in tensors:
+            return actor.encode(tensors['pc'], tensors['state'])
+        return actor.encode(tensors)
+    return encode

@@ -22,14 +22,30 @@ def task_protocol(cfg):
         selection=options.get('selection', 'success_then_env_reward'),
         critic_input_dim=int(cfg.model.cond_dim) + int(options.get('critic_use_remaining_time', False)),
         critic_input_format='frozen_features_remaining_time_v1' if options.get('critic_use_remaining_time', False) else 'frozen_features_v1')
-    if mode not in ('env', 'success_once'):
-        raise ValueError('online_task.reward_mode must be env or success_once')
+    privileged = options.get('critic_input', 'features') == 'privileged_stackcube'
+    if options.get('critic_input', 'features') not in ('features', 'privileged_stackcube'):
+        raise ValueError('Unknown online_task.critic_input')
+    if privileged or mode == 'success_potential':
+        if cfg.env.get('env_id') != 'StackCube-v1' or cfg.model.state_dim != 16:
+            raise ValueError('Privileged state/potential currently supports StackCube-v1 with Panda only')
+        protocol.update(version=2, potential_scale=float(options.get('potential_scale', 1.0)),
+                        potential_version='stackcube_progress_v1')
+        if not math.isfinite(protocol['potential_scale']) or protocol['potential_scale'] < 0:
+            raise ValueError('potential_scale must be finite and nonnegative')
+    if privileged:
+        from envs.stackcube_training import PRIVILEGED_DIM
+        protocol.update(critic_input_dim=PRIVILEGED_DIM + int(protocol['critic_use_remaining_time']),
+                        critic_input_format='privileged_stackcube_v1')
+    if mode not in ('env', 'success_once', 'success_potential'):
+        raise ValueError('Unknown online_task.reward_mode')
+    if mode == 'success_potential' and not finite:
+        raise ValueError('success_potential requires finite_horizon')
     if protocol['timeout_semantics'] not in ('finite_horizon', 'continuing_bootstrap'):
         raise ValueError('Invalid online_task.timeout_semantics')
     if finite and not protocol['critic_use_remaining_time']:
         raise ValueError('finite_horizon requires critic_use_remaining_time=true')
-    if mode == 'success_once' and not protocol['end_on_success']:
-        raise ValueError('success_once requires end_on_success=true')
+    if mode in ('success_once', 'success_potential') and not protocol['end_on_success']:
+        raise ValueError('Success rewards require end_on_success=true')
     if protocol['horizon'] < 1 or not math.isfinite(protocol['success_reward']) or protocol['success_reward'] <= 0:
         raise ValueError('Invalid task horizon/success_reward')
     if protocol['selection'] not in ('success_only', 'success_then_env_reward'):
@@ -50,12 +66,18 @@ def check_resume_protocol(checkpoint, current):
             'to start with a NEW Critic and optimizers.')
 
 
-def critic_features(features, elapsed, protocol):
+def critic_features(features, elapsed, protocol, privileged=None):
+    import torch
+    if protocol['critic_input_format'] == 'privileged_stackcube_v1':
+        if privileged is None:
+            raise ValueError('Missing training-only privileged Critic state')
+        features = torch.as_tensor(privileged, device=features.device, dtype=features.dtype).reshape(features.shape[0], -1)
     if not protocol['critic_use_remaining_time']:
         return features
-    import torch
-    remaining = max(0., (protocol['horizon'] - elapsed) / protocol['horizon'])
-    return torch.cat((features, features.new_full((features.shape[0], 1), remaining)), dim=-1)
+    elapsed = torch.as_tensor(elapsed, device=features.device, dtype=features.dtype)
+    remaining = ((protocol['horizon'] - elapsed) / protocol['horizon']).clamp(0, 1)
+    remaining = remaining.expand(features.shape[0]).reshape(-1, 1)
+    return torch.cat((features, remaining), dim=-1)
 
 
 def boundary_masks(terminated, truncated, protocol):
@@ -65,6 +87,9 @@ def boundary_masks(terminated, truncated, protocol):
 
 def task_phase(info):
     """Only reported task flags; missing flags stay unknown, not inferred from motion."""
+    info = dict(info)
+    if 'is_grasped' not in info and 'is_cubeA_grasped' in info:
+        info['is_grasped'] = info['is_cubeA_grasped']
     keys = ('success', 'is_grasped', 'is_cubeA_on_cubeB', 'is_cubeA_static')
     flags = {key: bool(info[key]) if key in info else None for key in keys}
     if flags['success']:
@@ -87,9 +112,22 @@ class OnlineTaskWrapper(gym.Wrapper):
         self.elapsed = 0
         self.ended = False
 
+    def training_state(self, info):
+        info = dict(info)
+        if (self.protocol['critic_input_format'] == 'privileged_stackcube_v1'
+                or self.protocol['reward_mode'] == 'success_potential'):
+            from envs.stackcube_training import stackcube_state
+            state, potential, flags = stackcube_state(self.env)
+            info.update({k: bool(v[0]) for k, v in flags.items()})
+            info['privileged_state'] = state[0].cpu().numpy()
+            info['potential'] = float(potential[0])
+        return info
+
     def reset(self, **kwargs):
         self.elapsed, self.ended = 0, False
         obs, info = self.env.reset(**kwargs)
+        info = self.training_state(info)
+        self.potential = info.get('potential', 0.)
         self.phase, _ = task_phase(info)
         return obs, info
 
@@ -97,8 +135,8 @@ class OnlineTaskWrapper(gym.Wrapper):
         if self.ended:
             raise RuntimeError('Reset required after online task boundary')
         obs, raw_reward, raw_terminated, raw_truncated, info = self.env.step(action)
-        info = dict(info)
-        if 'success' not in info and self.protocol['reward_mode'] == 'success_once':
+        info = self.training_state(info)
+        if 'success' not in info and self.protocol['reward_mode'] in ('success_once', 'success_potential'):
             raise ValueError('success_once requires an explicit environment info[success]')
         self.elapsed += 1
         success = bool(info.get('success', False))
@@ -109,6 +147,10 @@ class OnlineTaskWrapper(gym.Wrapper):
         self.ended = terminated or truncated
         reward = (float(success) * self.protocol['success_reward']
                   if self.protocol['reward_mode'] == 'success_once' else float(raw_reward))
+        if self.protocol['reward_mode'] == 'success_potential':
+            from envs.stackcube_training import shaped_reward
+            reward = shaped_reward(success, self.potential, info['potential'], self.ended, self.protocol)
+            self.potential = info['potential']
         reason = ('success' if success else 'failure' if raw_terminated else
                   'timeout' if truncated else None) if self.ended else None
         phase, flags = task_phase(info)

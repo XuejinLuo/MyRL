@@ -36,6 +36,10 @@ python train_iterative.py
 python train_online.py
 ```
 
+StackCube 持续在线 RL（GPU 并行、训练专用真实状态 Critic、过程奖励与 95% 目标验收）：
+见 [ONLINE_RL95.md](docs/ONLINE_RL95.md)。使用 `python train_online.py --config-name train_online_rl`；
+首次运行先执行指南中的 GPU 短程检查。
+
 每条命令只运行对应阶段，不自动启动后续阶段。无须手填上一阶段带时间戳的目录，也无须拼接长命令。
 
 - 默认任务为 StackCube，演示路径随任务和控制模式变化，使用当前用户的 `~/.maniskill/demos/`；也可直接修改 `dataset.data_path`。

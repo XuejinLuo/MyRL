@@ -21,7 +21,7 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
             'state': gym.spaces.Box(-np.inf, np.inf, shape=(state_dim,), dtype=np.float32)
         })
 
-    def observation(self, obs):
+    def observation(self, obs, target_ids=None):
         # 辅助函数：防御性兼容 (ManiSkill GPU 模式返回 Tensor，CPU 模式返回 numpy)
         def to_np(x):
             return x.cpu().numpy() if hasattr(x, 'cpu') else np.array(x)
@@ -87,6 +87,6 @@ class ManiSkillToRL100Wrapper(gym.ObservationWrapper):
             from data.pointcloud import resolve_target_ids
             result['segmentation'] = segmentation
             # Scene IDs can change after reconfiguration/reset.
-            result['target_ids'] = resolve_target_ids(
+            result['target_ids'] = target_ids if target_ids is not None else resolve_target_ids(
                 self.sampling_objects, self.unwrapped.segmentation_id_map)
         return result
