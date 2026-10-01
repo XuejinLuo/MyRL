@@ -3,22 +3,23 @@ import json
 import copy
 from importlib.metadata import version, PackageNotFoundError
 import os
+import time
 from datetime import datetime
 import numpy as np
 import torch
 import hydra
 from omegaconf import OmegaConf
-from tqdm import tqdm
-from models.factory import build_base, observation_encoder
+from models.factory import build_base, observation_encoder, batched_observation_encoder
 from models.critics.q_v_network import VNetwork
-from algos.pg import FlowPPO, compute_gae, normalize_advantages
+from algos.pg import FlowPPO, normalize_advantages
 from utils.normalizer import MinMaxNormalizer
 from utils.experiment import evaluation_paths, log_metrics, write_selection, selection_score
 from evaluation.runner import evaluate_policy, seed_all
 from models.checkpoint import FORMAT, policy_weights, make_actor, payload
-from envs.online_task import (task_protocol, check_resume_protocol, critic_features,
-                             boundary_masks, wrap_training_env)
-from utils.online_diagnostics import EpisodeDiagnostics, value_metrics
+from envs.online_task import task_protocol, check_resume_protocol, wrap_training_env
+from utils.online_diagnostics import value_metrics
+from envs.online_vector import SingleOnlineEnv, GPUOnlineEnv
+from workflows.online_rollout import OnlineCollector
 from utils.experiment import write_json
 from data.episodes import digest
 
@@ -27,6 +28,13 @@ def online_selection_score(result, protocol):
     if protocol['selection'] == 'success_only':
         return (result['Eval/Success_Rate'],)
     return selection_score(result)
+
+
+def atomic_checkpoint(state, path):
+    """An interrupted write must not destroy the previous resumable checkpoint."""
+    temporary = path + '.tmp'
+    torch.save(state, temporary)
+    os.replace(temporary, path)
 
 
 def runtime_protocol(env):
@@ -41,6 +49,25 @@ def runtime_protocol(env):
 
 
 def validate(cfg):
+    rollout = cfg.get('online_rollout', {})
+    backend, n = rollout.get('backend', 'cpu'), rollout.get('num_envs', 1)
+    if backend not in ('cpu', 'gpu') or n < 1 or (backend == 'cpu' and n != 1):
+        raise ValueError('Use cpu with num_envs=1, or gpu with num_envs>=1')
+    if backend == 'gpu':
+        from data.observations import observation_mode, relational_enabled
+        if (cfg.env.get('env_id') != 'StackCube-v1' or cfg.env.obs_mode != 'pointcloud'
+                or observation_mode(cfg.env) not in ('global_random', 'global_object_budget')
+                or relational_enabled(cfg.env)):
+            raise ValueError('GPU online currently supports StackCube global pointcloud observations without relational features')
+        if (cfg.online_task.reward_mode not in ('success_once', 'success_potential')
+                or cfg.online_task.timeout_semantics != 'finite_horizon'):
+            raise ValueError('GPU rollout requires success reward and finite_horizon')
+    training = cfg.get('online_training', {})
+    for key in ('total_env_steps', 'eval_every_env_steps'):
+        if training.get(key) is not None and training[key] < 1:
+            raise ValueError(f'{key} must be positive or null')
+    if not 0 < training.get('target_success_rate', .95) <= 1:
+        raise ValueError('target_success_rate must be in (0, 1]')
     for value in (cfg.algo.steps_per_epoch, cfg.algo.update_epochs, cfg.batch_size,
                   cfg.eval.every, cfg.save_epoch, cfg.epochs, cfg.model.num_inference_steps):
         if value < 1:
@@ -77,6 +104,11 @@ def run(cfg, env_factory=None):
         validate_common(cfg)
     validate(cfg)
     protocol = task_protocol(cfg)
+    rollout = cfg.get('online_rollout', {})
+    training = cfg.get('online_training', {})
+    budget = training.get('total_env_steps')
+    eval_interval = training.get('eval_every_env_steps')
+    keep_epochs = training.get('keep_epoch_checkpoints', True)
     custom_env_factory = env_factory is not None
     if env_factory is None:
         from envs.factory import make_env
@@ -148,20 +180,30 @@ def run(cfg, env_factory=None):
         start_epoch, total_steps = checkpoint['epoch'], checkpoint['total_env_steps']
         if cfg.epochs <= start_epoch and not cfg.eval_only:
             raise ValueError('epochs must exceed the resumed epoch')
+    if budget is not None and total_steps >= budget and not cfg.eval_only:
+        raise ValueError('total_env_steps must exceed the resumed total')
     encode = observation_encoder(cfg, actor, normalizer, device)
+    encode_many = (batched_observation_encoder(cfg, actor, normalizer, device)
+                   if rollout.get('backend', 'cpu') == 'gpu' else
+                   lambda observations: torch.cat([encode(obs) for obs in observations], dim=0))
 
     def evaluate(mode, epoch=0):
         previous = actor.eval_mode
         actor.eval_mode = mode
         try:
             destination, video = evaluation_paths(cfg, run_dir, epoch, sampler=mode)
+            metadata = dict(stage='online', round=None, split='validation', epoch=epoch, sampler=mode,
+                checkpoint=os.path.join(run_dir, 'checkpoints', f'epoch_{epoch:04d}.pth' if keep_epochs else 'last.pth'),
+                env=OmegaConf.to_container(cfg.env, resolve=True), training_protocol=protocol,
+                benchmark_protocol={**benchmark_protocol, 'sampler': mode})
+            if rollout.get('backend', 'cpu') == 'gpu':
+                from evaluation.online_worker import isolated_evaluate
+                return isolated_evaluate(cfg, base.state_dict(), normalizer.stats,
+                                         mode, destination, video, metadata)
             factory = env_factory if custom_env_factory else lambda: make_env(cfg, video=video)
             return evaluate_policy(factory, actor, encode, normalizer,
                 list(cfg.eval.seeds), cfg.model.num_inference_steps, output_dir=destination,
-                metadata=dict(stage='online', round=None, split='validation', epoch=epoch, sampler=mode,
-                              checkpoint=os.path.join(run_dir, 'checkpoints', f'epoch_{epoch:04d}.pth'),
-                              env=OmegaConf.to_container(cfg.env, resolve=True),
-                              training_protocol=protocol, benchmark_protocol={**benchmark_protocol, 'sampler': mode}))
+                metadata=metadata)
         finally:
             actor.eval_mode = previous
 
@@ -191,7 +233,7 @@ def run(cfg, env_factory=None):
         has_eval = 'Eval/Success_Rate' in metrics
         has_checkpoint = has_eval or epoch % cfg.save_epoch == 0 or epoch == cfg.epochs
         log_metrics(run_dir, epoch, metrics, stage='online', sampler=cfg.eval.sampler,
-            checkpoint=os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth') if has_checkpoint else None,
+            checkpoint=os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth' if keep_epochs else 'last.pth') if has_checkpoint else None,
             evaluation=str(evaluation_paths(cfg, run_dir, epoch)[0]) if has_eval else None)
         if wandb_run:
             wandb_run.log(metrics, step=epoch)
@@ -199,7 +241,6 @@ def run(cfg, env_factory=None):
 
     best_score, best_metrics, env = None, None, None
     best_state = None
-    diagnostics = None
     runtime = None
     source_hash = digest(source)
     provenance = dict(source_checkpoint=source, source_sha256=source_hash,
@@ -221,7 +262,7 @@ def run(cfg, env_factory=None):
             best_score, best_metrics = score, result
             best_state = copy.deepcopy(snapshot(epoch, result))
             best_state['model_state_dict'] = {k: v.cpu() for k, v in best_state['model_state_dict'].items()}
-            torch.save(best_state, os.path.join(ckpt_dir, 'best.pth'))
+            atomic_checkpoint(best_state, os.path.join(ckpt_dir, 'best.pth'))
             write_selection(run_dir, epoch, result, os.path.join(ckpt_dir, 'best.pth'), stage='online',
                 criterion=['Eval/Success_Rate'] if protocol['selection'] == 'success_only' else None)
 
@@ -230,103 +271,50 @@ def run(cfg, env_factory=None):
         state.update({'critic': critic.state_dict(), 'actor_optimizer': trainer.actor_optimizer.state_dict(),
             'critic_optimizer': trainer.critic_optimizer.state_dict(), 'total_env_steps': total_steps,
             'selection_best': best_state})
-        torch.save(state, os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth'))
-        torch.save(state, os.path.join(ckpt_dir, 'last.pth'))
+        if keep_epochs:
+            atomic_checkpoint(state, os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth'))
+        atomic_checkpoint(state, os.path.join(ckpt_dir, 'last.pth'))
 
     try:
         # Benchmark factory stays unadapted; only the training env receives this wrapper.
-        env = (env_factory() if custom_env_factory else
-               make_env(cfg, **({'reward_mode': protocol['environment_reward_mode']}
-                               if protocol['environment_reward_mode'] is not None else {})))
+        if rollout.get('backend', 'cpu') == 'gpu':
+            if custom_env_factory:
+                raise ValueError('Custom single-environment factory cannot be used with GPU rollout')
+            env = GPUOnlineEnv(cfg, protocol)
+        else:
+            raw_env = (env_factory() if custom_env_factory else
+                       make_env(cfg, **({'reward_mode': protocol['environment_reward_mode']}
+                                       if protocol['environment_reward_mode'] is not None else {})))
+            env = SingleOnlineEnv(wrap_training_env(raw_env, protocol))
         runtime = runtime_protocol(env)
+        if rollout.get('backend', 'cpu') == 'gpu':
+            runtime.update(training_backend='physx_cuda', training_num_envs=env.num_envs)
         if cfg.resume and checkpoint.get('runtime_protocol') not in (None, runtime):
             raise ValueError('Runtime environment/reward mode differs from resumed checkpoint')
-        env = wrap_training_env(env, protocol)
         write_json(os.path.join(run_dir, 'protocol.json'), dict(training=protocol,
             benchmark=benchmark_protocol, runtime=runtime, **provenance))
         print(json.dumps(dict(training_protocol=protocol, runtime=runtime)), flush=True)
-        diagnostics = EpisodeDiagnostics(os.path.join(run_dir, 'diagnostics'), cfg.algo.gamma,
-                                         cfg.get('online_diagnostics'))
         if cfg.resume and checkpoint.get('selection_best'):
             best_state = checkpoint['selection_best']
             best_state['model_state_dict'] = {k: v.cpu() for k, v in best_state['model_state_dict'].items()}
             best_metrics = best_state['metrics']
             best_score = online_selection_score(best_metrics, protocol)
-            torch.save(best_state, os.path.join(ckpt_dir, 'best.pth'))
+            atomic_checkpoint(best_state, os.path.join(ckpt_dir, 'best.pth'))
             write_selection(run_dir, best_state['epoch'], best_metrics, os.path.join(ckpt_dir, 'best.pth'),
                 stage='online', criterion=['Eval/Success_Rate'] if protocol['selection'] == 'success_only' else None)
         baseline = evaluate(cfg.eval.sampler, start_epoch)
         log(start_epoch, baseline)
         save_best(start_epoch, baseline)
         save_epoch(start_epoch, baseline)
-        torch.save(snapshot(start_epoch, baseline), os.path.join(ckpt_dir, 'initial_policy.pth'))
+        atomic_checkpoint(snapshot(start_epoch, baseline), os.path.join(ckpt_dir, 'initial_policy.pth'))
         # Resume resets the simulator at an epoch boundary, not an exact trajectory continuation.
-        obs, _ = env.reset(seed=cfg.seed + start_epoch)
-        features = encode(obs)
-        episode_success = False
-        elapsed = 0
+        collector = OnlineCollector(env, actor, critic, encode_many, normalizer, cfg, protocol,
+                                    os.path.join(run_dir, 'diagnostics'), cfg.seed + start_epoch)
+        last_eval_steps = total_steps
         for epoch in range(start_epoch + 1, cfg.epochs + 1):
-            data = {key: [] for key in ('features', 'chains', 'logprobs', 'rewards', 'values',
-                'next_values', 'terminated', 'dones', 'lengths', 'critic_features', 'bootstrap_mask', 'trace_mask')}
-            diagnostic_decisions = []
-            training_reward_sum = 0.
-            reward_sum, successes, episodes, env_steps, clipped_count, action_count = 0., 0, 0, 0, 0, 0
-            actor.eval()
-            critic.eval()
-            for _ in tqdm(range(cfg.algo.steps_per_epoch), desc=f'Epoch {epoch} rollout', disable=cfg.quiet):
-                with torch.no_grad():
-                    action, chain, logprob = actor.collect(features)
-                    value_input = critic_features(features, elapsed, protocol)
-                    value = critic(value_input).item()
-                raw = action[0].cpu().numpy()
-                if not np.isfinite(raw).all():
-                    raise FloatingPointError('Nonfinite generated action')
-                # Clipping is a fixed environment transform. NEVER overwrite latent
-                # chain/logprobs with clipped or physically executed actions.
-                nxt, reward, terminated, truncated, info = env.step(normalizer.unnormalize(raw, 'action'))
-                terminated, truncated = bool(terminated), bool(truncated)
-                done = terminated or truncated
-                length = int(info['actual_steps'])
-                rewards = np.asarray(info['primitive_rewards'], dtype=np.float64)
-                if rewards.shape != (length,) or not 1 <= length <= cfg.env.exec_steps:
-                    raise ValueError('Invalid primitive reward/length metadata from ChunkActionWrapper')
-                discounted_reward = float(np.dot(cfg.algo.gamma ** np.arange(length), rewards)) * cfg.algo.reward_scale
-                next_features = encode(nxt)  # BEFORE reset: time-limit bootstrap uses final observation
-                elapsed += length
-                next_value_input = critic_features(next_features, elapsed, protocol)
-                bootstrap_mask, trace_mask = boundary_masks(terminated, truncated, protocol)
-                with torch.no_grad():
-                    next_value = critic(next_value_input).item() if bootstrap_mask else 0.
-                diagnostic_decisions.append(diagnostics.record(info['online_transitions'], value,
-                                                               discounted_reward, epoch))
-                row = dict(features=features[0].cpu(), chains=chain[0].cpu(), logprobs=logprob[0].cpu(),
-                    rewards=discounted_reward, values=value, next_values=next_value,
-                    terminated=float(terminated), dones=float(done), lengths=length,
-                    critic_features=value_input[0].cpu(), bootstrap_mask=bootstrap_mask, trace_mask=trace_mask)
-                for key, val in row.items():
-                    data[key].append(val)
-                clipped_count += int((np.abs(raw[:length]) > 1.1).sum())
-                action_count += raw[:length].size
-                reward_sum += sum(e['raw_reward'] for e in info['online_transitions'])
-                training_reward_sum += sum(e['training_reward'] for e in info['online_transitions'])
-                env_steps += length
-                episode_success |= bool(info.get('success_any', info.get('success', False)))
-                if done:
-                    successes += int(episode_success)
-                    episodes += 1
-                    episode_success = False
-                    elapsed = 0
-                    obs, _ = env.reset()
-                    features = encode(obs)
-                else:
-                    features = next_features
-            batch = {key: (torch.stack(vals).to(device) if torch.is_tensor(vals[0]) else
-                torch.as_tensor(vals, dtype=torch.float32, device=device)) for key, vals in data.items()}
-            if not all(torch.isfinite(v).all() for v in batch.values()):
-                raise FloatingPointError('Nonfinite rollout')
-            adv, returns = compute_gae(batch['rewards'], batch['values'], batch['next_values'],
-                batch['terminated'], batch['dones'], batch['lengths'], cfg.algo.gamma, cfg.algo.gae_lambda,
-                bootstrap_mask=batch['bootstrap_mask'], trace_mask=batch['trace_mask'])
+            batch, adv, returns, rollout_metrics = collector.collect(epoch,
+                None if budget is None else budget - total_steps)
+            env_steps = rollout_metrics['Env/Steps']
             # Freeze one target for both diagnostics; after is training-set fit.
             frozen_returns = returns.detach().clone()
             before = value_metrics(batch['values'], frozen_returns)
@@ -334,9 +322,11 @@ def run(cfg, env_factory=None):
             update_epochs = cfg.algo.update_epochs if actor_enabled else (
                 cfg.algo.get('critic_warmup_update_epochs') or cfg.algo.update_epochs)
             normalized = normalize_advantages(adv)
-            diagnostics.attach_advantages(diagnostic_decisions, adv, normalized, actor_enabled)
+            collector.attach_advantages(adv, normalized, actor_enabled)
+            update_started = time.perf_counter()
             metrics = trainer.update(batch, adv, frozen_returns, cfg.batch_size, update_epochs,
                 actor_enabled=actor_enabled, verify=cfg.algo.verify_logprobs)
+            metrics['Perf/Update_Seconds'] = time.perf_counter() - update_started
             total_steps += env_steps
             with torch.no_grad():
                 predicted = critic(batch['critic_features']).squeeze(-1)
@@ -344,11 +334,8 @@ def run(cfg, env_factory=None):
             if cfg.get('online_diagnostics', {}).get('value_before_after', True):
                 for label, values in (('Before', before), ('After', after)):
                     metrics.update({f'Value/{label}/{key}': val for key, val in values.items()})
-            metrics.update({'Env/Reward': reward_sum, 'Env/Raw_Reward': reward_sum,
-                'Train/Reward': training_reward_sum, 'Env/Episodes': episodes, 'Env/Success_Count': successes,
-                'Env/Success_Rate': successes / episodes if episodes else None,
-                'Env/Steps': env_steps, 'Env/Total_Steps': total_steps,
-                'Action/Normalization_Clip_Fraction': clipped_count / max(action_count, 1),
+            metrics.update(rollout_metrics)
+            metrics.update({'Env/Total_Steps': total_steps,
                 'Value/Explained_Variance': after['Explained_Variance'],
                 'Value/Return_Mean': frozen_returns.mean().item(),
                 'Adv/Mean': adv.mean().item(), 'Adv/Std': adv.std(unbiased=False).item(),
@@ -357,15 +344,26 @@ def run(cfg, env_factory=None):
                 'Adv/Normalized_Std': normalized.std(unbiased=False).item(),
                 'Adv/Normalized_Positive_Fraction': (normalized > 0).float().mean().item(),
                 'Adv/Actor_Enabled': actor_enabled})
-            metrics.update(diagnostics.flush(epoch, final=epoch == cfg.epochs))
-            if epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
+            final = epoch == cfg.epochs or (budget is not None and total_steps >= budget)
+            metrics.update(collector.flush(epoch, final=final))
+            do_eval = final or (total_steps - last_eval_steps >= eval_interval if eval_interval else epoch % cfg.eval.every == 0)
+            if do_eval:
                 result = evaluate(cfg.eval.sampler, epoch)
                 metrics.update(result)
                 metrics['Eval/Delta_Success'] = result['Eval/Success_Rate'] - baseline['Eval/Success_Rate']
                 save_best(epoch, result)
+                last_eval_steps = total_steps
+                target = float(training.get('target_success_rate', .95))
+                write_json(os.path.join(run_dir, 'goal_status.json'), dict(
+                    target_success_rate=target, validation_success_rate=result['Eval/Success_Rate'],
+                    validation_target_met=result['Eval/Success_Rate'] >= target,
+                    best_validation_success_rate=best_metrics['Eval/Success_Rate'],
+                    total_env_steps=total_steps, final=final, independent_test_required=True))
             log(epoch, metrics)
-            if epoch % cfg.save_epoch == 0 or epoch % cfg.eval.every == 0 or epoch == cfg.epochs:
+            if epoch % cfg.save_epoch == 0 or do_eval or final:
                 save_epoch(epoch, metrics)
+            if final:
+                break
         return {'run_dir': run_dir, 'best_metrics': best_metrics, 'total_env_steps': total_steps}
     finally:
         if env is not None:
