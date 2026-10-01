@@ -244,7 +244,7 @@ def test_target_report_uses_counts_and_distinguishes_confidence():
         target_report(summary, stage='missing')
 
 
-def test_isolated_evaluation_request_and_error_propagation(monkeypatch):
+def test_isolated_evaluation_request_and_error_propagation(monkeypatch, tmp_path):
     import subprocess
     from evaluation import online_worker
     cfg = profile()
@@ -258,10 +258,12 @@ def test_isolated_evaluation_request_and_error_propagation(monkeypatch):
         Path(command[-1]).write_text(json.dumps({'Eval/Success_Rate': .5}))
     monkeypatch.setattr(online_worker.subprocess, 'run', process)
     result = online_worker.isolated_evaluate(cfg, {'test': torch.ones(1)}, {}, 'cps',
-        'test', None, dict(benchmark_protocol=dict(adapter='none')))
+        tmp_path, None, dict(benchmark_protocol=dict(adapter='none')))
     assert result['Eval/Success_Rate'] == .5 and len(called) == 1
     def failed(*args, **kwargs):
         raise subprocess.CalledProcessError(1, 'worker')
     monkeypatch.setattr(online_worker.subprocess, 'run', failed)
     with pytest.raises(subprocess.CalledProcessError):
-        online_worker.isolated_evaluate(cfg, {}, {}, 'cps', 'test', None, {})
+        online_worker.isolated_evaluate(cfg, {}, {}, 'cps', tmp_path, None, {})
+    failure = json.loads((tmp_path/'worker_failure.json').read_text())
+    assert failure['attempt'] == 2 and not failure['recovered']

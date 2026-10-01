@@ -64,6 +64,8 @@ def validate(cfg):
                 or cfg.online_task.timeout_semantics != 'finite_horizon'):
             raise ValueError('GPU rollout requires success reward and finite_horizon')
     training = cfg.get('online_training', {})
+    if training.get('eval_worker_retries', 1) < 0:
+        raise ValueError('eval_worker_retries must be nonnegative')
     for key in ('total_env_steps', 'eval_every_env_steps'):
         if training.get(key) is not None and training[key] < 1:
             raise ValueError(f'{key} must be positive or null')
@@ -179,9 +181,10 @@ def run(cfg, env_factory=None):
         for group in trainer.critic_optimizer.param_groups:
             group['lr'] = cfg.algo.critic_lr
         start_epoch, total_steps = checkpoint['epoch'], checkpoint['total_env_steps']
-        if cfg.epochs <= start_epoch and not cfg.eval_only:
+        if cfg.epochs <= start_epoch and not cfg.eval_only and not checkpoint.get('evaluation_pending', False):
             raise ValueError('epochs must exceed the resumed epoch')
-    if budget is not None and total_steps >= budget and not cfg.eval_only:
+    if (budget is not None and total_steps >= budget and not cfg.eval_only
+            and not (cfg.resume and checkpoint.get('evaluation_pending', False))):
         raise ValueError('total_env_steps must exceed the resumed total')
     encode = observation_encoder(cfg, actor, normalizer, device)
     encode_many = (batched_observation_encoder(cfg, actor, normalizer, device)
@@ -267,11 +270,11 @@ def run(cfg, env_factory=None):
             write_selection(run_dir, epoch, result, os.path.join(ckpt_dir, 'best.pth'), stage='online',
                 criterion=['Eval/Success_Rate'] if protocol['selection'] == 'success_only' else None)
 
-    def save_epoch(epoch, metrics):
+    def save_epoch(epoch, metrics, evaluation_pending=False):
         state = snapshot(epoch, metrics)
         state.update({'critic': critic.state_dict(), 'actor_optimizer': trainer.actor_optimizer.state_dict(),
             'critic_optimizer': trainer.critic_optimizer.state_dict(), 'total_env_steps': total_steps,
-            'selection_best': best_state})
+            'selection_best': best_state, 'evaluation_pending': evaluation_pending})
         if keep_epochs:
             atomic_checkpoint(state, os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth'))
         atomic_checkpoint(state, os.path.join(ckpt_dir, 'last.pth'))
@@ -303,11 +306,22 @@ def run(cfg, env_factory=None):
             atomic_checkpoint(best_state, os.path.join(ckpt_dir, 'best.pth'))
             write_selection(run_dir, best_state['epoch'], best_metrics, os.path.join(ckpt_dir, 'best.pth'),
                 stage='online', criterion=['Eval/Success_Rate'] if protocol['selection'] == 'success_only' else None)
+        # Persist even the current resume state BEFORE launching a fallible worker.
+        save_epoch(start_epoch, checkpoint.get('metrics', {}) if cfg.resume else {}, evaluation_pending=True)
         baseline = evaluate(cfg.eval.sampler, start_epoch)
         log(start_epoch, baseline)
         save_best(start_epoch, baseline)
         save_epoch(start_epoch, baseline)
         atomic_checkpoint(snapshot(start_epoch, baseline), os.path.join(ckpt_dir, 'initial_policy.pth'))
+        if start_epoch >= cfg.epochs or (budget is not None and total_steps >= budget):
+            # Recover a failed final evaluation without taking another optimizer step.
+            target = float(training.get('target_success_rate', .95))
+            write_json(os.path.join(run_dir, 'goal_status.json'), dict(
+                target_success_rate=target, validation_success_rate=baseline['Eval/Success_Rate'],
+                validation_target_met=baseline['Eval/Success_Rate'] >= target,
+                best_validation_success_rate=best_metrics['Eval/Success_Rate'],
+                total_env_steps=total_steps, final=True, independent_test_required=True))
+            return {'run_dir': run_dir, 'best_metrics': best_metrics, 'total_env_steps': total_steps}
         # Resume resets the simulator at an epoch boundary, not an exact trajectory continuation.
         collector = OnlineCollector(env, actor, critic, encode_many, normalizer, cfg, protocol,
                                     os.path.join(run_dir, 'diagnostics'), cfg.seed + start_epoch)
@@ -349,7 +363,14 @@ def run(cfg, env_factory=None):
             metrics.update(collector.flush(epoch, final=final))
             do_eval = final or (total_steps - last_eval_steps >= eval_interval if eval_interval else epoch % cfg.eval.every == 0)
             if do_eval:
-                result = evaluate(cfg.eval.sampler, epoch)
+                save_epoch(epoch, metrics, evaluation_pending=True)
+                try:
+                    result = evaluate(cfg.eval.sampler, epoch)
+                except Exception:
+                    print(f'Evaluation failed after epoch {epoch}; training state is saved at '
+                          f'{os.path.join(ckpt_dir, "last.pth")}. Resume from this checkpoint '
+                          'with a new output directory after fixing the worker error.', flush=True)
+                    raise
                 metrics.update(result)
                 metrics['Eval/Delta_Success'] = result['Eval/Success_Rate'] - baseline['Eval/Success_Rate']
                 save_best(epoch, result)

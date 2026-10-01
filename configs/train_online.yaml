@@ -22,6 +22,7 @@ online_training:
   eval_every_env_steps: null  # null preserves epoch-based evaluation
   target_success_rate: 0.95  # reporting target, never a guarantee or automatic stop
   keep_epoch_checkpoints: true
+  eval_worker_retries: 1  # one fresh-process retry; persistent failure remains fatal
 online_diagnostics:
   enabled: true  # false disables optional phase stats / traces, not episode summaries
   value_before_after: true

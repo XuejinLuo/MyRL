@@ -122,6 +122,54 @@ python -m tools.diagnostics.check_success_target \
 
 ## 日志与回传
 
+### 评估子进程导入失败后的恢复
+
+若 traceback 落在 `evaluation.online_worker -> mani_skill -> IPython -> prompt_toolkit -> wcwidth`
+的导入链，说明本次评估还未进入仿真。仅凭 traceback 不能断言具体版本冲突、安装损坏或偶发进程异常，
+先在相同 conda 环境检查：
+
+```bash
+python -m evaluation.online_worker --check-imports
+```
+
+若仍在 wcwidth 导入时报错，可尝试单独重装兼容版本；该操作不更新 PyTorch、CUDA 或 ManiSkill：
+
+```bash
+python -m pip install --no-deps --force-reinstall --no-cache-dir 'wcwidth==0.2.13'
+python -m pip check
+python -m evaluation.online_worker --check-imports
+```
+
+`wcwidth==0.2.13` 是兼容性排查措施，不是对当前故障根因的确认。
+如果仍失败，保留完整检查输出（包含 Python 路径、已成功导入模块的版本和第一个失败模块），先不要重复长训。
+
+更新后的训练流程在每次评估之前原子保存完整 `last.pth`，其中 `evaluation_pending=true`。
+子进程非零退出时，默认重新启动进程重试一次；两次都失败则保留错误并停止，绝不制造成功率或更新 best。
+可以用 `online_training.eval_worker_retries=0` 禁用重试。
+`eval/validation_*/worker_failure.json` 记录返回码、次数和是否恢复，完整 traceback 仍输出到终端。
+
+恢复必须从这次中断的目录读取。例如 `online_rl02` 在 epoch 201 中断：
+
+```bash
+python - <<'PY'
+from models.checkpoint import load_checkpoint
+p = 'outputs/StackCube-v1/oc_budget/online_rl02/checkpoints/last.pth'
+c = load_checkpoint(p, map_location='cpu')
+print('checkpoint:', p)
+print('epoch:', c['epoch'], 'total_env_steps:', c['total_env_steps'])
+print('evaluation_pending:', c.get('evaluation_pending', False))
+PY
+
+python train_online.py --config-name train_online_rl \
+  stages.online.resume=outputs/StackCube-v1/oc_budget/online_rl02/checkpoints/last.pth \
+  online_training.total_env_steps=10000000 \
+  output=outputs/StackCube-v1/oc_budget/online_rl03
+```
+
+请保持实际使用的 backend 和并行环境数；8 环境配置仍须加 `online_rollout.num_envs=8 algo.steps_per_epoch=512`。
+旧版本在评估后才保存，已经丢失的内存更新无法从 traceback 恢复；旧文件能恢复到哪轮以实际 `epoch` 为准。
+新版本会重新评估 pending checkpoint 后继续；若已达到总步数/epoch 上限，只补完最终评估，不再做额外更新。
+
 - `metrics.jsonl/csv`：验证成功率、累计环境步数、Actor 更新数、KL、Critic 拟合、采样/更新时间与吞吐。
 - `goal_status.json`：当前/最佳验证成功率和目标状态；不是最终独立测试结论。
 - `protocol.json`：奖励、Critic 格式、ManiSkill 版本、训练后端/并行数、源权重 SHA256。
