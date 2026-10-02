@@ -24,6 +24,8 @@ online_training:
   keep_epoch_checkpoints: true
   eval_worker_retries: 1  # one fresh-process retry; persistent failure remains fatal
 online_diagnostics:
+  policy_probe_every: 0  # 0 disables; opt-in profiles use every 10 epochs
+  policy_probe_samples: 32
   enabled: true  # false disables optional phase stats / traces, not episode summaries
   value_before_after: true
   task_phase_stats: true

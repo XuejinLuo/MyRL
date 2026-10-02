@@ -1,0 +1,14 @@
+# One-change ablation against train_online_rl: only the PPO event scope changes.
+defaults:
+  - train_online_rl
+  - _self_
+output: ${paths.root}/online_rl_action01
+stages:
+  online:
+    resume: null
+    initial_ckpt: ${paths.root}/online_rl03/checkpoints/best.pth
+algo:
+  ratio_scope: final_prefix
+online_diagnostics:
+  policy_probe_every: 10
+  policy_probe_samples: 32
