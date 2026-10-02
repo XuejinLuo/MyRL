@@ -3,6 +3,9 @@
 本方案从现有 oc_budget Actor 初始化，之后通过自主交互和 Flow PPO 更新策略。
 无需新增示范、人工接管或重新运行 offline/iterative。95% 是需要实测的目标，代码修改不构成达标承诺。
 
+1000 万步后遇到约 73% 平台期时，参见 [执行动作前缀 PPO 对照](ONLINE_RL_ACTION.md)。
+新配置为可选实验，不改变本文原 `train_online_rl` 的默认算法。
+
 ## 修改内容
 
 - Actor 仍使用原来的 RGB 点云、object-budget 采样和机器人状态，视觉编码器保持冻结，更新 Flow backbone。

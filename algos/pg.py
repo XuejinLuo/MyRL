@@ -64,7 +64,7 @@ def clipped_objective(new_logprob, old_logprob, advantages, clip_ratio):
 class FlowPPO:
     def __init__(self, policy, critic, actor_lr=3e-6, critic_lr=3e-4,
                  clip_ratio=0.2, value_clip=0.2, max_grad_norm=0.5,
-                 target_kl=0.02, prefix_steps=None):
+                 target_kl=0.02, prefix_steps=None, final_prefix_steps=None):
         self.policy, self.critic = policy, critic
         self.actor_params = list(policy.policy.backbone.parameters())
         self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=actor_lr, eps=1e-5)
@@ -72,6 +72,21 @@ class FlowPPO:
         self.clip_ratio, self.value_clip = clip_ratio, value_clip
         self.max_grad_norm, self.target_kl = max_grad_norm, target_kl
         self.prefix_steps = prefix_steps
+        if prefix_steps is not None and final_prefix_steps is not None:
+            raise ValueError('Choose prefix_steps OR final_prefix_steps')
+        for size in (prefix_steps, final_prefix_steps):
+            if size is not None and not 1 <= size <= policy.policy.chunk_size:
+                raise ValueError('Invalid PPO action prefix length')
+        self.final_prefix_steps = final_prefix_steps
+
+    def event_logprob(self, logprob, step):
+        # Intermediate tail coordinates can affect the executed prefix through
+        # Transformer attention. Only the FINAL sampled tail is unused. The CPS
+        # conditional Gaussian factorizes, so its final prefix marginal is exact.
+        prefix = self.prefix_steps
+        if self.final_prefix_steps is not None and step == self.policy.sampler.num_steps - 1:
+            prefix = self.final_prefix_steps
+        return sum_event_logprob(logprob, prefix)
 
     def update_critic(self, features, returns, old_values=None):
         self.critic.eval()
@@ -94,9 +109,9 @@ class FlowPPO:
         max_error = 0.0
         for idx in torch.arange(len(batch['features']), device=batch['features'].device).split(batch_size):
             for step in range(self.policy.sampler.num_steps):
-                now = sum_event_logprob(self.policy.evaluate_transition(batch['features'][idx],
-                    batch['chains'][idx], step), self.prefix_steps)
-                old = sum_event_logprob(batch['logprobs'][idx, step], self.prefix_steps)
+                now = self.event_logprob(self.policy.evaluate_transition(batch['features'][idx],
+                    batch['chains'][idx], step), step)
+                old = self.event_logprob(batch['logprobs'][idx, step], step)
                 error = (now - old).abs().max().item()
                 if not torch.isfinite(now).all():
                     raise FloatingPointError('Nonfinite replay log probability')
@@ -130,9 +145,9 @@ class FlowPPO:
                     continue
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 for step in range(num_steps):
-                    new = sum_event_logprob(self.policy.evaluate_transition(batch['features'][idx],
-                        batch['chains'][idx], step), self.prefix_steps)
-                    old = sum_event_logprob(batch['logprobs'][idx, step], self.prefix_steps).detach()
+                    new = self.event_logprob(self.policy.evaluate_transition(batch['features'][idx],
+                        batch['chains'][idx], step), step)
+                    old = self.event_logprob(batch['logprobs'][idx, step], step).detach()
                     drift = (new - old).detach().abs().max().item()
                     metrics['ppo/max_abs_log_ratio'] = max(metrics['ppo/max_abs_log_ratio'], drift)
                     try:

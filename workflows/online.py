@@ -79,8 +79,8 @@ def validate(cfg):
         raise ValueError('This migration implements Flow PPO; select model=flow_3d')
     if not 1 <= cfg.env.exec_steps <= cfg.model.chunk_size:
         raise ValueError('Require 1 <= exec_steps <= chunk_size')
-    if cfg.algo.ratio_scope not in ('full', 'prefix'):
-        raise ValueError('ratio_scope must be full or prefix')
+    if cfg.algo.ratio_scope not in ('full', 'prefix', 'final_prefix'):
+        raise ValueError('ratio_scope must be full, prefix or final_prefix')
     if not 0 < cfg.algo.gamma <= 1 or not 0 <= cfg.algo.gae_lambda <= 1:
         raise ValueError('Invalid gamma/lambda')
     if cfg.algo.actor_lr <= 0 or cfg.algo.critic_lr <= 0 or not 0 < cfg.algo.clip_ratio < 1:
@@ -97,6 +97,9 @@ def validate(cfg):
     for key in ('trace_max_episodes', 'trace_max_steps_per_episode'):
         if cfg.get('online_diagnostics', {}).get(key, 0) < 0:
             raise ValueError(f'{key} must be nonnegative')
+    diag = cfg.get('online_diagnostics', {})
+    if diag.get('policy_probe_every', 0) < 0 or diag.get('policy_probe_samples', 32) < 1:
+        raise ValueError('Invalid policy probe interval/sample count')
     if cfg.algo.reward_scale <= 0:
         raise ValueError('reward_scale must be positive')
 
@@ -166,7 +169,8 @@ def run(cfg, env_factory=None):
         critic_lr=cfg.algo.critic_lr, clip_ratio=cfg.algo.clip_ratio,
         value_clip=cfg.algo.value_clip, max_grad_norm=cfg.algo.max_grad_norm,
         target_kl=cfg.algo.target_kl,
-        prefix_steps=cfg.env.exec_steps if cfg.algo.ratio_scope == 'prefix' else None)
+        prefix_steps=cfg.env.exec_steps if cfg.algo.ratio_scope == 'prefix' else None,
+        final_prefix_steps=cfg.env.exec_steps if cfg.algo.ratio_scope == 'final_prefix' else None)
     start_epoch, total_steps = 0, 0
     if cfg.resume:
         try:
@@ -339,8 +343,16 @@ def run(cfg, env_factory=None):
             normalized = normalize_advantages(adv)
             collector.attach_advantages(adv, normalized, actor_enabled)
             update_started = time.perf_counter()
+            probe = None
+            probe_every = cfg.get('online_diagnostics', {}).get('policy_probe_every', 0)
+            if actor_enabled and probe_every and epoch % probe_every == 0:
+                from utils.policy_probe import PolicyUpdateProbe
+                probe = PolicyUpdateProbe(trainer, batch, adv, cfg.env.exec_steps,
+                    cfg.online_diagnostics.get('policy_probe_samples', 32))
             metrics = trainer.update(batch, adv, frozen_returns, cfg.batch_size, update_epochs,
                 actor_enabled=actor_enabled, verify=cfg.algo.verify_logprobs)
+            if probe is not None:
+                metrics.update(probe.finish(normalizer))
             metrics['Perf/Update_Seconds'] = time.perf_counter() - update_started
             total_steps += env_steps
             with torch.no_grad():
