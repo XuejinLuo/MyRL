@@ -40,6 +40,32 @@ def normalize_advantages(advantages):
     return (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-5)
 
 
+@torch.no_grad()
+def compute_mc_returns(rewards, values, dones, lengths, gamma=1.):
+    """Return-to-go for concatenated COMPLETE episodes, with no value bootstrap.
+
+    Rewards are already discounted within each action chunk. Episodes must be
+    contiguous (never flatten interleaved vector lanes before calling this).
+    Both termination and finite-horizon timeout close an episode.
+    """
+    if (rewards.ndim != 1 or not len(rewards)
+            or any(x.shape != rewards.shape for x in (values, dones, lengths))):
+        raise ValueError('MC requires nonempty, matching one-dimensional inputs')
+    if not all(torch.isfinite(x).all() for x in (rewards, values, dones, lengths)):
+        raise ValueError('Nonfinite MC input')
+    if (not 0 < gamma <= 1 or torch.any(lengths < 1)
+            or torch.any(lengths != lengths.floor())):
+        raise ValueError('Invalid MC gamma/chunk lengths')
+    if not torch.all((dones == 0) | (dones == 1)) or not bool(dones[-1]):
+        raise ValueError('MC requires complete episodes ending in a boundary')
+    returns = torch.empty_like(rewards)
+    carry = rewards.new_zeros(())
+    for t in reversed(range(len(rewards))):
+        carry = rewards[t] + gamma ** lengths[t] * (1 - dones[t].float()) * carry
+        returns[t] = carry
+    return returns - values, returns
+
+
 def sum_event_logprob(logprob, prefix_steps=None):
     if prefix_steps is not None:
         logprob = logprob[:, :prefix_steps]

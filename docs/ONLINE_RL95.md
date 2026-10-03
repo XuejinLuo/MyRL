@@ -5,6 +5,8 @@
 
 1000 万步后遇到约 73% 平台期时，参见 [执行动作前缀 PPO 对照](ONLINE_RL_ACTION.md)。
 新配置为可选实验，不改变本文原 `train_online_rl` 的默认算法。
+若上述实验及 CPU 对照仍未超过初始策略，下一项实验见
+[完整回合 MC 回报 PPO](ONLINE_RL_MC.md)，从同一 Actor 新建训练。
 
 ## 修改内容
 

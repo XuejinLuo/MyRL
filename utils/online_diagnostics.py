@@ -31,7 +31,7 @@ def append_json(path, row):
 
 
 class EpisodeDiagnostics:
-    """Keep only the current episode + completed episodes awaiting this rollout's GAE.
+    """Keep the current episode + completed episodes awaiting rollout advantages.
 
     Completed summaries always persist. Optional primitive traces are capped by
     episode count AND per-episode step count. Outcome labels never enter learning.
@@ -102,7 +102,7 @@ class EpisodeDiagnostics:
         decisions, trace = episode.pop('decisions'), episode.pop('trace')
         episode.pop('last_phase'); episode.pop('phase_run')
         # Complete Monte Carlo return-to-go under the sampled, possibly changing
-        # policy; never substituted for the frozen GAE regression target.
+        # policy. Diagnostics never mutate the collector's learning targets.
         if not episode['censored']:
             actual = 0.
             for decision in reversed(decisions):

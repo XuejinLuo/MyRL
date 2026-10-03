@@ -21,6 +21,7 @@ from envs.online_task import task_protocol, check_resume_protocol, wrap_training
 from utils.online_diagnostics import value_metrics
 from envs.online_vector import SingleOnlineEnv, GPUOnlineEnv
 from workflows.online_rollout import OnlineCollector
+from workflows.online_mc import CompleteEpisodeCollector, return_protocol, check_return_resume
 from utils.experiment import write_json
 from data.episodes import digest
 
@@ -54,6 +55,7 @@ def validate(cfg):
     backend, n = rollout.get('backend', 'cpu'), rollout.get('num_envs', 1)
     if backend not in ('cpu', 'gpu') or n < 1 or (backend == 'cpu' and n != 1):
         raise ValueError('Use cpu with num_envs=1, or gpu with num_envs>=1')
+    return_protocol(cfg)
     if backend == 'gpu':
         from data.observations import observation_mode, relational_enabled
         if (cfg.env.get('env_id') != 'StackCube-v1' or cfg.env.obs_mode != 'pointcloud'
@@ -110,6 +112,7 @@ def run(cfg, env_factory=None):
         validate_common(cfg)
     validate(cfg)
     protocol = task_protocol(cfg)
+    returns_protocol = return_protocol(cfg)
     rollout = cfg.get('online_rollout', {})
     training = cfg.get('online_training', {})
     budget = training.get('total_env_steps')
@@ -130,6 +133,7 @@ def run(cfg, env_factory=None):
         raise ValueError('resume requires an online epoch_*.pth or last.pth with optimizer state; best.pth is for initialization/evaluation')
     if cfg.resume:
         check_resume_protocol(checkpoint, protocol)
+        check_return_resume(checkpoint, cfg)
     if 'config' in checkpoint:
         for section in ('model', 'env'):
             if checkpoint['config'][section] != OmegaConf.to_container(cfg[section], resolve=True):
@@ -260,7 +264,7 @@ def run(cfg, env_factory=None):
     def snapshot(epoch, metrics):
         state = payload(base, cfg, normalizer, epoch, metrics)
         state.update(online_protocol=protocol, benchmark_protocol=benchmark_protocol,
-                     runtime_protocol=runtime, provenance=provenance)
+                     runtime_protocol=runtime, return_protocol=returns_protocol, provenance=provenance)
         return state
 
     def save_best(epoch, result):
@@ -300,8 +304,9 @@ def run(cfg, env_factory=None):
         if cfg.resume and checkpoint.get('runtime_protocol') not in (None, runtime):
             raise ValueError('Runtime environment/reward mode differs from resumed checkpoint')
         write_json(os.path.join(run_dir, 'protocol.json'), dict(training=protocol,
-            benchmark=benchmark_protocol, runtime=runtime, **provenance))
-        print(json.dumps(dict(training_protocol=protocol, runtime=runtime)), flush=True)
+            benchmark=benchmark_protocol, runtime=runtime, returns=returns_protocol, **provenance))
+        print(json.dumps(dict(training_protocol=protocol, runtime=runtime,
+                              return_protocol=returns_protocol)), flush=True)
         if cfg.resume and checkpoint.get('selection_best'):
             best_state = checkpoint['selection_best']
             best_state['model_state_dict'] = {k: v.cpu() for k, v in best_state['model_state_dict'].items()}
@@ -327,7 +332,8 @@ def run(cfg, env_factory=None):
                 total_env_steps=total_steps, final=True, independent_test_required=True))
             return {'run_dir': run_dir, 'best_metrics': best_metrics, 'total_env_steps': total_steps}
         # Resume resets the simulator at an epoch boundary, not an exact trajectory continuation.
-        collector = OnlineCollector(env, actor, critic, encode_many, normalizer, cfg, protocol,
+        collector_class = CompleteEpisodeCollector if returns_protocol['estimator'] == 'mc' else OnlineCollector
+        collector = collector_class(env, actor, critic, encode_many, normalizer, cfg, protocol,
                                     os.path.join(run_dir, 'diagnostics'), cfg.seed + start_epoch)
         last_eval_steps = total_steps
         for epoch in range(start_epoch + 1, cfg.epochs + 1):
@@ -361,6 +367,16 @@ def run(cfg, env_factory=None):
             if cfg.get('online_diagnostics', {}).get('value_before_after', True):
                 for label, values in (('Before', before), ('After', after)):
                     metrics.update({f'Value/{label}/{key}': val for key, val in values.items()})
+            metrics['Value/Target_Is_MC'] = int(returns_protocol['estimator'] == 'mc')
+            if returns_protocol['estimator'] == 'mc':
+                # Before = prediction on newly collected complete episodes;
+                # After = fit on this same training batch, not held-out accuracy.
+                starts = batch['episode_starts']
+                for label, predictions in (('Before', batch['values']), ('After', predicted)):
+                    metrics.update({f'Value/MC/{label}/{key}': val for key, val in
+                                    value_metrics(predictions, frozen_returns).items()})
+                    metrics.update({f'Value/MC_Start/{label}/{key}': val for key, val in
+                                    value_metrics(predictions[starts], frozen_returns[starts]).items()})
             metrics.update(rollout_metrics)
             metrics.update({'Env/Total_Steps': total_steps,
                 'Value/Explained_Variance': after['Explained_Variance'],

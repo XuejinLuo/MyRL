@@ -1,0 +1,22 @@
+# Actual episode return-to-go; same Actor, reward, full-event PPO and learning rates.
+defaults:
+  - train_online_rl
+  - _self_
+output: ${paths.root}/online_rl_mc_cpu01
+stages:
+  online:
+    resume: null
+    initial_ckpt: ${paths.root}/online_rl03/checkpoints/best.pth
+algo:
+  return_estimator: mc
+  ratio_scope: full
+online_rollout:
+  backend: cpu
+  num_envs: 1
+  episodes_per_batch: 64
+online_training:
+  total_env_steps: 300000
+  eval_every_env_steps: 50000
+online_diagnostics:
+  policy_probe_every: 10
+  policy_probe_samples: 32
