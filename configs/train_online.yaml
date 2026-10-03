@@ -17,6 +17,7 @@ quiet: false
 online_rollout:
   backend: cpu
   num_envs: 1
+  episodes_per_batch: 64  # only used by return_estimator=mc; multiple of num_envs
 online_training:
   total_env_steps: null  # absolute total including warmup and resumed steps
   eval_every_env_steps: null  # null preserves epoch-based evaluation

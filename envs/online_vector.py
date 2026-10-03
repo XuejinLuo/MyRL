@@ -36,7 +36,9 @@ class SingleOnlineEnv:
         obs, info = self.env.reset(seed=seed)
         return [obs], [info]
 
-    def step(self, actions):
+    def step(self, actions, active=None):
+        if active is not None and (np.asarray(active).shape != (1,) or not bool(active[0])):
+            raise ValueError('Single environment must be active when stepping')
         obs, reward, term, trunc, info = self.env.step(actions[0])
         return [obs], np.array([reward]), np.array([term]), np.array([trunc]), [info]
 
@@ -102,9 +104,16 @@ class GPUOnlineEnv:
         return [observations[i] for i in range(self.num_envs)], [
             dict(privileged_state=states[i]) for i in range(self.num_envs)]
 
-    def step(self, actions):
-        if self.pending.any():
+    def step(self, actions, active=None):
+        # Complete-episode waves park finished lanes until every lane finishes.
+        # PhysX still advances padded lanes; none of their data enters learning.
+        requested = np.ones(self.num_envs, dtype=bool) if active is None else np.asarray(active, dtype=bool)
+        if requested.shape != (self.num_envs,) or not requested.any():
+            raise ValueError('Expected a nonempty active lane mask')
+        if (self.pending & requested).any():
             raise RuntimeError('Call reset_done before collecting another chunk')
+        if (~requested & ~self.pending).any():
+            raise ValueError('Only finished lanes can be parked')
         if actions.shape != (self.num_envs, self.cfg.model.chunk_size, self.cfg.model.action_dim):
             raise ValueError('Incorrect vector action shape')
         n = self.num_envs
@@ -112,7 +121,7 @@ class GPUOnlineEnv:
         infos = [dict(primitive_rewards=[], online_transitions=[]) for _ in range(n)]
         observations = [None] * n
         for step in range(self.cfg.env.exec_steps):
-            active = ~(term | trunc)
+            active = requested & ~(term | trunc)
             action = torch.as_tensor(actions[:, step], device=self.unwrapped.device, dtype=torch.float32)
             space = self.unwrapped.single_action_space
             action = torch.maximum(torch.minimum(action, torch.as_tensor(space.high, device=action.device)),
@@ -149,11 +158,11 @@ class GPUOnlineEnv:
             if just_finished:
                 for i, obs in self.observations(raw, just_finished).items():
                     observations[i] = obs
-            if (term | trunc).all():
+            if ((term | trunc) | ~requested).all():
                 break
         for info in infos:
             info['actual_steps'] = len(info['primitive_rewards'])
-        self.pending = term | trunc
+        self.pending |= term | trunc
         return observations, np.array([sum(i['primitive_rewards']) for i in infos]), term, trunc, infos
 
     def reset_done(self, done, observations, infos):
