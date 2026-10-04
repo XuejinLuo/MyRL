@@ -144,9 +144,11 @@ def test_gpu_rejects_parking_an_unfinished_lane():
         env.step(np.zeros((2, 16, 7)), active=[True, False])
 
 
-def test_mc_real_ppo_checkpoint_metrics_and_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize('baseline', ['value', 'none'])
+def test_mc_real_ppo_checkpoint_metrics_and_resume(tmp_path, monkeypatch, baseline):
     from workflows import online
     cfg = config(tmp_path); cfg.algo.return_estimator = 'mc'
+    cfg.algo.mc_baseline = baseline
     cfg.online_rollout = dict(backend='cpu', num_envs=1, episodes_per_batch=2)
     cfg.online_training = dict(total_env_steps=7, eval_every_env_steps=100,
                                keep_epoch_checkpoints=False)
@@ -154,16 +156,26 @@ def test_mc_real_ppo_checkpoint_metrics_and_resume(tmp_path, monkeypatch):
     torch.save(TinyPolicy().state_dict(), cfg.algo.pretrained_ckpt)
     (tmp_path/'dataset_stats.json').write_text(json.dumps({k: dict(min=[-1.], max=[1.]) for k in ('state', 'action')}))
     monkeypatch.setattr(online, 'build_base', lambda cfg, device: TinyPolicy().to(device))
+    original_update = online.FlowPPO.update
+    captured = []
+    def update(self, batch, advantages, returns, *args, **kwargs):
+        expected = returns - batch['values'] if baseline == 'value' else returns
+        torch.testing.assert_close(advantages, expected, rtol=0, atol=0)
+        captured.append(advantages.clone())
+        return original_update(self, batch, advantages, returns, *args, **kwargs)
+    monkeypatch.setattr(online.FlowPPO, 'update', update)
     factory = lambda: ChunkActionWrapper(ToyEnv(), chunk_size=3, exec_steps=2)
     result = online.run(cfg, factory)
     assert result['total_env_steps'] == 12  # two batches of two full 3-step episodes
     checkpoint = torch.load(Path(cfg.output)/'checkpoints/last.pth', weights_only=True)
     assert checkpoint['epoch'] == 2 and checkpoint['actor_optimizer']['state']
+    assert len(captured) == 2 and checkpoint['critic_optimizer']['state']
     assert checkpoint['return_protocol'] == return_protocol(cfg)
     assert checkpoint['selection_best']['epoch'] == 0
     rows = [json.loads(line) for line in (Path(cfg.output)/'metrics.jsonl').read_text().splitlines()]
     for row in rows[1:]:
         assert row['Value/Target_Is_MC'] == 1 and row['Episode/censored_Count'] == 0
+        assert row['Adv/Uses_Learned_Baseline'] == int(baseline == 'value')
         assert row['Value/MC/Before/Target_Mean'] == row['Value/MC/After/Target_Mean']
         # ToyEnv first succeeds at step 3, coincident with timeout.
         assert row['Value/MC_Start/Before/Target_Mean'] == pytest.approx(cfg.algo.gamma**2)
@@ -173,6 +185,12 @@ def test_mc_real_ppo_checkpoint_metrics_and_resume(tmp_path, monkeypatch):
     assert result['total_env_steps'] == 18
     resumed = torch.load(Path(cfg.output)/'checkpoints/last.pth', weights_only=True)
     assert resumed['epoch'] == 3 and resumed['selection_best']['epoch'] == 0
+    cfg.algo.mc_baseline = 'none' if baseline == 'value' else 'value'
+    cfg.output = str(tmp_path/'rejected_baseline')
+    with pytest.raises(ValueError, match='return protocol mismatch'):
+        online.run(cfg, factory)
+    assert not Path(cfg.output).exists()
+    cfg.algo.mc_baseline = 'value'
     cfg.algo.return_estimator = 'gae'; cfg.output = str(tmp_path/'rejected')
     with pytest.raises(ValueError, match='return protocol mismatch'):
         online.run(cfg, factory)

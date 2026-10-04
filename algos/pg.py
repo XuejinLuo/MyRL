@@ -41,13 +41,17 @@ def normalize_advantages(advantages):
 
 
 @torch.no_grad()
-def compute_mc_returns(rewards, values, dones, lengths, gamma=1.):
+def compute_mc_returns(rewards, values, dones, lengths, gamma=1., *, baseline='value'):
     """Return-to-go for concatenated COMPLETE episodes, with no value bootstrap.
 
     Rewards are already discounted within each action chunk. Episodes must be
     contiguous (never flatten interleaved vector lanes before calling this).
     Both termination and finite-horizon timeout close an episode.
+    baseline='none' uses return-to-go itself as the raw Actor signal; Critic
+    targets are identical in both modes. PPO still normalizes this signal.
     """
+    if baseline not in ('value', 'none'):
+        raise ValueError('MC baseline must be value or none')
     if (rewards.ndim != 1 or not len(rewards)
             or any(x.shape != rewards.shape for x in (values, dones, lengths))):
         raise ValueError('MC requires nonempty, matching one-dimensional inputs')
@@ -63,7 +67,8 @@ def compute_mc_returns(rewards, values, dones, lengths, gamma=1.):
     for t in reversed(range(len(rewards))):
         carry = rewards[t] + gamma ** lengths[t] * (1 - dones[t].float()) * carry
         returns[t] = carry
-    return returns - values, returns
+    advantages = returns - values if baseline == 'value' else returns.clone()
+    return advantages, returns
 
 
 def sum_event_logprob(logprob, prefix_steps=None):

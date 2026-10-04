@@ -11,6 +11,11 @@ def return_protocol(cfg):
     estimator = cfg['algo'].get('return_estimator', 'gae')
     if estimator not in ('gae', 'mc'):
         raise ValueError('return_estimator must be gae or mc')
+    baseline = cfg['algo'].get('mc_baseline', 'value')
+    if baseline not in ('value', 'none'):
+        raise ValueError('mc_baseline must be value or none')
+    if estimator != 'mc' and baseline != 'value':
+        raise ValueError('mc_baseline=none requires return_estimator=mc')
     protocol = dict(version=1, estimator=estimator)
     if estimator == 'mc':
         rollout = cfg.get('online_rollout', {})
@@ -20,7 +25,8 @@ def return_protocol(cfg):
             raise ValueError('episodes_per_batch must be a positive multiple of num_envs')
         if cfg.get('online_task', {}).get('timeout_semantics') != 'finite_horizon':
             raise ValueError('MC requires finite_horizon timeout semantics')
-        protocol.update(episodes_per_batch=quota, collection='complete_episode_waves')
+        protocol.update(episodes_per_batch=quota, collection='complete_episode_waves',
+                        mc_baseline=baseline)
     return protocol
 
 
@@ -30,6 +36,11 @@ def check_return_resume(checkpoint, cfg):
     saved = checkpoint.get('return_protocol')
     if saved is None:
         saved = return_protocol(checkpoint['config'])
+    # PR #22 MC checkpoints predate this option and used G - V. Copy before
+    # canonicalizing so validation does not mutate loaded checkpoint metadata.
+    saved = dict(saved)
+    if saved.get('estimator') == 'mc':
+        saved.setdefault('mc_baseline', 'value')
     if saved != return_protocol(cfg):
         raise ValueError('Checkpoint return protocol mismatch; initialize a new run '
                          'from Actor weights instead of resume')
@@ -45,7 +56,9 @@ class CompleteEpisodeCollector(OnlineCollector):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.quota = return_protocol(self.cfg)['episodes_per_batch']
+        returns_protocol = return_protocol(self.cfg)
+        self.quota = returns_protocol['episodes_per_batch']
+        self.baseline = returns_protocol['mc_baseline']
         if self.quota % self.n:
             raise ValueError('Episode quota must be a multiple of actual environment count')
 
@@ -126,7 +139,7 @@ class CompleteEpisodeCollector(OnlineCollector):
         if not all(torch.isfinite(v).all() for v in batch.values()):
             raise FloatingPointError('Nonfinite MC rollout')
         advantages, returns = compute_mc_returns(batch['rewards'], batch['values'],
-            batch['dones'], batch['lengths'], cfg.algo.gamma)
+            batch['dones'], batch['lengths'], cfg.algo.gamma, baseline=self.baseline)
         # The reverse scalar recurrence runs on host rollout storage, avoiding
         # thousands of tiny CUDA launches. PPO tensors move to the device once.
         batch = {key: value.to(device) for key, value in batch.items()}
@@ -142,5 +155,6 @@ class CompleteEpisodeCollector(OnlineCollector):
             'Perf/Rollout_Seconds': elapsed, 'Perf/Env_Steps_Per_Second': counts['steps'] / max(elapsed, 1e-9),
             'Action/Normalization_Clip_Fraction': counts['clipped'] / max(counts['actions'], 1),
             'Return/Complete_Episodes': self.quota, 'Return/Decisions': len(rows),
+            'Adv/Uses_Learned_Baseline': int(self.baseline == 'value'),
             'Return/Budget_Overshoot': max(0, counts['steps'] - remaining_steps) if remaining_steps is not None else 0}
         return batch, advantages, returns, metrics
