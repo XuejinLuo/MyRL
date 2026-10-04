@@ -7,6 +7,9 @@ GAE/自举目标拟合，不能当成实际完成任务回报的预测能力。
 这次改为用完整回合的实际回报训练 Actor 和 Critic。它仍是自主环境交互的在线 RL，
 不需要新增示范、人工接管或重跑 offline/iterative。95% 是实验目标，尚未实测达到。
 
+这轮 MC 实验未超过初始 best 时，下一项可选对照见
+[Actor 不使用学习型价值基线](ONLINE_RL_MC_NOBASELINE.md)。本文默认仍为 `G - V`。
+
 ## 学习目标与采样
 
 `train_online_rl_mc` 使用 `algo.return_estimator=mc`：

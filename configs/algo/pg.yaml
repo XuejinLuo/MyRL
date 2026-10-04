@@ -20,6 +20,7 @@ min_std: ${min_std}
 # final_prefix marginalizes only the unused FINAL Gaussian tail; earlier events stay full.
 ratio_scope: full
 return_estimator: gae  # mc requires complete finite-horizon episode collection
+mc_baseline: value  # value: G - V; none: G (MC only); both retain PPO normalization
 verify_logprobs: true
 pretrained_ckpt: ${stages.online.initial_ckpt}
 stats_path: ${stages.online.stats_path}

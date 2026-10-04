@@ -1,0 +1,9 @@
+# One-change MC ablation: Actor signal is G instead of G - V.
+defaults:
+  - train_online_rl_mc
+  - _self_
+output: ${paths.root}/online_rl_mc_nobaseline_cpu01
+algo:
+  mc_baseline: none
+# Keep the five Actor-frozen Critic warmup batches for comparison with PR #22.
+# Critic training/diagnostics remain; its predictions no longer enter Actor advantages.
